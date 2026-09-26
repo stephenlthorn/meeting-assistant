@@ -9,7 +9,7 @@ struct Problem: Equatable, Identifiable {
     var id: String { message }
 }
 
-enum PrivacyPane: Equatable {
+enum PrivacyPane: Hashable, CaseIterable {
     case screenRecording, microphone, speechRecognition
 
     var title: String {

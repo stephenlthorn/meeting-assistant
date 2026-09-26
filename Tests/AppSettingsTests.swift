@@ -138,6 +138,50 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertNil(saved.deepgramKeySource)
     }
 
+    // MARK: - Shortcuts and overlay
+
+    func testShortcutsStartAsCommandShiftSpaceAndCommandShiftH() {
+        let settings = makeSettings()
+
+        XCTAssertEqual(settings.answerHotKey.label, "⌘⇧Space")
+        XCTAssertEqual(settings.overlayHotKey.label, "⌘⇧H")
+    }
+
+    func testChosenShortcutsPersist() {
+        let defaults = freshDefaults()
+        let first = makeSettings(defaults: defaults)
+        first.answerHotKey = HotKeyCombo.answerChoices[1]
+        first.overlayHotKey = HotKeyCombo.overlayChoices[2]
+
+        let second = makeSettings(defaults: defaults)
+
+        XCTAssertEqual(second.answerHotKey, HotKeyCombo.answerChoices[1])
+        XCTAssertEqual(second.overlayHotKey, HotKeyCombo.overlayChoices[2])
+    }
+
+    func testAnUnknownSavedShortcutFallsBackToTheDefault() {
+        let defaults = freshDefaults()
+        defaults.set("⌘⌥⌃⇧F19", forKey: "answerHotKey")
+
+        XCTAssertEqual(makeSettings(defaults: defaults).answerHotKey, HotKeyCombo.answerChoices[0])
+    }
+
+    func testEveryShortcutChoiceIsDistinct() {
+        let all = HotKeyCombo.answerChoices + HotKeyCombo.overlayChoices
+        XCTAssertEqual(Set(all).count, all.count)
+        XCTAssertEqual(Set(all.map(\.label)).count, all.count)
+    }
+
+    func testTheOverlayShowsUntilItIsHidden() {
+        let defaults = freshDefaults()
+        let first = makeSettings(defaults: defaults)
+        XCTAssertTrue(first.showsOverlay)
+
+        first.showsOverlay = false
+
+        XCTAssertFalse(makeSettings(defaults: defaults).showsOverlay)
+    }
+
     // MARK: - Migration from the com.example bundle id
 
     func testSettingsAndKeysMoveOverFromTheOldBundleID() {

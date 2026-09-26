@@ -86,7 +86,7 @@ final class AssistantController {
         }
     }
 
-    static func live(settings: AppSettings = .shared) -> AssistantController {
+    static func live(settings: AppSettings) -> AssistantController {
         AssistantController(settings: settings,
                             systemAudio: SystemAudioCapture(),
                             microphone: MicCapture(),

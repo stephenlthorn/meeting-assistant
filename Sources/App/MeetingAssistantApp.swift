@@ -1,6 +1,6 @@
-import SwiftUI
 import AppKit
-import Carbon.HIToolbox
+import Combine
+import SwiftUI
 
 @main
 struct MeetingAssistantApp: App {
@@ -8,49 +8,51 @@ struct MeetingAssistantApp: App {
 
     var body: some Scene {
         MenuBarExtra("Meeting Assistant", systemImage: "waveform.circle") {
-            MenuContent(controller: appDelegate.controller)
+            MenuContent(controller: appDelegate.controller, settings: appDelegate.settings,
+                        hotKeys: appDelegate.hotKeys, toggleOverlay: appDelegate.toggleOverlay)
         }
         Settings {
-            SettingsView()
+            SettingsView(settings: appDelegate.settings, hotKeys: appDelegate.hotKeys)
         }
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let controller = AssistantController.live()
+    let settings = AppSettings.shared
+    let hotKeys = HotKeyBinder()
+    private(set) lazy var controller = AssistantController.live(settings: settings)
     private var panel: OverlayPanel?
-    private var answerHotKey: HotKeyManager?
-    private var toggleHotKey: HotKeyManager?
+    private var subscriptions: Set<AnyCancellable> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let hosting = NSHostingView(rootView: OverlayView(controller: controller))
-        let panel = OverlayPanel(contentView: hosting)
-        positionTopRight(panel)
-        panel.orderFrontRegardless()
+        let overlay = OverlayView(controller: controller, settings: settings) { [weak self] in
+            self?.toggleOverlay()
+        }
+        let panel = OverlayPanel(contentView: FirstClickHostingView(rootView: overlay))
+        if !panel.restoredSavedFrame { positionTopRight(panel) }
+        if settings.showsOverlay { panel.orderFrontRegardless() }
         self.panel = panel
 
-        // ⌘⇧Space: ask the model for help now.
-        answerHotKey = try? HotKeyManager(combo: HotKeyCombo(keyCode: UInt32(kVK_Space),
-                                                             modifiers: UInt32(cmdKey | shiftKey),
-                                                             label: "⌘⇧Space")) { [weak self] in
-            self?.controller.answerNow()
-        }
-        // ⌘⇧H: show/hide the overlay.
-        toggleHotKey = try? HotKeyManager(combo: HotKeyCombo(keyCode: UInt32(kVK_ANSI_H),
-                                                             modifiers: UInt32(cmdKey | shiftKey),
-                                                             label: "⌘⇧H")) { [weak self] in
-            self?.toggleOverlay()
+        settings.$answerHotKey.combineLatest(settings.$overlayHotKey)
+            .sink { [weak self] answer, overlay in self?.bindHotKeys(answer: answer, overlay: overlay) }
+            .store(in: &subscriptions)
+    }
+
+    func toggleOverlay() {
+        guard let panel else { return }
+        settings.showsOverlay.toggle()
+        if settings.showsOverlay {
+            panel.orderFrontRegardless()
+        } else {
+            panel.orderOut(nil)
         }
     }
 
-    private func toggleOverlay() {
-        guard let panel else { return }
-        if panel.isVisible {
-            panel.orderOut(nil)
-        } else {
-            panel.orderFrontRegardless()
-        }
+    private func bindHotKeys(answer: HotKeyCombo, overlay: HotKeyCombo) {
+        hotKeys.bind(answer: answer, overlay: overlay,
+                     onAnswer: { [weak self] in self?.controller.answerNow() },
+                     onOverlay: { [weak self] in self?.toggleOverlay() })
     }
 
     private func positionTopRight(_ panel: NSPanel) {
@@ -65,13 +67,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct MenuContent: View {
     let controller: AssistantController
-    @ObservedObject private var settings = AppSettings.shared
+    @ObservedObject var settings: AppSettings
+    @ObservedObject var hotKeys: HotKeyBinder
+    let toggleOverlay: () -> Void
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Button(controller.isListening ? "Stop Listening" : "Start Listening") {
             controller.toggleListening()
         }
-        Button("Answer Now (⌘⇧Space)") { controller.answerNow() }
+        Button("Answer Now (\(settings.answerHotKey.label))") { controller.answerNow() }
+        Button("\(settings.showsOverlay ? "Hide" : "Show") Overlay (\(settings.overlayHotKey.label))") {
+            toggleOverlay()
+        }
 
         Divider()
 
@@ -82,18 +90,26 @@ struct MenuContent: View {
 
         Divider()
 
-        Button("Copy Transcript") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(controller.transcriptText, forType: .string)
-        }
-        .disabled(controller.transcriptText.isEmpty)
+        Button("Copy Answer") { Clipboard.copy(controller.answer) }
+            .disabled(controller.answer.isEmpty)
+        Button("Copy Transcript") { Clipboard.copy(controller.transcriptText) }
+            .disabled(controller.transcriptDisplay.isEmpty)
         Button("Clear Transcript") { controller.clearTranscript() }
 
         Divider()
 
-        SettingsLink { Text("Settings…") }
+        ForEach(controller.problems.compactMap(\.fix), id: \.self) { pane in
+            Button("Open \(pane.title) Settings…") { NSWorkspace.shared.open(pane.settingsURL) }
+        }
+        if let problem = hotKeys.problem {
+            Text(problem)
+        }
         if !settings.apiKeyPresent {
-            Text("Set your API key in Settings")
+            Text("Add your API key in Settings")
+        }
+        Button("Settings…") {
+            NSApp.activate()
+            openSettings()
         }
         Button("Quit") { NSApplication.shared.terminate(nil) }
     }

@@ -36,6 +36,9 @@ final class AppSettings: ObservableObject {
     @Published var extraInstructions: String { didSet { defaults.set(extraInstructions, forKey: "extraInstructions") } }
     @Published var autoAnswer: Bool { didSet { defaults.set(autoAnswer, forKey: "autoAnswer") } }
     @Published var useCloudSTT: Bool { didSet { defaults.set(useCloudSTT, forKey: "useCloudSTT") } }
+    @Published var answerHotKey: HotKeyCombo { didSet { defaults.set(answerHotKey.label, forKey: "answerHotKey") } }
+    @Published var overlayHotKey: HotKeyCombo { didSet { defaults.set(overlayHotKey.label, forKey: "overlayHotKey") } }
+    @Published var showsOverlay: Bool { didSet { defaults.set(showsOverlay, forKey: "showsOverlay") } }
     @Published private(set) var apiKeySource: KeySource?
     @Published private(set) var deepgramKeySource: KeySource?
 
@@ -56,6 +59,10 @@ final class AppSettings: ObservableObject {
         extraInstructions = defaults.string(forKey: "extraInstructions") ?? ""
         autoAnswer = defaults.bool(forKey: "autoAnswer")
         useCloudSTT = defaults.bool(forKey: "useCloudSTT")
+        answerHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "answerHotKey"), in: HotKeyCombo.answerChoices)
+        overlayHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "overlayHotKey"),
+                                           in: HotKeyCombo.overlayChoices)
+        showsOverlay = defaults.object(forKey: "showsOverlay") as? Bool ?? true
         refreshKeySources()
     }
 
