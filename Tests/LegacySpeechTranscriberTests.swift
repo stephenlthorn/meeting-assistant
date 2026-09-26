@@ -262,22 +262,6 @@ final class FakeRecognitionSession: SpeechRecognitionSession {
     func fail(_ error: Error = TestFailure(message: "No speech detected")) { onError(error) }
 }
 
-final class ManualScheduler {
-    private var pending: [(delay: TimeInterval, work: () -> Void)] = []
-
-    var delays: [TimeInterval] { pending.map(\.delay) }
-
-    func schedule(_ delay: TimeInterval, _ work: @escaping () -> Void) {
-        pending.append((delay, work))
-    }
-
-    func fireAll() {
-        let due = pending
-        pending = []
-        due.forEach { $0.work() }
-    }
-}
-
 /// A 100 ms mono tone at a constant amplitude.
 func tone(amplitude: Float, sampleRate: Double = 16_000, channels: AVAudioChannelCount = 1) -> AVAudioPCMBuffer {
     let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: channels)!

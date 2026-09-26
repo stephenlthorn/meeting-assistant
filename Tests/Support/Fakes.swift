@@ -125,6 +125,30 @@ final class FakeAnswerer: AnswerStreaming {
     }
 }
 
+/// Collects scheduled work so a test decides when it runs.
+final class ManualScheduler {
+    private var pending: [(delay: TimeInterval, work: () -> Void)] = []
+
+    var delays: [TimeInterval] { pending.map(\.delay) }
+
+    func schedule(_ delay: TimeInterval, _ work: @escaping () -> Void) {
+        pending.append((delay, work))
+    }
+
+    func fireAll() {
+        let due = pending
+        pending = []
+        due.forEach { $0.work() }
+    }
+
+    /// Runs only the work scheduled with this delay.
+    func fire(delay: TimeInterval) {
+        let due = pending.filter { $0.delay == delay }
+        pending.removeAll { $0.delay == delay }
+        due.forEach { $0.work() }
+    }
+}
+
 final class TestClock {
     var now = Date(timeIntervalSince1970: 1_000)
 }
