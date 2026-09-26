@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "VERSION"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: ver
+        run: echo "tag=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project MeetingAssistant.xcodeproj \
+            -scheme MeetingAssistant \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package .app
+        run: |
+          APP="build/Build/Products/Release/MeetingAssistant.app"
+          test -d "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" MeetingAssistant.app.zip
+          ls -lh MeetingAssistant.app.zip
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ inputs.tag || steps.ver.outputs.tag }}
+          files: MeetingAssistant.app.zip
+          body: |
+            Unsigned macOS build of Meeting Assistant.
+
+            Download `MeetingAssistant.app.zip`, then before first launch:
+
+            ```bash
+            unzip MeetingAssistant.app.zip
+            xattr -dr com.apple.quarantine MeetingAssistant.app
+            open MeetingAssistant.app
+            ```
+
+            Building from source in Xcode is the smoother path; see the README.

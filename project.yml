@@ -1,0 +1,37 @@
+name: MeetingAssistant
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+targets:
+  MeetingAssistant:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    info:
+      path: Sources/Support/Info.generated.plist
+      properties:
+        LSUIElement: true
+        CFBundleDisplayName: Meeting Assistant
+        NSSpeechRecognitionUsageDescription: "Transcribes meeting audio on this device to provide live assistance."
+        NSMicrophoneUsageDescription: "Captures your microphone so your side of the call is transcribed on-device."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.meetingassistant
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: NO
+
+schemes:
+  MeetingAssistant:
+    build:
+      targets:
+        MeetingAssistant: all
+    run:
+      config: Debug

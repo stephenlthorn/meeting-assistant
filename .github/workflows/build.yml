@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project MeetingAssistant.xcodeproj \
+            -scheme MeetingAssistant \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package .app
+        run: |
+          APP="build/Build/Products/Release/MeetingAssistant.app"
+          test -d "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" MeetingAssistant.app.zip
+          ls -lh MeetingAssistant.app.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeetingAssistant-app
+          path: MeetingAssistant.app.zip
+          if-no-files-found: error
