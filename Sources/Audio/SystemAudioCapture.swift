@@ -1,6 +1,7 @@
+import AVFoundation
+import CoreGraphics
 import Foundation
 import ScreenCaptureKit
-import AVFoundation
 
 /// Captures the Mac's system audio output (what your speakers/headphones play,
 /// i.e. the other people on the call) using ScreenCaptureKit. No virtual audio
@@ -8,21 +9,30 @@ import AVFoundation
 ///
 /// Permission: first `start()` triggers the system "Screen Recording" prompt
 /// (ScreenCaptureKit is gated by that TCC permission even for audio-only use).
-final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
+final class SystemAudioCapture: NSObject, SystemAudioCapturing, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private let audioQueue = DispatchQueue(label: "meetingassistant.audio.capture")
 
-    /// Called on a background queue with a mono Float32 buffer per audio chunk.
-    var onBuffer: ((AVAudioPCMBuffer) -> Void)?
-    /// Called if the stream stops unexpectedly.
-    var onError: ((String) -> Void)?
+    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    var onError: (@MainActor (String) -> Void)?
 
     func start() async throws {
-        let content = try await SCShareableContent.current
-        guard let display = content.displays.first else {
-            throw NSError(domain: "SystemAudioCapture", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "No display available for capture."])
+        do {
+            try await startStream()
+        } catch let error as SystemAudioError {
+            throw error
+        } catch {
+            guard CGPreflightScreenCaptureAccess() else {
+                CGRequestScreenCaptureAccess()
+                throw SystemAudioError.permissionDenied
+            }
+            throw error
         }
+    }
+
+    private func startStream() async throws {
+        let content = try await SCShareableContent.current
+        guard let display = content.displays.first else { throw SystemAudioError.noDisplay }
 
         // We capture the whole display's audio. Video is required by SCStream but
         // we keep it tiny and never read the frames.
@@ -62,7 +72,9 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        onError?(error.localizedDescription)
+        let onError = self.onError
+        let message = error.localizedDescription
+        deliverOnMain { onError?(message) }
     }
 
     // MARK: - Conversion helpers

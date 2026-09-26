@@ -5,8 +5,10 @@ import AVFoundation
 /// a WebSocket and emits interim + final segments. Unlike the on-device backends,
 /// audio leaves the machine, so this is opt-in.
 final class CloudTranscriber: LiveTranscriber {
-    var onSegment: ((_ text: String, _ isFinal: Bool) -> Void)?
-    var onError: ((String) -> Void)?
+    let backendName = "Deepgram"
+    var onSegment: (@MainActor (TranscriptSegment) -> Void)?
+    var onError: (@MainActor (String) -> Void)?
+    var onNotice: (@MainActor (String?) -> Void)?
 
     private let apiKey: String
     private let localeIdentifier: String
@@ -14,6 +16,7 @@ final class CloudTranscriber: LiveTranscriber {
     private var task: URLSessionWebSocketTask?
     private var converter: AVAudioConverter?
     private var running = false
+    private var utterance = 0
 
     init(apiKey: String, localeIdentifier: String = "en-US") {
         self.apiKey = apiKey
@@ -24,7 +27,7 @@ final class CloudTranscriber: LiveTranscriber {
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) { completion(true) }
 
     func start() {
-        guard !apiKey.isEmpty else { onError?("Missing Deepgram API key."); return }
+        guard !apiKey.isEmpty else { report("Missing Deepgram API key."); return }
         var components = URLComponents(string: "wss://api.deepgram.com/v1/listen")!
         components.queryItems = [
             URLQueryItem(name: "model", value: "nova-3"),
@@ -36,7 +39,7 @@ final class CloudTranscriber: LiveTranscriber {
             URLQueryItem(name: "punctuate", value: "true"),
             URLQueryItem(name: "language", value: localeIdentifier),
         ]
-        guard let url = components.url else { onError?("Bad Deepgram URL."); return }
+        guard let url = components.url else { report("Bad Deepgram URL."); return }
         var request = URLRequest(url: url)
         request.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
         let task = session.webSocketTask(with: request)
@@ -60,7 +63,7 @@ final class CloudTranscriber: LiveTranscriber {
         guard running, let task, let data = pcm16Data(from: buffer), !data.isEmpty else { return }
         task.send(.data(data)) { [weak self] error in
             guard let self, let error, self.running else { return }
-            self.onError?("Deepgram send: \(error.localizedDescription)")
+            self.report("Deepgram send: \(error.localizedDescription)")
         }
     }
 
@@ -71,7 +74,7 @@ final class CloudTranscriber: LiveTranscriber {
             guard let self else { return }
             switch result {
             case .failure(let error):
-                if self.running { self.onError?("Deepgram: \(error.localizedDescription)") }
+                if self.running { self.report("Deepgram: \(error.localizedDescription)") }
             case .success(let message):
                 self.handle(message)
                 if self.running { self.receive() }
@@ -92,9 +95,16 @@ final class CloudTranscriber: LiveTranscriber {
               let alternatives = channel["alternatives"] as? [[String: Any]],
               let transcript = alternatives.first?["transcript"] as? String else { return }
         let isFinal = (object["is_final"] as? Bool) ?? false
-        if !transcript.isEmpty || isFinal {
-            onSegment?(transcript, isFinal)
-        }
+        guard !transcript.isEmpty || isFinal else { return }
+        let segment = TranscriptSegment(utterance: utterance, text: transcript, isFinal: isFinal)
+        if isFinal { utterance += 1 }
+        let onSegment = self.onSegment
+        deliverOnMain { onSegment?(segment) }
+    }
+
+    private func report(_ message: String) {
+        let onError = self.onError
+        deliverOnMain { onError?(message) }
     }
 
     // MARK: - Audio conversion

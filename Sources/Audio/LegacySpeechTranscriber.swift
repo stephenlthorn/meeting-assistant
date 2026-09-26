@@ -10,17 +10,19 @@ import AVFoundation
 /// Permission: `requestAuthorization` triggers the Speech Recognition prompt.
 /// Add `NSSpeechRecognitionUsageDescription` to Info.plist (project.yml does this).
 final class LegacySpeechTranscriber: LiveTranscriber {
+    let backendName = "on-device"
     private let recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var segmentStart = Date()
     private let rotateAfter: TimeInterval = 45
     private var running = false
+    private var requestCount = 0
     private let queue = DispatchQueue(label: "meetingassistant.speech")
 
-    /// Emits the current segment's text and whether it is finalized. Off the main thread.
-    var onSegment: ((_ text: String, _ isFinal: Bool) -> Void)?
-    var onError: ((String) -> Void)?
+    var onSegment: (@MainActor (TranscriptSegment) -> Void)?
+    var onError: (@MainActor (String) -> Void)?
+    var onNotice: (@MainActor (String?) -> Void)?
 
     init(localeIdentifier: String = "en-US") {
         recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier))
@@ -36,7 +38,8 @@ final class LegacySpeechTranscriber: LiveTranscriber {
         queue.async { [weak self] in
             guard let self else { return }
             guard let recognizer = self.recognizer, recognizer.isAvailable else {
-                self.onError?("Speech recognizer unavailable for this locale.")
+                let onError = self.onError
+                deliverOnMain { onError?("Speech recognizer unavailable for this locale.") }
                 return
             }
             self.running = true
@@ -75,12 +78,18 @@ final class LegacySpeechTranscriber: LiveTranscriber {
             req.requiresOnDeviceRecognition = true
         }
         segmentStart = Date()
+        requestCount += 1
+        let utterance = requestCount
         request = req
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
             self.queue.async {
                 if let result {
-                    self.onSegment?(result.bestTranscription.formattedString, result.isFinal)
+                    let segment = TranscriptSegment(utterance: utterance,
+                                                    text: result.bestTranscription.formattedString,
+                                                    isFinal: result.isFinal)
+                    let onSegment = self.onSegment
+                    deliverOnMain { onSegment?(segment) }
                 }
                 if error != nil, self.running {
                     self.rotate()

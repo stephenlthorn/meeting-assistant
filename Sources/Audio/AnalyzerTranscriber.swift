@@ -16,8 +16,10 @@ import Speech
 /// macOS 26 release.
 @available(macOS 26, *)
 final class AnalyzerTranscriber: LiveTranscriber {
-    var onSegment: ((_ text: String, _ isFinal: Bool) -> Void)?
-    var onError: ((String) -> Void)?
+    let backendName = "on-device"
+    var onSegment: (@MainActor (TranscriptSegment) -> Void)?
+    var onError: (@MainActor (String) -> Void)?
+    var onNotice: (@MainActor (String?) -> Void)?
 
     private let localeIdentifier: String
     private var analyzer: SpeechAnalyzer?
@@ -47,7 +49,8 @@ final class AnalyzerTranscriber: LiveTranscriber {
             do {
                 try await self.setUpAndRun()
             } catch {
-                self.onError?("SpeechAnalyzer setup failed: \(error.localizedDescription)")
+                let onError = self.onError
+                deliverOnMain { onError?("SpeechAnalyzer setup failed: \(error.localizedDescription)") }
             }
         }
     }
@@ -113,13 +116,19 @@ final class AnalyzerTranscriber: LiveTranscriber {
 
         resultsTask = Task { [weak self] in
             guard let self, let transcriber = self.transcriber else { return }
+            var utterance = 0
             do {
                 for try await result in transcriber.results {
-                    self.onSegment?(String(result.text.characters), result.isFinal)
+                    let segment = TranscriptSegment(utterance: utterance, text: String(result.text.characters),
+                                                    isFinal: result.isFinal)
+                    if result.isFinal { utterance += 1 }
+                    let onSegment = self.onSegment
+                    deliverOnMain { onSegment?(segment) }
                 }
             } catch {
                 if self.running {
-                    self.onError?("Transcription stream error: \(error.localizedDescription)")
+                    let onError = self.onError
+                    deliverOnMain { onError?("Transcription stream error: \(error.localizedDescription)") }
                 }
             }
         }

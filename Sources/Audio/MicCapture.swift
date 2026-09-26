@@ -6,12 +6,12 @@ import AVFoundation
 ///
 /// Permission: needs microphone access (NSMicrophoneUsageDescription in
 /// Info.plist; the system prompt is triggered by `requestAuthorization`).
-final class MicCapture {
+final class MicCapture: MicrophoneCapturing {
     private let engine = AVAudioEngine()
     private var tapped = false
 
-    var onBuffer: ((AVAudioPCMBuffer) -> Void)?
-    var onError: ((String) -> Void)?
+    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    var onError: (@MainActor (String) -> Void)?
 
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {

@@ -18,7 +18,7 @@ struct MeetingAssistantApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    let controller = AssistantController()
+    let controller = AssistantController.live()
     private var panel: OverlayPanel?
     private var answerHotKey: HotKeyManager?
     private var toggleHotKey: HotKeyManager?
@@ -64,7 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 struct MenuContent: View {
-    @ObservedObject var controller: AssistantController
+    let controller: AssistantController
     @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
@@ -82,7 +82,11 @@ struct MenuContent: View {
 
         Divider()
 
-        Button("Copy Transcript") { controller.copyTranscript() }
+        Button("Copy Transcript") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(controller.transcriptText, forType: .string)
+        }
+        .disabled(controller.transcriptText.isEmpty)
         Button("Clear Transcript") { controller.clearTranscript() }
 
         Divider()

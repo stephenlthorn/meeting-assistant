@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The overlay content: status header, live two-sided transcript, and streaming answer.
 struct OverlayView: View {
-    @ObservedObject var controller: AssistantController
+    let controller: AssistantController
     @ObservedObject private var settings = AppSettings.shared
 
     var body: some View {
@@ -11,7 +11,7 @@ struct OverlayView: View {
             Divider()
             section(title: "Transcript (You + Them)") {
                 ScrollView {
-                    Text(controller.transcript.isEmpty ? "Listening for audio..." : controller.transcript)
+                    Text(controller.transcriptDisplay.isEmpty ? "Listening for audio..." : controller.transcriptDisplay)
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)

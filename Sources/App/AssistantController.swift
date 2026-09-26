@@ -1,6 +1,6 @@
-import Foundation
 import AVFoundation
-import AppKit
+import Foundation
+import Observation
 
 /// Which side of the conversation a transcript line came from.
 enum Speaker: String {
@@ -8,212 +8,351 @@ enum Speaker: String {
     case them = "Them"
 }
 
-/// Orchestrates the pipeline: system audio (them) + microphone (you) feed two
-/// transcribers, whose segments merge into one speaker-labeled transcript. On a
-/// manual trigger (or auto-answer) the recent transcript is sent to the LLM.
-/// Transcribers are created per session so a Settings change (e.g. cloud STT)
-/// applies on the next Start.
+enum ListeningState: Equatable {
+    case idle, starting, listening
+}
+
+/// Orchestrates the pipeline: system audio (them) and the microphone (you)
+/// feed two transcribers whose segments merge into one speaker-labeled
+/// transcript; on demand (or auto-answer) the recent transcript goes to Claude.
+///
+/// Everything here runs on the main actor except audio, which capture threads
+/// hand to the current transcribers through lock-protected slots. Each Start
+/// and Stop begins a new session, and callbacks from older sessions are
+/// ignored. Starting and stopping system audio is chained, so a Start never
+/// overlaps the previous Stop.
 @MainActor
-final class AssistantController: ObservableObject {
-    @Published var transcript = ""
-    @Published var answer = ""
-    @Published var status = "Idle"
-    @Published var isListening = false
+@Observable
+final class AssistantController {
+    static let displayCharacters = 1_500
+    static let promptCharacters = 4_000
+    static let autoAnswerInterval: TimeInterval = 6
+    private static let maxProblems = 3
 
-    private let settings = AppSettings.shared
-    private let systemCapture = SystemAudioCapture()
-    private let micCapture = MicCapture()
-    private var themTranscriber: LiveTranscriber?
-    private var youTranscriber: LiveTranscriber?
-    private let llm = LLMClient()
-    private var answerTask: Task<Void, Never>?
-    private var lastAutoAnswer = Date.distantPast
+    private(set) var listening: ListeningState = .idle
+    private(set) var status = "Idle"
+    private(set) var problems: [Problem] = []
+    private(set) var notice: String?
+    private(set) var transcriptDisplay = ""
+    private(set) var answer = ""
+    private(set) var isAnswering = false
 
-    private struct Turn { let speaker: Speaker; var text: String; var isFinal: Bool }
-    private var turns: [Turn] = []
-    private var activeIndex: [Speaker: Int] = [:]
+    var isListening: Bool { listening != .idle }
+    var transcriptText: String { transcript.text }
 
-    init() {
-        systemCapture.onBuffer = { [weak self] buffer in self?.themTranscriber?.append(buffer) }
-        systemCapture.onError = { [weak self] message in
-            Task { @MainActor in self?.status = "System audio: \(message)" }
+    private enum SideState { case off, pending, up, failed }
+
+    @ObservationIgnored private let settings: AppSettings
+    @ObservationIgnored private let systemAudio: SystemAudioCapturing
+    @ObservationIgnored private let microphone: MicrophoneCapturing
+    @ObservationIgnored private let makeTranscriber: @MainActor (Speaker) -> LiveTranscriber
+    @ObservationIgnored private let answerer: AnswerStreaming
+    @ObservationIgnored private let now: () -> Date
+
+    @ObservationIgnored private let themSlot = TranscriberSlot()
+    @ObservationIgnored private let youSlot = TranscriberSlot()
+    @ObservationIgnored private var themTranscriber: LiveTranscriber?
+    @ObservationIgnored private var youTranscriber: LiveTranscriber?
+    @ObservationIgnored private var themSide = SideState.off
+    @ObservationIgnored private var youSide = SideState.off
+    @ObservationIgnored private var backendName = ""
+    @ObservationIgnored private var session = 0
+    @ObservationIgnored private var lifecycle: Task<Void, Never>?
+
+    @ObservationIgnored private var transcript = Transcript()
+    @ObservationIgnored private var answerTask: Task<Void, Never>?
+    @ObservationIgnored private var answerRequest = 0
+    @ObservationIgnored private var lastAutoAnswer = Date.distantPast
+
+    init(settings: AppSettings,
+         systemAudio: SystemAudioCapturing,
+         microphone: MicrophoneCapturing,
+         makeTranscriber: @escaping @MainActor (Speaker) -> LiveTranscriber,
+         answerer: AnswerStreaming,
+         now: @escaping () -> Date = Date.init) {
+        self.settings = settings
+        self.systemAudio = systemAudio
+        self.microphone = microphone
+        self.makeTranscriber = makeTranscriber
+        self.answerer = answerer
+        self.now = now
+        systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
+        microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
+        systemAudio.onError = { [weak self] message in
+            self?.report(Problem(message: "Meeting audio stopped: \(message)"))
         }
-        micCapture.onBuffer = { [weak self] buffer in self?.youTranscriber?.append(buffer) }
-        micCapture.onError = { [weak self] message in
-            Task { @MainActor in self?.status = "Mic: \(message)" }
+        microphone.onError = { [weak self] message in
+            self?.report(Problem(message: "Microphone stopped: \(message)"))
         }
     }
 
-    func toggleListening() { isListening ? stop() : start() }
+    static func live(settings: AppSettings = .shared) -> AssistantController {
+        AssistantController(settings: settings,
+                            systemAudio: SystemAudioCapture(),
+                            microphone: MicCapture(),
+                            makeTranscriber: { _ in TranscriberFactory.make(settings: settings) },
+                            answerer: AnthropicClient())
+    }
+
+    // MARK: - Listening
+
+    func toggleListening() {
+        isListening ? stop() : start()
+    }
 
     func start() {
-        clearTranscript()
-        let them = TranscriberFactory.make()
-        wire(them, .them)
+        guard listening == .idle else { return }
+        session += 1
+        let current = session
+        listening = .starting
+        status = "Starting…"
+        problems = []
+        notice = nil
+        resetTranscriptAndAnswer()
+
+        let them = makeTranscriber(.them)
+        let you = makeTranscriber(.you)
+        wire(them, as: .them, session: current)
+        wire(you, as: .you, session: current)
         themTranscriber = them
-        let you = TranscriberFactory.make()
-        wire(you, .you)
         youTranscriber = you
+        backendName = them.backendName
+        themSide = .pending
+        youSide = .pending
 
-        // Speech authorization is process-wide and shared (cloud/analyzer return true).
         them.requestAuthorization { [weak self] granted in
-            guard let self else { return }
-            guard granted else {
-                self.status = "Speech permission denied"
-                return
-            }
-            self.startThemSide()
-            self.startYouSide()
+            deliverOnMain { self?.speechAuthorizationResolved(granted, session: current) }
         }
-    }
-
-    private func wire(_ transcriber: LiveTranscriber, _ speaker: Speaker) {
-        transcriber.onSegment = { [weak self] text, isFinal in
-            Task { @MainActor in self?.ingest(speaker, text, isFinal) }
-        }
-        transcriber.onError = { [weak self] message in
-            Task { @MainActor in self?.status = "\(speaker.rawValue): \(message)" }
-        }
-    }
-
-    private func startThemSide() {
-        themTranscriber?.start()
-        Task {
-            do {
-                try await systemCapture.start()
-                isListening = true
-                status = statusLabel()
-            } catch {
-                status = "System audio failed: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    private func startYouSide() {
-        micCapture.requestAuthorization { [weak self] granted in
-            guard let self else { return }
-            guard granted else {
-                self.status = "Listening (mic denied: their side only)"
-                return
-            }
-            self.youTranscriber?.start()
-            do {
-                try self.micCapture.start()
-            } catch {
-                self.status = "Mic failed: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    private func statusLabel() -> String {
-        (settings.useCloudSTT && settings.deepgramKeySource != nil) ? "Listening (Deepgram)" : "Listening"
     }
 
     func stop() {
-        let systemCapture = self.systemCapture
-        Task { await systemCapture.stop() }
-        micCapture.stop()
-        themTranscriber?.stop()
-        themTranscriber = nil
-        youTranscriber?.stop()
-        youTranscriber = nil
-        isListening = false
+        guard listening != .idle else { return }
+        session += 1
+        tearDown()
+        listening = .idle
         status = "Stopped"
+        notice = nil
     }
+
+    private func speechAuthorizationResolved(_ granted: Bool, session current: Int) {
+        guard session == current else { return }
+        guard granted else {
+            report(Problem(message: "Speech Recognition permission is off. Allow Meeting Assistant in System Settings.",
+                           fix: .speechRecognition))
+            themSide = .failed
+            youSide = .failed
+            resolveStartup()
+            return
+        }
+        startThemSide(session: current)
+        startYouSide(session: current)
+    }
+
+    private func startThemSide(session current: Int) {
+        guard let them = themTranscriber else { return }
+        them.start()
+        themSlot.set(them)
+        let previous = lifecycle
+        lifecycle = Task { [weak self, systemAudio] in
+            await previous?.value
+            do {
+                try await systemAudio.start()
+                guard let self, self.session == current else {
+                    await systemAudio.stop()
+                    return
+                }
+                self.themSide = .up
+                self.resolveStartup()
+            } catch {
+                guard let self, self.session == current else { return }
+                self.themSlot.set(nil)
+                them.stop()
+                self.themSide = .failed
+                self.report(Self.problem(forSystemAudioError: error))
+                self.resolveStartup()
+            }
+        }
+    }
+
+    private func startYouSide(session current: Int) {
+        microphone.requestAuthorization { [weak self] granted in
+            deliverOnMain { self?.microphoneAuthorizationResolved(granted, session: current) }
+        }
+    }
+
+    private func microphoneAuthorizationResolved(_ granted: Bool, session current: Int) {
+        guard session == current, let you = youTranscriber else { return }
+        guard granted else {
+            youSide = .failed
+            report(Problem(message: "Microphone access is off, so only their side is transcribed.", fix: .microphone))
+            resolveStartup()
+            return
+        }
+        you.start()
+        youSlot.set(you)
+        do {
+            try microphone.start()
+            youSide = .up
+        } catch {
+            youSlot.set(nil)
+            you.stop()
+            youSide = .failed
+            report(Problem(message: "Couldn't start the microphone: \(error.localizedDescription)"))
+        }
+        resolveStartup()
+    }
+
+    private func resolveStartup() {
+        switch (themSide, youSide) {
+        case (.up, _), (_, .up):
+            listening = .listening
+            status = listeningStatus()
+        case (.failed, .failed):
+            session += 1
+            tearDown()
+            listening = .idle
+            status = "Not listening"
+        default:
+            break
+        }
+    }
+
+    private func listeningStatus() -> String {
+        let scope: String? = switch (themSide, youSide) {
+        case (.up, .failed): "their side only"
+        case (.failed, .up): "your side only"
+        default: nil
+        }
+        return "Listening (" + ([backendName] + [scope].compactMap { $0 }).joined(separator: ", ") + ")"
+    }
+
+    private func tearDown() {
+        themSlot.set(nil)
+        youSlot.set(nil)
+        if youSide == .up { microphone.stop() }
+        if themSide == .pending || themSide == .up {
+            let previous = lifecycle
+            lifecycle = Task { [systemAudio] in
+                await previous?.value
+                await systemAudio.stop()
+            }
+        }
+        themTranscriber?.stop()
+        youTranscriber?.stop()
+        themTranscriber = nil
+        youTranscriber = nil
+        themSide = .off
+        youSide = .off
+    }
+
+    private func wire(_ transcriber: LiveTranscriber, as speaker: Speaker, session current: Int) {
+        transcriber.onSegment = { [weak self] segment in
+            guard let self, self.session == current else { return }
+            self.receive(segment, from: speaker)
+        }
+        transcriber.onError = { [weak self] message in
+            guard let self, self.session == current else { return }
+            self.report(Problem(message: "\(speaker.rawValue): \(message)"))
+        }
+        transcriber.onNotice = { [weak self] message in
+            guard let self, self.session == current else { return }
+            self.notice = message
+        }
+    }
+
+    private func report(_ problem: Problem) {
+        guard !problems.contains(problem) else { return }
+        problems = Array((problems + [problem]).suffix(Self.maxProblems))
+    }
+
+    private static func problem(forSystemAudioError error: Error) -> Problem {
+        guard (error as? SystemAudioError) == .permissionDenied else {
+            return Problem(message: "Couldn't capture meeting audio: \(error.localizedDescription)")
+        }
+        return Problem(message: "Meeting audio needs Screen Recording permission. Allow Meeting Assistant in System Settings, then quit and reopen it.",
+                       fix: .screenRecording)
+    }
+
+    // MARK: - Transcript
+
+    func clearTranscript() {
+        resetTranscriptAndAnswer()
+    }
+
+    private func resetTranscriptAndAnswer() {
+        transcript = Transcript()
+        transcriptDisplay = ""
+        answerTask?.cancel()
+        answerRequest += 1
+        answer = ""
+        isAnswering = false
+    }
+
+    private func receive(_ segment: TranscriptSegment, from speaker: Speaker) {
+        let finished = transcript.apply(segment, from: speaker, at: now())
+        transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
+        guard let finished, finished.speaker == .them,
+              QuestionDetector.looksLikeQuestion(finished.text) else { return }
+        autoAnswerIfDue()
+    }
+
+    // MARK: - Answers
 
     func answerNow() {
         answerTask?.cancel()
-        let context = String(transcript.suffix(4000))
+        answerRequest += 1
+        let current = answerRequest
+        let context = transcript.tail(maxCharacters: Self.promptCharacters)
         guard !context.isEmpty else {
-            answer = "(No transcript yet. Start listening first.)"
+            answer = "No transcript yet. Start listening first."
+            isAnswering = false
             return
         }
         guard let apiKey = settings.resolveAPIKey() else {
-            answer = "No API key. Add one in Settings (⌘,)."
-            status = "Needs API key"
+            answer = "No API key. Add one in Settings (menu bar icon, then Settings…)."
+            isAnswering = false
             return
         }
         answer = ""
-        status = "Thinking..."
-        let model = settings.model
-        let system = systemPrompt()
-        let user = """
+        isAnswering = true
+        let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
+                                                   system: settings.systemPrompt,
+                                                   user: Self.userPrompt(context)))
+        answerTask = Task { [weak self] in
+            do {
+                for try await chunk in stream {
+                    guard let self, self.answerRequest == current else { return }
+                    self.answer += chunk
+                }
+                self?.finishAnswer(current, error: nil)
+            } catch {
+                self?.finishAnswer(current, error: error)
+            }
+        }
+    }
+
+    private func finishAnswer(_ request: Int, error: Error?) {
+        guard request == answerRequest else { return }
+        isAnswering = false
+        guard let error, !(error is CancellationError) else { return }
+        let message = "Error: \(error.localizedDescription)"
+        answer = answer.isEmpty ? message : answer + "\n\n" + message
+    }
+
+    private func autoAnswerIfDue() {
+        guard settings.autoAnswer, !isAnswering,
+              now().timeIntervalSince(lastAutoAnswer) >= Self.autoAnswerInterval else { return }
+        lastAutoAnswer = now()
+        answerNow()
+    }
+
+    private static func userPrompt(_ context: String) -> String {
+        """
         Live conversation transcript so far (You = me, Them = the other participants):
 
         \(context)
 
         Based on the latest exchange, give me help right now. Be concise.
         """
-        answerTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await self.llm.stream(apiKey: apiKey, model: model, system: system, user: user) { delta in
-                    Task { @MainActor in self.answer += delta }
-                }
-                self.status = self.isListening ? self.statusLabel() : "Idle"
-            } catch {
-                self.answer = "Error: \(error.localizedDescription)"
-                self.status = "Error"
-            }
-        }
-    }
-
-    func clearTranscript() {
-        turns.removeAll()
-        activeIndex.removeAll()
-        transcript = ""
-        answer = ""
-    }
-
-    func copyTranscript() {
-        guard !transcript.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(transcript, forType: .string)
-    }
-
-    // MARK: - Prompt
-
-    private func systemPrompt() -> String {
-        let base = settings.profile.systemPrompt
-        let extra = settings.extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        return extra.isEmpty ? base : base + "\n\nAdditional instructions from the user:\n" + extra
-    }
-
-    // MARK: - Transcript merge
-
-    /// Merges per-side segments into one ordered, speaker-labeled transcript.
-    /// Each side keeps one in-progress turn that updates in place until it
-    /// finalizes; new turns append in the order their segments start.
-    private func ingest(_ speaker: Speaker, _ text: String, _ isFinal: Bool) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let index = activeIndex[speaker], index < turns.count {
-            turns[index].text = trimmed
-            turns[index].isFinal = isFinal
-            if isFinal { activeIndex[speaker] = nil }
-        } else if !trimmed.isEmpty {
-            turns.append(Turn(speaker: speaker, text: trimmed, isFinal: isFinal))
-            if !isFinal { activeIndex[speaker] = turns.count - 1 }
-        }
-        transcript = turns
-            .filter { !$0.text.isEmpty }
-            .map { "\($0.speaker.rawValue): \($0.text)" }
-            .joined(separator: "\n")
-
-        if speaker == .them, isFinal, settings.autoAnswer, looksLikeQuestion(trimmed) {
-            if Date().timeIntervalSince(lastAutoAnswer) > 6 {
-                lastAutoAnswer = Date()
-                answerNow()
-            }
-        }
-    }
-
-    private func looksLikeQuestion(_ text: String) -> Bool {
-        let lowered = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard lowered.count > 3 else { return false }
-        if lowered.hasSuffix("?") { return true }
-        let starters = ["what", "why", "how", "when", "where", "who", "which",
-                        "can you", "could you", "would you", "do you", "did you",
-                        "are you", "is there", "tell me", "walk me through", "explain"]
-        return starters.contains { lowered.hasPrefix($0 + " ") || lowered == $0 }
     }
 }
