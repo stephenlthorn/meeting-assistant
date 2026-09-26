@@ -34,6 +34,11 @@ enum SystemAudioError: LocalizedError, Equatable {
     }
 }
 
+/// Runs `work` on a background queue after `delay` seconds.
+func runAfter(_ delay: TimeInterval, _ work: @escaping () -> Void) {
+    DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: work)
+}
+
 /// Runs `work` on the main actor, in the order calls were made.
 func deliverOnMain(_ work: @escaping @MainActor () -> Void) {
     DispatchQueue.main.async { MainActor.assumeIsolated(work) }

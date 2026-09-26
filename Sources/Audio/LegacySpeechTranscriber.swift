@@ -62,7 +62,7 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     init(engine: SpeechRecognitionEngine,
          queue: DispatchQueue = DispatchQueue(label: "meetingassistant.speech"),
          now: @escaping () -> Date = Date.init,
-         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = LegacySpeechTranscriber.afterDelay) {
+         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
         self.engine = engine
         self.queue = queue
         self.now = now
@@ -71,10 +71,6 @@ final class LegacySpeechTranscriber: LiveTranscriber {
 
     convenience init(localeIdentifier: String = "en-US") {
         self.init(engine: AppleSpeechEngine(localeIdentifier: localeIdentifier))
-    }
-
-    static func afterDelay(_ delay: TimeInterval, _ work: @escaping () -> Void) {
-        DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) {
