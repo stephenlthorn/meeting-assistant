@@ -1,16 +1,18 @@
 name: release
 
+# Publishes a release when VERSION changes on main (or on demand). It never
+# re-publishes an existing tag. With Developer ID secrets configured the app is
+# signed and notarized; otherwise it is ad-hoc signed.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
     paths:
       - "VERSION"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (e.g. v0.1.0)"
-        required: true
-        default: "v0.1.0"
+        description: "Release tag to create (defaults to the VERSION file)"
+        required: false
 
 permissions:
   contents: write
@@ -18,20 +20,54 @@ permissions:
 jobs:
   release:
     runs-on: macos-26
+    env:
+      APP: build/Build/Products/Release/MeetingAssistant.app
+      GH_TOKEN: ${{ github.token }}
+      INPUT_TAG: ${{ inputs.tag }}
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve tag
         id: ver
-        run: echo "tag=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="${INPUT_TAG:-$(cat VERSION)}"
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Tag must look like v1.2.3"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release $TAG already exists. Bump VERSION to publish a new one."
+          fi
 
       - name: Install XcodeGen
+        if: steps.ver.outputs.exists != 'true'
         run: brew install xcodegen
 
       - name: Generate Xcode project
+        if: steps.ver.outputs.exists != 'true'
         run: xcodegen generate
 
-      - name: Build (unsigned)
+      - name: Test
+        if: steps.ver.outputs.exists != 'true'
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project MeetingAssistant.xcodeproj \
+            -scheme MeetingAssistant \
+            -destination 'platform=macOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Build (Release)
+        if: steps.ver.outputs.exists != 'true'
         run: |
           set -o pipefail
           xcodebuild \
@@ -43,29 +79,73 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package .app
+      - name: Sign with Developer ID
+        if: steps.ver.outputs.exists != 'true' && env.MACOS_CERTIFICATE_P12 != ''
         run: |
-          APP="build/Build/Products/Release/MeetingAssistant.app"
-          test -d "$APP"
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          codesign --force --options runtime --timestamp \
+            --entitlements Config/MeetingAssistant.entitlements \
+            --sign "$MACOS_SIGNING_IDENTITY" "$APP"
+
+      - name: Ad-hoc sign
+        if: steps.ver.outputs.exists != 'true' && env.MACOS_CERTIFICATE_P12 == ''
+        run: codesign --force --options runtime --entitlements Config/MeetingAssistant.entitlements --sign - "$APP"
+
+      - name: Verify signature
+        if: steps.ver.outputs.exists != 'true'
+        run: codesign --verify --strict --verbose=2 "$APP"
+
+      - name: Package .app
+        if: steps.ver.outputs.exists != 'true'
+        run: ditto -c -k --sequesterRsrc --keepParent "$APP" MeetingAssistant.app.zip
+
+      - name: Notarize
+        id: notarize
+        if: steps.ver.outputs.exists != 'true' && env.MACOS_CERTIFICATE_P12 != '' && env.APPLE_ID != ''
+        run: |
+          xcrun notarytool submit MeetingAssistant.app.zip \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$APP"
+          rm MeetingAssistant.app.zip
           ditto -c -k --sequesterRsrc --keepParent "$APP" MeetingAssistant.app.zip
-          ls -lh MeetingAssistant.app.zip
+          echo "done=true" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        if: steps.ver.outputs.exists != 'true'
+        env:
+          NOTARIZED: ${{ steps.notarize.outputs.done }}
+        run: |
+          if [ "$NOTARIZED" = "true" ]; then
+            echo 'Signed and notarized macOS build of Meeting Assistant. Unzip `MeetingAssistant.app.zip` and open the app.' > release-notes.md
+          else
+            {
+              echo 'Ad-hoc signed macOS build of Meeting Assistant (not notarized).'
+              echo
+              echo 'Download `MeetingAssistant.app.zip`, then before first launch:'
+              echo
+              echo '```bash'
+              echo 'unzip MeetingAssistant.app.zip'
+              echo 'xattr -dr com.apple.quarantine MeetingAssistant.app'
+              echo 'open MeetingAssistant.app'
+              echo '```'
+              echo
+              echo 'macOS asks for Screen Recording and Microphone again after each ad-hoc update. Building from source in Xcode is the smoother path; see the README.'
+            } > release-notes.md
+          fi
 
       - name: Publish release
+        if: steps.ver.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || steps.ver.outputs.tag }}
+          tag_name: ${{ steps.ver.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: ${{ inputs.tag || steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
           files: MeetingAssistant.app.zip
-          body: |
-            Unsigned macOS build of Meeting Assistant.
-
-            Download `MeetingAssistant.app.zip`, then before first launch:
-
-            ```bash
-            unzip MeetingAssistant.app.zip
-            xattr -dr com.apple.quarantine MeetingAssistant.app
-            open MeetingAssistant.app
-            ```
-
-            Building from source in Xcode is the smoother path; see the README.
+          body_path: release-notes.md
