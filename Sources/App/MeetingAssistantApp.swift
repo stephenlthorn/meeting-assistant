@@ -31,13 +31,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.panel = panel
 
         // ⌘⇧Space: ask the model for help now.
-        answerHotKey = HotKeyManager(keyCode: UInt32(kVK_Space),
-                                     modifiers: UInt32(cmdKey | shiftKey)) { [weak self] in
+        answerHotKey = try? HotKeyManager(combo: HotKeyCombo(keyCode: UInt32(kVK_Space),
+                                                             modifiers: UInt32(cmdKey | shiftKey),
+                                                             label: "⌘⇧Space")) { [weak self] in
             self?.controller.answerNow()
         }
         // ⌘⇧H: show/hide the overlay.
-        toggleHotKey = HotKeyManager(keyCode: UInt32(kVK_ANSI_H),
-                                     modifiers: UInt32(cmdKey | shiftKey)) { [weak self] in
+        toggleHotKey = try? HotKeyManager(combo: HotKeyCombo(keyCode: UInt32(kVK_ANSI_H),
+                                                             modifiers: UInt32(cmdKey | shiftKey),
+                                                             label: "⌘⇧H")) { [weak self] in
             self?.toggleOverlay()
         }
     }

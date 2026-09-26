@@ -28,10 +28,29 @@ targets:
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: NO
 
+  MeetingAssistantTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: Sources
+        excludes:
+          - "App/MeetingAssistantApp.swift"
+          - "Support/**"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.meetingassistant.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
+
 schemes:
   MeetingAssistant:
     build:
       targets:
-        MeetingAssistant: all
+        MeetingAssistant: [running, profiling, analyzing, archiving]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - MeetingAssistantTests
