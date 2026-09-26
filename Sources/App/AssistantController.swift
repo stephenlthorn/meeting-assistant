@@ -106,7 +106,7 @@ final class AssistantController: ObservableObject {
     }
 
     private func statusLabel() -> String {
-        (settings.useCloudSTT && settings.deepgramKeyPresent) ? "Listening (Deepgram)" : "Listening"
+        (settings.useCloudSTT && settings.deepgramKeySource != nil) ? "Listening (Deepgram)" : "Listening"
     }
 
     func stop() {

@@ -1,44 +1,57 @@
 import Foundation
 import Security
 
-/// Minimal Keychain wrapper for storing the API key as a generic password.
-enum KeychainStore {
-    private static let service = "com.example.meetingassistant"
+/// Where API keys live: the Keychain in the app, memory in tests.
+protocol SecretStore {
+    func read(_ account: String) -> String?
+    /// Whether a secret exists, without reading (and so decrypting) it.
+    func contains(_ account: String) -> Bool
+    /// Replaces any existing secret; returns false and keeps the old one on failure.
+    func write(_ value: String, for account: String) -> Bool
+    func delete(_ account: String)
+}
 
-    static func set(_ value: String, for account: String) {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(query as CFDictionary)
-        query[kSecValueData as String] = Data(value.utf8)
-        SecItemAdd(query as CFDictionary, nil)
-    }
+/// Generic-password Keychain storage for the API keys.
+struct KeychainStore: SecretStore {
+    let service: String
 
-    static func get(_ account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
+    func read(_ account: String) -> String? {
+        var query = baseQuery(account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let string = String(data: data, encoding: .utf8) else {
-            return nil
-        }
-        return string
+              let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
-    static func delete(_ account: String) {
-        let query: [String: Any] = [
+    func contains(_ account: String) -> Bool {
+        var query = baseQuery(account)
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        return SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess
+    }
+
+    func write(_ value: String, for account: String) -> Bool {
+        let data = Data(value.utf8)
+        let status = SecItemUpdate(baseQuery(account) as CFDictionary,
+                                   [kSecValueData as String: data] as CFDictionary)
+        guard status == errSecItemNotFound else { return status == errSecSuccess }
+        var item = baseQuery(account)
+        item[kSecValueData as String] = data
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+
+    func delete(_ account: String) {
+        SecItemDelete(baseQuery(account) as CFDictionary)
+    }
+
+    private func baseQuery(_ account: String) -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        SecItemDelete(query as CFDictionary)
     }
 }

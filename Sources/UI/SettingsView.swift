@@ -20,7 +20,7 @@ struct SettingsView: View {
 
                     keyStatus(settings.apiKeyPresent)
                     Spacer()
-                    Button("Remove") { settings.setAPIKey("") }
+                    Button("Remove") { settings.removeAPIKey() }
                         .disabled(!settings.apiKeyPresent)
                 }
                 Picker("Model", selection: $settings.model) {
@@ -32,10 +32,7 @@ struct SettingsView: View {
 
             Section("Behavior") {
                 Toggle("Auto-answer when the other side asks a question", isOn: $settings.autoAnswer)
-                Picker("Profile", selection: Binding(
-                    get: { settings.profile },
-                    set: { settings.profileRaw = $0.rawValue }
-                )) {
+                Picker("Profile", selection: $settings.profile) {
                     ForEach(Profile.allCases) { Text($0.rawValue).tag($0) }
                 }
             }
@@ -50,10 +47,10 @@ struct SettingsView: View {
                     }
                     .disabled(deepgramField.trimmingCharacters(in: .whitespaces).isEmpty)
 
-                    keyStatus(settings.deepgramKeyPresent)
+                    keyStatus(settings.deepgramKeySource != nil)
                     Spacer()
-                    Button("Remove") { settings.setDeepgramKey("") }
-                        .disabled(!settings.deepgramKeyPresent)
+                    Button("Remove") { settings.removeDeepgramKey() }
+                        .disabled(settings.deepgramKeySource == nil)
                 }
                 Text("On-device is the default (private). Cloud STT sends call audio to Deepgram and applies the next time you Start Listening.")
                     .font(.caption)

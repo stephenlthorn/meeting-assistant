@@ -76,10 +76,7 @@ struct MenuContent: View {
         Divider()
 
         Toggle("Auto-answer their questions", isOn: $settings.autoAnswer)
-        Picker("Profile", selection: Binding(
-            get: { settings.profile },
-            set: { settings.profileRaw = $0.rawValue }
-        )) {
+        Picker("Profile", selection: $settings.profile) {
             ForEach(Profile.allCases) { Text($0.rawValue).tag($0) }
         }
 
