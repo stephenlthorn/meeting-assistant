@@ -7,12 +7,7 @@ import XCTest
 @MainActor
 final class OverlayRenderTests: XCTestCase {
     func testTheOverlayRendersALiveSession() async throws {
-        let suite = "MeetingAssistantTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
-        let settings = AppSettings(defaults: defaults,
-                                   secrets: InMemorySecretStore(values: ["anthropic_api_key": "sk-test"]),
-                                   environment: [:], anthropicKeyFile: URL(fileURLWithPath: "/nonexistent"))
+        let settings = makeTestSettings(for: self)
         let microphone = FakeMicrophone()
         microphone.authorized = false
         let transcribers = FakeTranscriberFactory()

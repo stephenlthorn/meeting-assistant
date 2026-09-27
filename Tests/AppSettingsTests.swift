@@ -182,6 +182,47 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertFalse(makeSettings(defaults: defaults).showsOverlay)
     }
 
+    // MARK: - Privacy terms
+
+    func testThePrivacyTermsStartUnaccepted() {
+        XCTAssertFalse(makeSettings().hasAcceptedTerms)
+    }
+
+    func testAcceptingThePrivacyTermsPersists() {
+        let defaults = freshDefaults()
+        makeSettings(defaults: defaults).acceptTerms()
+
+        XCTAssertTrue(makeSettings(defaults: defaults).hasAcceptedTerms)
+    }
+
+    func testTermsAcceptedForAnEarlierVersionMustBeAcceptedAgain() {
+        let defaults = freshDefaults()
+        defaults.set(AppSettings.termsVersion - 1, forKey: "acceptedTermsVersion")
+
+        XCTAssertFalse(makeSettings(defaults: defaults).hasAcceptedTerms)
+    }
+
+    func testAcceptingCloudAudioTurnsOnDeepgramAndPersists() {
+        let defaults = freshDefaults()
+        makeSettings(defaults: defaults).acceptCloudAudio()
+
+        let settings = makeSettings(defaults: defaults)
+        XCTAssertTrue(settings.cloudAudioAccepted)
+        XCTAssertTrue(settings.useCloudSTT)
+    }
+
+    func testWithdrawingTheTermsAlsoStopsSendingAudioToDeepgram() {
+        let settings = makeSettings()
+        settings.acceptTerms()
+        settings.acceptCloudAudio()
+
+        settings.withdrawTerms()
+
+        XCTAssertFalse(settings.hasAcceptedTerms)
+        XCTAssertFalse(settings.cloudAudioAccepted)
+        XCTAssertFalse(settings.useCloudSTT)
+    }
+
     // MARK: - Migration from the com.example bundle id
 
     func testSettingsAndKeysMoveOverFromTheOldBundleID() {

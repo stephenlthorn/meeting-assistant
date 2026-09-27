@@ -8,6 +8,7 @@ enum OverlayText {
         case .idle: "Not listening. Start from the menu bar icon."
         case .starting: "Starting…"
         case .listening: "Listening for audio…"
+        case .sample: "The sample meeting is about to start…"
         }
     }
 
@@ -16,5 +17,16 @@ enum OverlayText {
         if isAnswering { return "Thinking…" }
         if !hasKey { return "Add your Anthropic API key: menu bar icon, then Settings…" }
         return "Press \(shortcut) for help"
+    }
+}
+
+/// The menu bar icon: a record symbol whenever audio is being captured.
+enum MenuBarSymbol {
+    static func name(for state: ListeningState) -> String {
+        switch state {
+        case .idle: "waveform.circle"
+        case .starting, .listening: "record.circle"
+        case .sample: "play.circle"
+        }
     }
 }

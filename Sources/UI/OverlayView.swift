@@ -71,6 +71,7 @@ private struct OverlayHeader: View {
         switch controller.listening {
         case .listening: .green
         case .starting: .orange
+        case .sample: .blue
         case .idle: .gray
         }
     }

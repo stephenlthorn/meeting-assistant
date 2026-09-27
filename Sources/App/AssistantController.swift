@@ -9,7 +9,7 @@ enum Speaker: String {
 }
 
 enum ListeningState: Equatable {
-    case idle, starting, listening
+    case idle, starting, listening, sample
 }
 
 /// Orchestrates the pipeline: system audio (them) and the microphone (you)
@@ -21,6 +21,10 @@ enum ListeningState: Equatable {
 /// and Stop begins a new session, and callbacks from older sessions are
 /// ignored. Starting and stopping system audio is chained, so a Start never
 /// overlaps the previous Stop.
+///
+/// Listening and answering wait until the privacy terms are accepted;
+/// `onTermsNeeded` receives a closure that carries on once they are. The
+/// sample meeting needs no terms, since it records nothing.
 @MainActor
 @Observable
 final class AssistantController {
@@ -40,6 +44,9 @@ final class AssistantController {
     var isListening: Bool { listening != .idle }
     var transcriptText: String { transcript.text }
 
+    /// Asked to show the privacy terms; call the closure once they are accepted.
+    @ObservationIgnored var onTermsNeeded: ((@escaping () -> Void) -> Void)?
+
     private enum SideState { case off, pending, up, failed }
 
     @ObservationIgnored private let settings: AppSettings
@@ -48,6 +55,8 @@ final class AssistantController {
     @ObservationIgnored private let makeTranscriber: @MainActor (Speaker) -> LiveTranscriber
     @ObservationIgnored private let answerer: AnswerStreaming
     @ObservationIgnored private let now: () -> Date
+    @ObservationIgnored private let schedule: (TimeInterval, @escaping () -> Void) -> Void
+    @ObservationIgnored private let sampleWordDelay: TimeInterval
 
     @ObservationIgnored private let themSlot = TranscriberSlot()
     @ObservationIgnored private let youSlot = TranscriberSlot()
@@ -63,19 +72,24 @@ final class AssistantController {
     @ObservationIgnored private var answerTask: Task<Void, Never>?
     @ObservationIgnored private var answerRequest = 0
     @ObservationIgnored private var lastAutoAnswer = Date.distantPast
+    @ObservationIgnored private var sampleAnswersShown = 0
 
     init(settings: AppSettings,
          systemAudio: SystemAudioCapturing,
          microphone: MicrophoneCapturing,
          makeTranscriber: @escaping @MainActor (Speaker) -> LiveTranscriber,
          answerer: AnswerStreaming,
-         now: @escaping () -> Date = Date.init) {
+         now: @escaping () -> Date = Date.init,
+         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
+         sampleWordDelay: TimeInterval = 0.04) {
         self.settings = settings
         self.systemAudio = systemAudio
         self.microphone = microphone
         self.makeTranscriber = makeTranscriber
         self.answerer = answerer
         self.now = now
+        self.schedule = schedule
+        self.sampleWordDelay = sampleWordDelay
         systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
         microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
         systemAudio.onError = { [weak self] message in
@@ -102,6 +116,10 @@ final class AssistantController {
 
     func start() {
         guard listening == .idle else { return }
+        guard settings.hasAcceptedTerms else {
+            onTermsNeeded?({ [weak self] in self?.start() })
+            return
+        }
         session += 1
         let current = session
         listening = .starting
@@ -299,6 +317,11 @@ final class AssistantController {
     // MARK: - Answers
 
     func answerNow() {
+        let inSample = listening == .sample
+        guard inSample || settings.hasAcceptedTerms else {
+            onTermsNeeded?({ [weak self] in self?.answerNow() })
+            return
+        }
         answerTask?.cancel()
         answerRequest += 1
         let current = answerRequest
@@ -308,16 +331,20 @@ final class AssistantController {
             isAnswering = false
             return
         }
-        guard let apiKey = settings.resolveAPIKey() else {
+        let stream: AsyncThrowingStream<String, Error>
+        if let apiKey = settings.resolveAPIKey() {
+            stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
+                                                   system: settings.systemPrompt,
+                                                   user: Self.userPrompt(context)))
+        } else if inSample {
+            stream = nextSampleAnswer()
+        } else {
             answer = "No API key. Add one in Settings (menu bar icon, then Settings…)."
             isAnswering = false
             return
         }
         answer = ""
         isAnswering = true
-        let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: settings.systemPrompt,
-                                                   user: Self.userPrompt(context)))
         answerTask = Task { [weak self] in
             do {
                 for try await chunk in stream {
@@ -344,6 +371,52 @@ final class AssistantController {
               now().timeIntervalSince(lastAutoAnswer) >= Self.autoAnswerInterval else { return }
         lastAutoAnswer = now()
         answerNow()
+    }
+
+    // MARK: - Sample meeting
+
+    /// Plays the scripted call from `SampleMeeting`, answering its questions as
+    /// they come, so the app can be tried without a meeting or permissions.
+    func startSample() {
+        guard listening == .idle else { return }
+        session += 1
+        listening = .sample
+        status = "Sample meeting (nothing is recorded)"
+        problems = []
+        notice = nil
+        resetTranscriptAndAnswer()
+        sampleAnswersShown = 0
+        scheduleSampleLine(0, session: session)
+    }
+
+    private func scheduleSampleLine(_ index: Int, session current: Int) {
+        schedule(SampleMeeting.lineInterval) { [weak self] in
+            deliverOnMain { self?.showSampleLine(index, session: current) }
+        }
+    }
+
+    private func showSampleLine(_ index: Int, session current: Int) {
+        guard session == current, listening == .sample else { return }
+        let line = SampleMeeting.lines[index]
+        let segment = TranscriptSegment(utterance: index, text: line.text, isFinal: true)
+        let finished = transcript.apply(segment, from: line.speaker, at: now())
+        transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
+        if let finished, finished.speaker == .them, QuestionDetector.looksLikeQuestion(finished.text) {
+            answerNow()
+        }
+        if index + 1 < SampleMeeting.lines.count {
+            scheduleSampleLine(index + 1, session: current)
+        } else {
+            listening = .idle
+            status = "Sample meeting finished"
+        }
+    }
+
+    private func nextSampleAnswer() -> AsyncThrowingStream<String, Error> {
+        let answers = SampleMeeting.sampleAnswers
+        let text = answers[min(sampleAnswersShown, answers.count - 1)]
+        sampleAnswersShown += 1
+        return SampleMeeting.streamAnswer(SampleMeeting.sampleAnswerIntro + text, wordDelay: sampleWordDelay)
     }
 
     private static func userPrompt(_ context: String) -> String {
