@@ -32,9 +32,18 @@ final class OverlayRenderTests: XCTestCase {
         XCTAssertGreaterThan(png.count, 5_000)
     }
 
-    private func render<Content: View>(_ content: Content) throws -> Data {
+    func testTheWelcomeScreenRenders() throws {
+        let png = try render(WelcomeView(onTrySample: {}, onAgree: {}), size: NSSize(width: 540, height: 470))
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("MeetingAssistantWelcome.png")
+        try png.write(to: url)
+        print("Welcome render: \(url.path)")
+        XCTAssertGreaterThan(png.count, 5_000)
+    }
+
+    private func render<Content: View>(_ content: Content, size: NSSize = NSSize(width: 380, height: 420)) throws -> Data {
         let view = FirstClickHostingView(rootView: content)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 420),
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: .borderless, backing: .buffered, defer: false)
         window.contentView = view
         view.layoutSubtreeIfNeeded()

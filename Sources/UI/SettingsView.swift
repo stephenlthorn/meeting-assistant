@@ -1,14 +1,17 @@
 import SwiftUI
 
 /// Preferences window: API key (Keychain), model, behavior, shortcuts, extra
-/// prompt instructions, optional Deepgram cloud STT, and links to the privacy
-/// permissions the app needs.
+/// prompt instructions, optional Deepgram cloud STT (only after agreeing to send
+/// it audio), privacy terms, and links to the permissions the app needs.
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var hotKeys: HotKeyBinder
+    let showWelcome: () -> Void
+    let withdrawTerms: () -> Void
     @State private var apiKeyField = ""
     @State private var deepgramField = ""
     @State private var saveFailed = false
+    @State private var confirmingCloudAudio = false
 
     var body: some View {
         Form {
@@ -57,7 +60,7 @@ struct SettingsView: View {
             }
 
             Section("Speech-to-text") {
-                Toggle("Use Deepgram cloud STT instead of on-device", isOn: $settings.useCloudSTT)
+                Toggle("Use Deepgram cloud STT instead of on-device", isOn: cloudSTTBinding)
                 SecureField("Deepgram API key", text: $deepgramField)
                 HStack {
                     Button("Save key") { save { settings.setDeepgramKey(deepgramField) } clear: { deepgramField = "" } }
@@ -81,6 +84,21 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Privacy") {
+                Text(settings.hasAcceptedTerms
+                     ? "You agreed to the privacy terms on the welcome screen."
+                     : "You haven't agreed to the privacy terms yet, so Meeting Assistant can't listen.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Review Welcome Screen…", action: showWelcome)
+                    Spacer()
+                    Button("Withdraw Agreement", action: withdrawTerms)
+                        .disabled(!settings.hasAcceptedTerms)
+                }
+                Link("Privacy policy", destination: AppLinks.privacyPolicy)
+            }
+
             Section("Permissions") {
                 ForEach(PrivacyPane.allCases, id: \.self) { pane in
                     Button("Open \(pane.title) Settings…") { NSWorkspace.shared.open(pane.settingsURL) }
@@ -89,9 +107,39 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("About") {
+                Text("Meeting Assistant is open source under the MIT license. Made by Stephen Thorn.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Link("Source code on GitHub", destination: AppLinks.sourceCode)
+                    Spacer()
+                    Link("stephenthorn.com", destination: AppLinks.website)
+                }
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 680)
+        .frame(width: 480, height: 720)
+        .alert("Send call audio to Deepgram?", isPresented: $confirmingCloudAudio) {
+            Button("Send Audio to Deepgram") { settings.acceptCloudAudio() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Audio from both sides of your calls will stream to Deepgram for transcription instead of staying on your Mac. Deepgram's privacy terms apply.")
+        }
+    }
+
+    /// Turning Deepgram on asks first, until the user has agreed once.
+    private var cloudSTTBinding: Binding<Bool> {
+        Binding(
+            get: { settings.useCloudSTT },
+            set: { turnOn in
+                if turnOn && !settings.cloudAudioAccepted {
+                    confirmingCloudAudio = true
+                } else {
+                    settings.useCloudSTT = turnOn
+                }
+            })
     }
 
     private func save(_ write: () -> Bool, clear: () -> Void) {
