@@ -1,46 +1,59 @@
+import AVFoundation
+import CoreGraphics
 import Foundation
 import ScreenCaptureKit
-import AVFoundation
 
 /// Captures the Mac's system audio output (what your speakers/headphones play,
 /// i.e. the other people on the call) using ScreenCaptureKit. No virtual audio
-/// device required on macOS 13+. Delivers mono PCM buffers to `onBuffer`.
+/// device required on macOS 13+. Delivers mono PCM buffers to `onBuffer`,
+/// requested at 16 kHz since that is all speech recognition needs.
 ///
 /// Permission: first `start()` triggers the system "Screen Recording" prompt
 /// (ScreenCaptureKit is gated by that TCC permission even for audio-only use).
-final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
+final class SystemAudioCapture: NSObject, SystemAudioCapturing, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private let audioQueue = DispatchQueue(label: "meetingassistant.audio.capture")
 
-    /// Called on a background queue with a mono Float32 buffer per audio chunk.
-    var onBuffer: ((AVAudioPCMBuffer) -> Void)?
-    /// Called if the stream stops unexpectedly.
-    var onError: ((String) -> Void)?
+    var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    var onError: (@MainActor (String) -> Void)?
 
     func start() async throws {
-        let content = try await SCShareableContent.current
-        guard let display = content.displays.first else {
-            throw NSError(domain: "SystemAudioCapture", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "No display available for capture."])
+        do {
+            try await startStream()
+        } catch let error as SystemAudioError {
+            throw error
+        } catch {
+            guard CGPreflightScreenCaptureAccess() else {
+                CGRequestScreenCaptureAccess()
+                throw SystemAudioError.permissionDenied
+            }
+            throw error
         }
+    }
 
-        // We capture the whole display's audio. Video is required by SCStream but
-        // we keep it tiny and never read the frames.
+    private func startStream() async throws {
+        let content = try await SCShareableContent.current
+        guard let display = content.displays.first else { throw SystemAudioError.noDisplay }
+
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.sampleRate = 48_000
-        config.channelCount = 2
-        config.excludesCurrentProcessAudio = true   // don't record our own sounds
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 6) // ~6fps, ignored
-
-        let stream = SCStream(filter: filter, configuration: config, delegate: self)
+        let stream = SCStream(filter: filter, configuration: Self.makeConfiguration(), delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
         try await stream.startCapture()
         self.stream = stream
+    }
+
+    /// Whole-display audio, mono at 16 kHz, without our own sounds. SCStream
+    /// requires video too, so it is 2x2 pixels at most once a second and never read.
+    static func makeConfiguration() -> SCStreamConfiguration {
+        let configuration = SCStreamConfiguration()
+        configuration.capturesAudio = true
+        configuration.sampleRate = 16_000
+        configuration.channelCount = 1
+        configuration.excludesCurrentProcessAudio = true
+        configuration.width = 2
+        configuration.height = 2
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        return configuration
     }
 
     func stop() async {
@@ -56,13 +69,15 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
               sampleBuffer.isValid,
               CMSampleBufferGetNumSamples(sampleBuffer) > 0,
               let pcm = Self.makePCMBuffer(from: sampleBuffer) else { return }
-        onBuffer?(Self.downmixToMono(pcm) ?? pcm)
+        onBuffer?(AudioMath.monoMix(pcm) ?? pcm)
     }
 
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        onError?(error.localizedDescription)
+        let onError = self.onError
+        let message = error.localizedDescription
+        deliverOnMain { onError?(message) }
     }
 
     // MARK: - Conversion helpers
@@ -83,29 +98,5 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
             sampleBuffer, at: 0, frameCount: Int32(frames), into: buffer.mutableAudioBufferList)
         return status == noErr ? buffer : nil
-    }
-
-    /// Averages channels into a single mono buffer (better for speech recognition).
-    /// Returns nil if the layout is interleaved (caller falls back to the original).
-    static func downmixToMono(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let channelData = input.floatChannelData else { return nil }
-        let channels = Int(input.format.channelCount)
-        if channels == 1 { return input }
-
-        guard let monoFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                             sampleRate: input.format.sampleRate,
-                                             channels: 1, interleaved: false),
-              let mono = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: input.frameCapacity) else {
-            return nil
-        }
-        mono.frameLength = input.frameLength
-        let out = mono.floatChannelData![0]
-        let count = Int(input.frameLength)
-        for i in 0..<count {
-            var sum: Float = 0
-            for c in 0..<channels { sum += channelData[c][i] }
-            out[i] = sum / Float(channels)
-        }
-        return mono
     }
 }

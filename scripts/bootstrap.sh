@@ -24,6 +24,6 @@ cat <<'NOTE'
 Next steps in Xcode:
   1. Select the MeetingAssistant scheme and press Run (Cmd+R).
   2. Grant Screen Recording, Microphone, and Speech Recognition when prompted.
-  3. Open Settings (Cmd+,) and paste your Anthropic API key.
+  3. Click the waveform icon in the menu bar, open Settings..., and paste your Anthropic API key.
 
 NOTE

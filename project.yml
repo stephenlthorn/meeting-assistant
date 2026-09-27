@@ -1,6 +1,6 @@
 name: MeetingAssistant
 options:
-  bundleIdPrefix: com.example
+  bundleIdPrefix: com.stephenthorn
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -20,18 +20,38 @@ targets:
         NSMicrophoneUsageDescription: "Captures your microphone so your side of the call is transcribed on-device."
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.meetingassistant
+        PRODUCT_BUNDLE_IDENTIFIER: com.stephenthorn.meetingassistant
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_VERSION: "5.9"
         CODE_SIGN_STYLE: Automatic
-        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: Config/MeetingAssistant.entitlements
+
+  MeetingAssistantTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: Sources
+        excludes:
+          - "App/MeetingAssistantApp.swift"
+          - "Support/**"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stephenthorn.meetingassistant.tests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.9"
 
 schemes:
   MeetingAssistant:
     build:
       targets:
-        MeetingAssistant: all
+        MeetingAssistant: [running, profiling, analyzing, archiving]
     run:
       config: Debug
+    test:
+      config: Debug
+      targets:
+        - MeetingAssistantTests
