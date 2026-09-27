@@ -17,13 +17,15 @@ targets:
       properties:
         LSUIElement: true
         CFBundleDisplayName: Meeting Assistant
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSSpeechRecognitionUsageDescription: "Transcribes meeting audio on this device to provide live assistance."
         NSMicrophoneUsageDescription: "Captures your microphone so your side of the call is transcribed on-device."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stephenthorn.meetingassistant
-        MARKETING_VERSION: "0.2.0"
-        CURRENT_PROJECT_VERSION: "2"
+        MARKETING_VERSION: "0.2.1"
+        CURRENT_PROJECT_VERSION: "3"
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_VERSION: "5.9"
         CODE_SIGN_STYLE: Automatic
