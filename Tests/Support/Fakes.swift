@@ -165,6 +165,21 @@ func silentBuffer() -> AVAudioPCMBuffer {
     return buffer
 }
 
+/// Settings over throwaway defaults and an in-memory Keychain.
+@MainActor
+func makeTestSettings(for testCase: XCTestCase,
+                      secrets: SecretStore = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"]),
+                      environment: [String: String] = [:],
+                      acceptTerms: Bool = true) -> AppSettings {
+    let suite = "MeetingAssistantTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    testCase.addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+    let settings = AppSettings(defaults: defaults, secrets: secrets, environment: environment,
+                               anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"))
+    if acceptTerms { settings.acceptTerms() }
+    return settings
+}
+
 /// Polls until `condition` holds, failing the test after `timeout`.
 @MainActor
 func eventually(timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line,

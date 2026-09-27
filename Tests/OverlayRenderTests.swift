@@ -7,12 +7,7 @@ import XCTest
 @MainActor
 final class OverlayRenderTests: XCTestCase {
     func testTheOverlayRendersALiveSession() async throws {
-        let suite = "MeetingAssistantTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
-        let settings = AppSettings(defaults: defaults,
-                                   secrets: InMemorySecretStore(values: ["anthropic_api_key": "sk-test"]),
-                                   environment: [:], anthropicKeyFile: URL(fileURLWithPath: "/nonexistent"))
+        let settings = makeTestSettings(for: self)
         let microphone = FakeMicrophone()
         microphone.authorized = false
         let transcribers = FakeTranscriberFactory()
@@ -37,9 +32,42 @@ final class OverlayRenderTests: XCTestCase {
         XCTAssertGreaterThan(png.count, 5_000)
     }
 
-    private func render<Content: View>(_ content: Content) throws -> Data {
+    func testTheOverlayRendersTheSampleMeeting() async throws {
+        let settings = makeTestSettings(for: self)
+        let answerer = FakeAnswerer()
+        let scheduler = ManualScheduler()
+        let controller = AssistantController(settings: settings, systemAudio: FakeSystemAudio(),
+                                             microphone: FakeMicrophone(), makeTranscriber: FakeTranscriberFactory().make,
+                                             answerer: answerer, schedule: scheduler.schedule, sampleWordDelay: 0)
+        controller.startSample()
+        while answerer.requests.isEmpty {
+            scheduler.fireAll()
+            await eventually { !scheduler.delays.isEmpty || !answerer.requests.isEmpty }
+        }
+        answerer.streams[0].yield(SampleMeeting.sampleAnswers[0])
+        answerer.streams[0].finish()
+        await eventually { !controller.isAnswering }
+
+        let png = try render(OverlayView(controller: controller, settings: settings, onHide: {}))
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("MeetingAssistantSample.png")
+        try png.write(to: url)
+        print("Sample render: \(url.path)")
+        XCTAssertGreaterThan(png.count, 5_000)
+    }
+
+    func testTheWelcomeScreenRenders() throws {
+        let png = try render(WelcomeView(onTrySample: {}, onAgree: {}), size: NSSize(width: 540, height: 470))
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("MeetingAssistantWelcome.png")
+        try png.write(to: url)
+        print("Welcome render: \(url.path)")
+        XCTAssertGreaterThan(png.count, 5_000)
+    }
+
+    private func render<Content: View>(_ content: Content, size: NSSize = NSSize(width: 380, height: 420)) throws -> Data {
         let view = FirstClickHostingView(rootView: content)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 420),
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: .borderless, backing: .buffered, defer: false)
         window.contentView = view
         view.layoutSubtreeIfNeeded()

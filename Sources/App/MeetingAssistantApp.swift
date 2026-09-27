@@ -7,12 +7,16 @@ struct MeetingAssistantApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        MenuBarExtra("Meeting Assistant", systemImage: "waveform.circle") {
+        MenuBarExtra {
             MenuContent(controller: appDelegate.controller, settings: appDelegate.settings,
-                        hotKeys: appDelegate.hotKeys, toggleOverlay: appDelegate.toggleOverlay)
+                        hotKeys: appDelegate.hotKeys, toggleOverlay: appDelegate.toggleOverlay,
+                        trySample: appDelegate.trySample, showWelcome: { appDelegate.showWelcome() })
+        } label: {
+            MenuBarIcon(controller: appDelegate.controller)
         }
         Settings {
-            SettingsView(settings: appDelegate.settings, hotKeys: appDelegate.hotKeys)
+            SettingsView(settings: appDelegate.settings, hotKeys: appDelegate.hotKeys,
+                         showWelcome: { appDelegate.showWelcome() }, withdrawTerms: appDelegate.withdrawTerms)
         }
     }
 }
@@ -23,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let hotKeys = HotKeyBinder()
     private(set) lazy var controller = AssistantController.live(settings: settings)
     private var panel: OverlayPanel?
+    private var welcomeWindow: NSWindow?
+    private var afterTerms: (() -> Void)?
     private var subscriptions: Set<AnyCancellable> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -33,6 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !panel.restoredSavedFrame { positionTopRight(panel) }
         if settings.showsOverlay { panel.orderFrontRegardless() }
         self.panel = panel
+
+        controller.onTermsNeeded = { [weak self] resume in self?.showWelcome(then: resume) }
+        if !settings.hasAcceptedTerms { showWelcome() }
 
         settings.$answerHotKey.combineLatest(settings.$overlayHotKey)
             .sink { [weak self] answer, overlay in self?.bindHotKeys(answer: answer, overlay: overlay) }
@@ -47,6 +56,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             panel.orderOut(nil)
         }
+    }
+
+    func trySample() {
+        welcomeWindow?.close()
+        if !settings.showsOverlay { toggleOverlay() }
+        controller.startSample()
+    }
+
+    /// Shows the welcome screen; `resume` runs once the terms are accepted.
+    func showWelcome(then resume: (() -> Void)? = nil) {
+        afterTerms = resume
+        if welcomeWindow == nil {
+            let welcome = WelcomeView(onTrySample: { [weak self] in self?.trySample() },
+                                      onAgree: { [weak self] in self?.acceptTerms() })
+            let hosting = NSHostingController(rootView: welcome)
+            hosting.sizingOptions = [.preferredContentSize]
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Welcome to Meeting Assistant"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            welcomeWindow = window
+        }
+        NSApp.activate()
+        welcomeWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    func withdrawTerms() {
+        controller.stop()
+        settings.withdrawTerms()
+    }
+
+    private func acceptTerms() {
+        settings.acceptTerms()
+        welcomeWindow?.close()
+        let resume = afterTerms
+        afterTerms = nil
+        resume?()
     }
 
     private func bindHotKeys(answer: HotKeyCombo, overlay: HotKeyCombo) {
@@ -65,21 +112,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// The menu bar icon, which switches to a record symbol while listening.
+struct MenuBarIcon: View {
+    let controller: AssistantController
+
+    var body: some View {
+        Image(systemName: MenuBarSymbol.name(for: controller.listening))
+            .accessibilityLabel("Meeting Assistant")
+    }
+}
+
 struct MenuContent: View {
     let controller: AssistantController
     @ObservedObject var settings: AppSettings
     @ObservedObject var hotKeys: HotKeyBinder
     let toggleOverlay: () -> Void
+    let trySample: () -> Void
+    let showWelcome: () -> Void
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        Button(controller.isListening ? "Stop Listening" : "Start Listening") {
-            controller.toggleListening()
-        }
+        Button(listeningTitle) { controller.toggleListening() }
         Button("Answer Now (\(settings.answerHotKey.label))") { controller.answerNow() }
         Button("\(settings.showsOverlay ? "Hide" : "Show") Overlay (\(settings.overlayHotKey.label))") {
             toggleOverlay()
         }
+        Button("Try a Sample Meeting") { trySample() }
+            .disabled(controller.isListening)
 
         Divider()
 
@@ -107,10 +166,19 @@ struct MenuContent: View {
         if !settings.apiKeyPresent {
             Text("Add your API key in Settings")
         }
+        Button("Welcome & Privacy…") { showWelcome() }
         Button("Settings…") {
             NSApp.activate()
             openSettings()
         }
         Button("Quit") { NSApplication.shared.terminate(nil) }
+    }
+
+    private var listeningTitle: String {
+        switch controller.listening {
+        case .idle: "Start Listening"
+        case .starting, .listening: "Stop Listening"
+        case .sample: "Stop Sample Meeting"
+        }
     }
 }

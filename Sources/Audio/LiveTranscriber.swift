@@ -19,12 +19,12 @@ protocol LiveTranscriber: AnyObject {
     func append(_ buffer: AVAudioPCMBuffer)
 }
 
-/// Picks the backend: Deepgram cloud when enabled and keyed, otherwise on-device
-/// (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14–15).
+/// Picks the backend: Deepgram cloud when enabled, agreed to and keyed,
+/// otherwise on-device (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14–15).
 enum TranscriberFactory {
     @MainActor
     static func make(settings: AppSettings, localeIdentifier: String = "en-US") -> LiveTranscriber {
-        if settings.useCloudSTT, let key = settings.resolveDeepgramKey() {
+        if settings.useCloudSTT, settings.cloudAudioAccepted, let key = settings.resolveDeepgramKey() {
             return CloudTranscriber(apiKey: key, localeIdentifier: localeIdentifier)
         }
         if #available(macOS 26, *) {

@@ -399,6 +399,129 @@ final class AssistantControllerTests: XCTestCase {
         XCTAssertTrue(h.answerer.requests.isEmpty)
     }
 
+    // MARK: - Privacy terms
+
+    func testListeningWaitsForThePrivacyTerms() async {
+        let h = makeHarness(acceptTerms: false)
+        var asked = 0
+        h.controller.onTermsNeeded = { _ in asked += 1 }
+
+        h.controller.start()
+        await settle()
+
+        XCTAssertEqual(asked, 1)
+        XCTAssertEqual(h.controller.listening, .idle)
+        XCTAssertEqual(h.systemAudio.events, [])
+        XCTAssertEqual(h.microphone.starts, 0)
+    }
+
+    func testAcceptingTheTermsCarriesOnWithWhatWasAsked() async {
+        let h = makeHarness(acceptTerms: false)
+        var resume: (() -> Void)?
+        h.controller.onTermsNeeded = { resume = $0 }
+        h.controller.start()
+
+        h.settings.acceptTerms()
+        resume?()
+
+        await eventually { h.controller.listening == .listening }
+    }
+
+    func testAnswersWaitForThePrivacyTerms() {
+        let h = makeHarness(acceptTerms: false)
+        var asked = 0
+        h.controller.onTermsNeeded = { _ in asked += 1 }
+
+        h.controller.answerNow()
+
+        XCTAssertEqual(asked, 1)
+        XCTAssertTrue(h.answerer.requests.isEmpty)
+    }
+
+    // MARK: - Sample meeting
+
+    func testTheSampleMeetingPlaysItsScriptWithoutRecording() async {
+        let h = makeHarness()
+
+        h.controller.startSample()
+        XCTAssertEqual(h.controller.listening, .sample)
+        XCTAssertEqual(h.controller.status, "Sample meeting (nothing is recorded)")
+        await advanceSample(h, lines: 3)
+
+        let expected = SampleMeeting.lines.prefix(3).map { "\($0.speaker.rawValue): \($0.text)" }.joined(separator: "\n")
+        XCTAssertEqual(h.controller.transcriptText, expected)
+        XCTAssertEqual(h.systemAudio.events, [])
+        XCTAssertEqual(h.microphone.starts, 0)
+        XCTAssertTrue(h.transcribers.made.isEmpty)
+    }
+
+    func testTheSampleMeetingShowsSampleAnswersWithoutAKey() async {
+        let h = makeHarness(secrets: InMemorySecretStore())
+
+        h.controller.startSample()
+        await advanceSample(h, lines: firstSampleQuestion + 1)
+
+        await eventually { !h.controller.isAnswering && !h.controller.answer.isEmpty }
+        XCTAssertTrue(h.controller.answer.hasPrefix("Sample answer"), h.controller.answer)
+        XCTAssertTrue(h.answerer.requests.isEmpty)
+    }
+
+    func testTheSampleMeetingAsksClaudeWhenThereIsAKey() async {
+        let h = makeHarness()
+
+        h.controller.startSample()
+        await advanceSample(h, lines: firstSampleQuestion + 1)
+
+        XCTAssertEqual(h.answerer.requests.count, 1)
+        XCTAssertTrue(h.answerer.requests.first?.user.contains(SampleMeeting.lines[firstSampleQuestion].text) ?? false)
+    }
+
+    func testTheSampleMeetingWorksBeforeThePrivacyTermsAreAccepted() async {
+        let h = makeHarness(acceptTerms: false, secrets: InMemorySecretStore())
+        var asked = 0
+        h.controller.onTermsNeeded = { _ in asked += 1 }
+
+        h.controller.startSample()
+        await advanceSample(h, lines: firstSampleQuestion + 1)
+
+        await eventually { !h.controller.isAnswering && !h.controller.answer.isEmpty }
+        XCTAssertTrue(h.controller.answer.hasPrefix("Sample answer"))
+        XCTAssertEqual(asked, 0)
+    }
+
+    func testStoppingEndsTheSampleMeeting() async {
+        let h = makeHarness()
+        h.controller.startSample()
+        await advanceSample(h, lines: 1)
+
+        h.controller.stop()
+        h.scheduler.fireAll()
+        await settle()
+
+        XCTAssertEqual(h.controller.listening, .idle)
+        XCTAssertEqual(h.controller.transcriptText, "Them: \(SampleMeeting.lines[0].text)")
+    }
+
+    func testTheSampleMeetingFinishesByItself() async {
+        let h = makeHarness()
+
+        h.controller.startSample()
+        await advanceSample(h, lines: SampleMeeting.lines.count)
+
+        await eventually { h.controller.listening == .idle }
+        XCTAssertEqual(h.controller.status, "Sample meeting finished")
+    }
+
+    func testASampleMeetingWaitsUntilListeningStops() async {
+        let h = makeHarness()
+        await startListening(h)
+
+        h.controller.startSample()
+
+        XCTAssertEqual(h.controller.listening, .listening)
+        XCTAssertTrue(h.scheduler.delays.isEmpty)
+    }
+
     // MARK: - Harness
 
     private struct Harness {
@@ -409,31 +532,46 @@ final class AssistantControllerTests: XCTestCase {
         let transcribers: FakeTranscriberFactory
         let answerer: FakeAnswerer
         let clock: TestClock
+        let scheduler: ManualScheduler
     }
 
-    private func makeHarness(secrets: InMemorySecretStore = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"]))
+    private func makeHarness(acceptTerms: Bool = true,
+                             secrets: InMemorySecretStore = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"]))
         -> Harness {
-        let suite = "MeetingAssistantTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
-        let settings = AppSettings(defaults: defaults, secrets: secrets, environment: [:],
-                                   anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"))
+        let settings = makeTestSettings(for: self, secrets: secrets, acceptTerms: acceptTerms)
         let systemAudio = FakeSystemAudio()
         let microphone = FakeMicrophone()
         let transcribers = FakeTranscriberFactory()
         let answerer = FakeAnswerer()
         let clock = TestClock()
+        let scheduler = ManualScheduler()
         let controller = AssistantController(settings: settings, systemAudio: systemAudio, microphone: microphone,
                                              makeTranscriber: transcribers.make, answerer: answerer,
-                                             now: { clock.now })
+                                             now: { clock.now }, schedule: scheduler.schedule,
+                                             sampleWordDelay: 0)
         return Harness(controller: controller, settings: settings, systemAudio: systemAudio,
-                       microphone: microphone, transcribers: transcribers, answerer: answerer, clock: clock)
+                       microphone: microphone, transcribers: transcribers, answerer: answerer, clock: clock,
+                       scheduler: scheduler)
     }
 
     private func startListening(_ h: Harness, file: StaticString = #filePath, line: UInt = #line) async {
         h.controller.start()
         await eventually(file: file, line: line) {
             h.controller.listening == .listening && h.systemAudio.events.last != "start"
+        }
+    }
+
+    private var firstSampleQuestion: Int {
+        SampleMeeting.lines.firstIndex { $0.speaker == .them && QuestionDetector.looksLikeQuestion($0.text) }!
+    }
+
+    /// Lets the sample meeting show its next `lines` lines, one scheduled step at a time.
+    private func advanceSample(_ h: Harness, lines: Int, file: StaticString = #filePath, line: UInt = #line) async {
+        for _ in 0..<lines {
+            h.scheduler.fireAll()
+            await eventually(file: file, line: line) {
+                !h.scheduler.delays.isEmpty || h.controller.listening != .sample
+            }
         }
     }
 }

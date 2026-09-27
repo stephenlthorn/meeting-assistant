@@ -9,6 +9,9 @@ final class AppSettings: ObservableObject {
         case keychain, environment, file
     }
 
+    /// Bump when the privacy terms shown on the welcome screen change, so
+    /// everyone is asked to agree again.
+    static let termsVersion = 1
     static let bundleID = "com.stephenthorn.meetingassistant"
     static let legacyBundleID = "com.example.meetingassistant"
 
@@ -39,10 +42,17 @@ final class AppSettings: ObservableObject {
     @Published var answerHotKey: HotKeyCombo { didSet { defaults.set(answerHotKey.label, forKey: "answerHotKey") } }
     @Published var overlayHotKey: HotKeyCombo { didSet { defaults.set(overlayHotKey.label, forKey: "overlayHotKey") } }
     @Published var showsOverlay: Bool { didSet { defaults.set(showsOverlay, forKey: "showsOverlay") } }
+    @Published private(set) var acceptedTermsVersion: Int {
+        didSet { defaults.set(acceptedTermsVersion, forKey: "acceptedTermsVersion") }
+    }
+    @Published private(set) var cloudAudioAccepted: Bool {
+        didSet { defaults.set(cloudAudioAccepted, forKey: "cloudAudioAccepted") }
+    }
     @Published private(set) var apiKeySource: KeySource?
     @Published private(set) var deepgramKeySource: KeySource?
 
     var apiKeyPresent: Bool { apiKeySource != nil }
+    var hasAcceptedTerms: Bool { acceptedTermsVersion >= Self.termsVersion }
 
     private let defaults: UserDefaults
     private let secrets: SecretStore
@@ -63,6 +73,8 @@ final class AppSettings: ObservableObject {
         overlayHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "overlayHotKey"),
                                            in: HotKeyCombo.overlayChoices)
         showsOverlay = defaults.object(forKey: "showsOverlay") as? Bool ?? true
+        acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
+        cloudAudioAccepted = defaults.bool(forKey: "cloudAudioAccepted")
         refreshKeySources()
     }
 
@@ -71,6 +83,25 @@ final class AppSettings: ObservableObject {
         let extra = extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !extra.isEmpty else { return profile.systemPrompt }
         return profile.systemPrompt + "\n\nAdditional instructions from the user:\n" + extra
+    }
+
+    // MARK: - Consent
+
+    func acceptTerms() {
+        acceptedTermsVersion = Self.termsVersion
+    }
+
+    /// Withdrawing the terms also stops any audio going to Deepgram.
+    func withdrawTerms() {
+        acceptedTermsVersion = 0
+        cloudAudioAccepted = false
+        useCloudSTT = false
+    }
+
+    /// The user agreed to stream call audio to Deepgram; turns cloud STT on.
+    func acceptCloudAudio() {
+        cloudAudioAccepted = true
+        useCloudSTT = true
     }
 
     // MARK: - Keys
