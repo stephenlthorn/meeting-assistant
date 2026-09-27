@@ -70,7 +70,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if welcomeWindow == nil {
             let welcome = WelcomeView(onTrySample: { [weak self] in self?.trySample() },
                                       onAgree: { [weak self] in self?.acceptTerms() })
-            let window = NSWindow(contentViewController: NSHostingController(rootView: welcome))
+            let hosting = NSHostingController(rootView: welcome)
+            hosting.sizingOptions = [.preferredContentSize]
+            let window = NSWindow(contentViewController: hosting)
             window.title = "Welcome to Meeting Assistant"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
