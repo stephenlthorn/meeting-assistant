@@ -33,6 +33,17 @@ enum ListeningState: Equatable {
 /// to be listening to something that is not there. The microphone retries
 /// itself and reports only when that fails or recovers.
 ///
+/// A side can also break without saying so. A transcriber that gives up says so
+/// (`onFatal`) and its side is marked failed at once. A watchdog per side, checked
+/// every `watchdogInterval` while its session lasts, restarts capture that stopped
+/// delivering audio and a transcriber that hears speech and writes nothing; if the
+/// side is still broken afterwards the user is told once. The same per-side meters
+/// feed `levels` for the overlay's indicator.
+///
+/// System audio is limited to the app chosen in Settings when that app is running
+/// (`AppSettings.captureAppBundleID`, read at each start and restart); otherwise
+/// every app is heard, and a notice says so.
+///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
 /// sample meeting needs no terms, since it records nothing.
@@ -97,6 +108,9 @@ final class AssistantController {
     @ObservationIgnored private var themCanRevive = false
     @ObservationIgnored private var captureProblems: [Speaker: Problem] = [:]
     @ObservationIgnored private var watchdogs: [Speaker: SideWatchdog] = [:]
+    /// Sides whose replacement transcriber is waiting for its permission answer.
+    /// Nothing is judged for them: the transcriber has not been started yet.
+    @ObservationIgnored private var awaitingSpeechPermission: Set<Speaker> = []
     @ObservationIgnored private var lastWatchdogTick = Date.distantPast
     @ObservationIgnored private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
 
@@ -181,6 +195,7 @@ final class AssistantController {
         captureProblems = [:]
         themCanRevive = false
         themRecovery += 1
+        awaitingSpeechPermission = []
         clearNotices()
         resetTranscriptAndAnswer()
         beginPrivacySession()
@@ -347,6 +362,7 @@ final class AssistantController {
         if youSide != .failed { youTranscriber?.stop() }
         themTranscriber = nil
         youTranscriber = nil
+        awaitingSpeechPermission = []
         themSide = .off
         youSide = .off
     }
@@ -555,7 +571,7 @@ final class AssistantController {
     private func inspect(_ speaker: Speaker, at time: Date, slept: Bool) {
         guard (speaker == .them ? themSide : youSide) == .up, var watch = watchdogs[speaker] else { return }
         let reading = meter(for: speaker).reading()
-        guard !slept else {
+        guard !slept, !awaitingSpeechPermission.contains(speaker) else {
             watch.rearm(at: time, reading: reading)
             watchdogs[speaker] = watch
             return
@@ -918,6 +934,7 @@ final class AssistantController {
                                            isFinal: segment.isFinal))
             }
             if speaker == .them { themTranscriber = fresh } else { youTranscriber = fresh }
+            if started { awaitingSpeechPermission.insert(speaker) }
             replaced.append(Replacement(speaker: speaker, transcriber: fresh, started: started))
         }
         guard let first = replaced.first else { return }
@@ -930,6 +947,7 @@ final class AssistantController {
 
     private func replacementsAuthorized(_ granted: Bool, replaced: [Replacement], session current: Int) {
         guard session == current else { return }
+        awaitingSpeechPermission.subtract(replaced.map(\.speaker))
         guard granted else {
             report(Problem(message: "Speech Recognition permission is off, so listening stopped. Allow Meeting Assistant in System Settings.",
                            fix: .speechRecognition))

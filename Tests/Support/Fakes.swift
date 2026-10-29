@@ -8,6 +8,9 @@ final class FakeTranscriber: LiveTranscriber {
     var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
     var grantsAuthorization: Bool
+    /// Leaves the authorization question unanswered until `resolveAuthorization`.
+    var holdsAuthorization = false
+    private var heldAuthorization: ((Bool) -> Void)?
     private(set) var starts = 0
     private(set) var stops = 0
     private let lock = NSLock()
@@ -20,7 +23,19 @@ final class FakeTranscriber: LiveTranscriber {
 
     var appended: Int { lock.withLock { appendedCount } }
 
-    func requestAuthorization(_ completion: @escaping (Bool) -> Void) { completion(grantsAuthorization) }
+    func requestAuthorization(_ completion: @escaping (Bool) -> Void) {
+        guard holdsAuthorization else {
+            completion(grantsAuthorization)
+            return
+        }
+        heldAuthorization = completion
+    }
+
+    @MainActor func resolveAuthorization() {
+        heldAuthorization?(grantsAuthorization)
+        heldAuthorization = nil
+    }
+
     func start() { starts += 1 }
     func stop() { stops += 1 }
     func append(_ buffer: AVAudioPCMBuffer) { lock.withLock { appendedCount += 1 } }
@@ -42,10 +57,12 @@ final class FakeTranscriber: LiveTranscriber {
 final class FakeTranscriberFactory {
     var backendName = "on-device"
     var grantsAuthorization = true
+    var holdsAuthorization = false
     private(set) var made: [(speaker: Speaker, transcriber: FakeTranscriber)] = []
 
     func make(_ speaker: Speaker) -> LiveTranscriber {
         let transcriber = FakeTranscriber(backendName: backendName, grantsAuthorization: grantsAuthorization)
+        transcriber.holdsAuthorization = holdsAuthorization
         made.append((speaker, transcriber))
         return transcriber
     }

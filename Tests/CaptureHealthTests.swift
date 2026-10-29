@@ -409,6 +409,27 @@ final class CaptureHealthTests: XCTestCase {
         XCTAssertEqual(h.transcribers.latest(.you)?.stops, 0)
     }
 
+    func testATranscriberStillWaitingForPermissionIsNotRestartedByTheWatchdog() async {
+        let h = LifecycleHarness(testCase: self)
+        h.settings.setDeepgramKey("dg-key")
+        h.settings.acceptCloudAudio()
+        await h.startListening()
+        h.transcribers.holdsAuthorization = true
+        h.settings.useCloudSTT = false
+        await eventually { h.transcribers.made.count == 4 }
+        let replacement = h.transcribers.latest(.them)
+
+        await h.pass(180, hearing: [.you], talking: [.them])
+
+        XCTAssertEqual(replacement?.starts, 0, "the question has not been answered yet")
+        XCTAssertEqual(h.controller.problems, [])
+
+        replacement?.resolveAuthorization()
+        await eventually { replacement?.starts == 1 }
+        await h.pass(60, hearing: [.you], talking: [.them])
+        XCTAssertEqual(replacement?.stops, 1, "watched again once it runs")
+    }
+
     // MARK: - Never during a stop (M1)
 
     func testNothingFiresAfterAUserStop() async {
