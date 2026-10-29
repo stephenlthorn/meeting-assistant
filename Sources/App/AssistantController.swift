@@ -54,6 +54,8 @@ final class AssistantController {
     private(set) var transcriptDisplay = ""
     private(set) var answer = ""
     private(set) var isAnswering = false
+    /// Per-side loudness for the overlay's level indicator.
+    let levels = CaptureLevels()
 
     var isListening: Bool { listening != .idle }
     var transcriptText: String { transcript.text }
@@ -77,8 +79,10 @@ final class AssistantController {
     @ObservationIgnored private let youSlot = TranscriberSlot()
     @ObservationIgnored private var themTranscriber: LiveTranscriber?
     @ObservationIgnored private var youTranscriber: LiveTranscriber?
-    @ObservationIgnored private var themSide = SideState.off
-    @ObservationIgnored private var youSide = SideState.off
+    @ObservationIgnored private var themSide = SideState.off { didSet { sideChanged(.them, to: themSide) } }
+    @ObservationIgnored private var youSide = SideState.off { didSet { sideChanged(.you, to: youSide) } }
+    @ObservationIgnored private let themMeter: AudioMeter
+    @ObservationIgnored private let youMeter: AudioMeter
     @ObservationIgnored private var speakerNotices: [Speaker: String] = [:]
     @ObservationIgnored private var backendName = ""
     @ObservationIgnored private var session = 0
@@ -107,7 +111,8 @@ final class AssistantController {
          sampleWordDelay: TimeInterval = 0.04,
          drainWindow: TimeInterval = AssistantController.defaultDrainWindow,
          workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
-         notifications: NotificationCenter = .default) {
+         notifications: NotificationCenter = .default,
+         meterClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.settings = settings
         self.systemAudio = systemAudio
         self.microphone = microphone
@@ -117,8 +122,21 @@ final class AssistantController {
         self.schedule = schedule
         self.sampleWordDelay = sampleWordDelay
         self.drainWindow = drainWindow
-        systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
-        microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
+        let levels = self.levels
+        themMeter = AudioMeter(clock: meterClock, onLevel: { level in
+            deliverOnMain { levels.update(.them, rms: level) }
+        })
+        youMeter = AudioMeter(clock: meterClock, onLevel: { level in
+            deliverOnMain { levels.update(.you, rms: level) }
+        })
+        systemAudio.onBuffer = { [themSlot, themMeter] buffer in
+            themMeter.observe(buffer)
+            themSlot.append(buffer)
+        }
+        microphone.onBuffer = { [youSlot, youMeter] buffer in
+            youMeter.observe(buffer)
+            youSlot.append(buffer)
+        }
         observeEnvironment(workspace: workspaceNotifications, screens: notifications)
     }
 
@@ -280,6 +298,11 @@ final class AssistantController {
         default:
             break
         }
+    }
+
+    /// The side is only metered while its capture is up.
+    private func sideChanged(_ speaker: Speaker, to state: SideState) {
+        levels.setActive(speaker, state == .up)
     }
 
     private func listeningStatus() -> String {

@@ -161,6 +161,16 @@ final class TestClock {
     var now = Date(timeIntervalSince1970: 1_000)
 }
 
+/// The monotonic clock capture threads read, moved by hand.
+final class MeterClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: TimeInterval = 100
+
+    var seconds: TimeInterval { lock.withLock { current } }
+
+    func advance(_ seconds: TimeInterval) { lock.withLock { current += seconds } }
+}
+
 struct TestFailure: LocalizedError {
     let message: String
     var errorDescription: String? { message }

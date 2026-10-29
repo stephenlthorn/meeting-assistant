@@ -34,4 +34,15 @@ final class AudioMathTests: XCTestCase {
 
         XCTAssertTrue(AudioMath.monoMix(mono) === mono)
     }
+
+    // MARK: - The meter scale
+
+    func testTheMeterSpansSixtyDecibelsSoQuietSpeechStillMovesIt() {
+        XCTAssertEqual(AudioMath.meterPosition(forRMS: 0), 0)
+        XCTAssertEqual(AudioMath.meterPosition(forRMS: 0.0005), 0, "below -60 dBFS is empty")
+        XCTAssertEqual(AudioMath.meterPosition(forRMS: 1), 1)
+        XCTAssertEqual(AudioMath.meterPosition(forRMS: 2), 1, "past full scale stays full")
+        XCTAssertEqual(AudioMath.meterPosition(forRMS: 0.0316), 0.5, accuracy: 0.01, "-30 dBFS is halfway")
+        XCTAssertGreaterThan(AudioMath.meterPosition(forRMS: 0.02), 0.4, "ordinary speech is well off the bottom")
+    }
 }

@@ -12,6 +12,7 @@ struct LifecycleHarness {
     let transcribers: FakeTranscriberFactory
     let answerer: FakeAnswerer
     let clock: TestClock
+    let meterClock: MeterClock
     let scheduler: ManualScheduler
     let workspaceNotifications: NotificationCenter
     let screenNotifications: NotificationCenter
@@ -24,6 +25,7 @@ struct LifecycleHarness {
         transcribers = FakeTranscriberFactory()
         answerer = FakeAnswerer()
         clock = TestClock()
+        meterClock = MeterClock()
         scheduler = ManualScheduler()
         workspaceNotifications = NotificationCenter()
         screenNotifications = NotificationCenter()
@@ -32,7 +34,8 @@ struct LifecycleHarness {
                                          now: { [clock] in clock.now }, schedule: scheduler.schedule,
                                          sampleWordDelay: 0, drainWindow: drainWindow,
                                          workspaceNotifications: workspaceNotifications,
-                                         notifications: screenNotifications)
+                                         notifications: screenNotifications,
+                                         meterClock: { [meterClock] in meterClock.seconds })
     }
 
     /// Starts listening and waits until both sides are up.

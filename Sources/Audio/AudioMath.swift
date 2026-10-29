@@ -16,6 +16,13 @@ enum AudioMath {
         return (total / Float(channelCount)).squareRoot()
     }
 
+    /// Where a level sits on a meter that runs from -60 dBFS (empty) to 0 dBFS
+    /// (full): linear loudness would leave ordinary speech near the bottom.
+    static func meterPosition(forRMS rms: Float) -> Float {
+        guard rms > 0 else { return 0 }
+        return min(1, max(0, (20 * log10(rms) + 60) / 60))
+    }
+
     /// Averages the channels into one. Returns `buffer` itself when it is
     /// already mono, and nil for interleaved or non-float formats.
     static func monoMix(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {

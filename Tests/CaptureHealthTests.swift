@@ -123,4 +123,72 @@ final class CaptureHealthTests: XCTestCase {
         XCTAssertEqual(h.transcribers.made.count, 3, "only your side, which still runs, is replaced")
         XCTAssertEqual(h.controller.status, "Listening (on-device, your side only)")
     }
+
+    // MARK: - Levels (M1)
+
+    func testEachSidesLevelFollowsItsOwnAudio() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        XCTAssertEqual(h.controller.levels.them, 0)
+        XCTAssertEqual(h.controller.levels.you, 0)
+
+        h.systemAudio.onBuffer?(tone(amplitude: 0.1))
+        await eventually { h.controller.levels.them > 0 }
+        XCTAssertEqual(h.controller.levels.you, 0)
+
+        h.microphone.onBuffer?(tone(amplitude: 0.1))
+        await eventually { h.controller.levels.you > 0 }
+    }
+
+    func testLevelsAreNotPushedToTheMainActorBufferByBuffer() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        h.systemAudio.onBuffer?(tone(amplitude: 0.1))
+        await eventually { h.controller.levels.them > 0 }
+        let first = h.controller.levels.them
+
+        for _ in 0..<5 { h.systemAudio.onBuffer?(tone(amplitude: 0.9)) }
+        await settle()
+        XCTAssertEqual(h.controller.levels.them, first, "the next report is a tenth of a second away")
+
+        h.meterClock.advance(0.11)
+        h.systemAudio.onBuffer?(tone(amplitude: 0.9))
+        await eventually { h.controller.levels.them > first }
+    }
+
+    func testStoppingZeroesTheLevelsAndLateAudioDoesNotRaiseThem() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        h.systemAudio.onBuffer?(tone(amplitude: 0.1))
+        await eventually { h.controller.levels.them > 0 }
+
+        h.controller.stop()
+        h.meterClock.advance(1)
+        h.systemAudio.onBuffer?(tone(amplitude: 0.1))
+        await settle()
+
+        XCTAssertEqual(h.controller.levels.them, 0)
+    }
+
+    func testASideThatIsReconnectingShowsNoLevel() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        h.systemAudio.onBuffer?(tone(amplitude: 0.1))
+        await eventually { h.controller.levels.them > 0 }
+
+        h.systemAudio.onError?("The display went to sleep")
+
+        XCTAssertEqual(h.controller.levels.them, 0)
+    }
+
+    func testAMicrophoneThatFailedShowsNoLevel() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        h.microphone.onBuffer?(tone(amplitude: 0.1))
+        await eventually { h.controller.levels.you > 0 }
+
+        h.microphone.onError?("Device busy")
+
+        XCTAssertEqual(h.controller.levels.you, 0)
+    }
 }
