@@ -230,13 +230,13 @@ final class AssistantControllerTests: XCTestCase {
         XCTAssertEqual(h.controller.problems.map(\.message), ["Them: Speech model missing"])
     }
 
-    func testCaptureErrorsShowAsProblems() async {
+    func testCaptureThatCannotBeRestartedShowsAsAProblem() async {
         let h = makeHarness()
         await startListening(h)
 
-        h.systemAudio.onError?("The display went to sleep")
+        h.systemAudio.onError?(CaptureFailure(message: "The user stopped the stream", isRetryable: false))
 
-        XCTAssertEqual(h.controller.problems.map(\.message), ["Meeting audio stopped: The display went to sleep"])
+        XCTAssertEqual(h.controller.problems.map(\.message), ["Meeting audio stopped: The user stopped the stream"])
     }
 
     func testTranscriberNoticesShowAndClear() async {
