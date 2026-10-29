@@ -12,9 +12,11 @@ enum OverlayText {
         }
     }
 
-    static func answer(_ answer: String, isAnswering: Bool, hasKey: Bool, shortcut: String) -> String {
+    static func answer(_ answer: String, isAnswering: Bool, hasKey: Bool, keyUnreadable: Bool = false,
+                       shortcut: String) -> String {
         if !answer.isEmpty { return answer }
         if isAnswering { return "Thinking…" }
+        if keyUnreadable { return "Allow Keychain access to your API key: menu bar icon, then Settings…" }
         if !hasKey { return "Add your Anthropic API key: menu bar icon, then Settings…" }
         return "Press \(shortcut) for help"
     }

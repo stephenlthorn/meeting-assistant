@@ -24,7 +24,12 @@ struct SettingsView: View {
                               file: "~/.config/meeting-assistant/anthropic_key")
                     Spacer()
                     Button("Remove") { settings.removeAPIKey() }
-                        .disabled(settings.apiKeySource != .keychain)
+                        .disabled(!canRemove(settings.apiKeySource))
+                }
+                if settings.apiKeySource == .unreadable {
+                    Text("macOS wouldn't let Meeting Assistant read the saved key. Allow access when it asks, or save the key again.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
                 if saveFailed {
                     Text("Couldn't save the key to the Keychain.")
@@ -68,7 +73,7 @@ struct SettingsView: View {
                     keyStatus(settings.deepgramKeySource, environmentName: "DEEPGRAM_API_KEY", file: nil)
                     Spacer()
                     Button("Remove") { settings.removeDeepgramKey() }
-                        .disabled(settings.deepgramKeySource != .keychain)
+                        .disabled(!canRemove(settings.deepgramKeySource))
                 }
                 Text("On-device is the default (private). Cloud STT sends call audio to Deepgram and applies the next time you Start Listening.")
                     .font(.caption)
@@ -153,10 +158,17 @@ struct SettingsView: View {
         case .keychain: text = "Saved in Keychain"
         case .environment: text = "Using \(environmentName)"
         case .file: text = "Using \(file ?? "key file")"
+        case .unreadable: text = "Allow Keychain access"
         case nil: text = "No key set"
         }
-        return Label(text, systemImage: source == nil ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
-            .foregroundStyle(source == nil ? .orange : .green)
+        let usable = source != nil && source != .unreadable
+        return Label(text, systemImage: usable ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+            .foregroundStyle(usable ? .green : .orange)
+    }
+
+    /// Only a Keychain item can be removed here, readable or not.
+    private func canRemove(_ source: AppSettings.KeySource?) -> Bool {
+        source == .keychain || source == .unreadable
     }
 
     private func modelLabel(_ id: String) -> String {

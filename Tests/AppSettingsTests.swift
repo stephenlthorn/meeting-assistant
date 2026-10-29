@@ -122,6 +122,126 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.apiKeySource, .environment)
     }
 
+    // MARK: - A Keychain that cannot be read
+
+    func testAKeychainKeyThatCannotBeReadIsNotReportedAsSaved() {
+        let settings = makeSettings(secrets: LockedSecretStore())
+
+        XCTAssertNil(settings.resolveAPIKey())
+
+        XCTAssertFalse(settings.apiKeyPresent)
+        XCTAssertEqual(settings.apiKeySource, .unreadable)
+    }
+
+    func testAnUnreadableKeychainKeyFallsBackToTheEnvironment() {
+        let settings = makeSettings(secrets: LockedSecretStore(), environment: ["ANTHROPIC_API_KEY": "sk-env"])
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-env")
+
+        XCTAssertTrue(settings.apiKeyPresent)
+        XCTAssertEqual(settings.apiKeySource, .environment)
+    }
+
+    func testTheKeychainKeyIsReadOnceAndReusedForTheSession() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-keychain"])
+        let settings = makeSettings(secrets: secrets)
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-keychain")
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-keychain")
+
+        XCTAssertEqual(secrets.reads, 1)
+    }
+
+    func testAFailedReadIsNotRetriedUntilTheNextSession() {
+        let secrets = LockedSecretStore()
+        let settings = makeSettings(secrets: secrets)
+
+        XCTAssertNil(settings.resolveAPIKey())
+        XCTAssertNil(settings.resolveAPIKey())
+
+        XCTAssertEqual(secrets.reads, 1)
+    }
+
+    func testLoadingKeysForListeningReadsTheKeyUpFront() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-keychain"])
+        let settings = makeSettings(secrets: secrets)
+
+        settings.loadKeysForListening()
+        XCTAssertEqual(secrets.reads, 1)
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-keychain")
+        XCTAssertEqual(secrets.reads, 1)
+    }
+
+    func testLoadingKeysForListeningTriesAgainAfterAFailedRead() {
+        let secrets = LockedSecretStore()
+        let settings = makeSettings(secrets: secrets)
+        settings.loadKeysForListening()
+        XCTAssertEqual(settings.apiKeySource, .unreadable)
+
+        secrets.readable = true
+        settings.loadKeysForListening()
+
+        XCTAssertEqual(settings.apiKeySource, .keychain)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-locked")
+    }
+
+    func testLoadingKeysForListeningLeavesTheDeepgramKeyUnreadUnlessItIsInUse() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk", "deepgram_api_key": "dg"])
+        let settings = makeSettings(secrets: secrets)
+
+        settings.loadKeysForListening()
+        XCTAssertEqual(secrets.reads, 1)
+
+        settings.acceptCloudAudio()
+        settings.loadKeysForListening()
+        XCTAssertEqual(secrets.reads, 3)
+    }
+
+    func testSavingTheKeyAgainRecoversFromAnUnreadableOne() {
+        let secrets = LockedSecretStore()
+        let settings = makeSettings(secrets: secrets)
+        XCTAssertNil(settings.resolveAPIKey())
+        secrets.readable = true
+
+        XCTAssertTrue(settings.setAPIKey("sk-new"))
+
+        XCTAssertEqual(settings.apiKeySource, .keychain)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-new")
+    }
+
+    func testReplacingTheKeyDropsTheCachedOne() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-old"])
+        let settings = makeSettings(secrets: secrets)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-old")
+
+        settings.setAPIKey("sk-new")
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-new")
+    }
+
+    func testRemovingTheKeyDropsTheCachedOne() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-old"])
+        let settings = makeSettings(secrets: secrets)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-old")
+
+        settings.removeAPIKey()
+
+        XCTAssertNil(settings.resolveAPIKey())
+        XCTAssertNil(settings.apiKeySource)
+    }
+
+    func testAnUnreadableDeepgramKeyIsNotUsed() {
+        let settings = makeSettings(secrets: LockedSecretStore(values: ["deepgram_api_key": "dg"]))
+        settings.acceptCloudAudio()
+        XCTAssertTrue(settings.sendsAudioToDeepgram)
+
+        XCTAssertNil(settings.resolveDeepgramKey())
+
+        XCTAssertEqual(settings.deepgramKeySource, .unreadable)
+        XCTAssertFalse(settings.sendsAudioToDeepgram)
+    }
+
     // MARK: - Deepgram key
 
     func testTheDeepgramKeyComesFromTheKeychainOrEnvironment() {

@@ -127,6 +127,7 @@ final class AssistantController {
         problems = []
         notice = nil
         resetTranscriptAndAnswer()
+        beginPrivacySession()
 
         let them = makeTranscriber(.them)
         let you = makeTranscriber(.you)
@@ -339,7 +340,9 @@ final class AssistantController {
         } else if inSample {
             stream = nextSampleAnswer()
         } else {
-            answer = "No API key. Add one in Settings (menu bar icon, then Settings…)."
+            answer = settings.apiKeySource == .unreadable
+                ? "Can't read your API key from the Keychain. Allow access when macOS asks, or save the key again in Settings."
+                : "No API key. Add one in Settings (menu bar icon, then Settings…)."
             isAnswering = false
             return
         }
@@ -421,5 +424,13 @@ final class AssistantController {
 
     private static func userPrompt(_ context: String) -> String {
         AnswerPrompt.user(transcript: context)
+    }
+
+    // MARK: - Privacy
+
+    /// Runs at the start of every listening session, before any transcriber or
+    /// audio exists: reads the keys now, so a Keychain prompt never lands mid-call.
+    private func beginPrivacySession() {
+        settings.loadKeysForListening()
     }
 }
