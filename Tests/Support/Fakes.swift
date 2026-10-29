@@ -97,6 +97,7 @@ final class FakeSystemAudio: SystemAudioCapturing {
 final class FakeMicrophone: MicrophoneCapturing {
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onRecovered: (@MainActor () -> Void)?
     var authorized = true
     var startError: Error?
     private(set) var starts = 0

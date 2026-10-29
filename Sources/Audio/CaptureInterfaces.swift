@@ -16,6 +16,9 @@ protocol MicrophoneCapturing: AnyObject {
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)? { get set }
     /// Called on the main actor when capture stops unexpectedly.
     var onError: (@MainActor (String) -> Void)? { get set }
+    /// Called on the main actor when capture that stopped by itself and was
+    /// reported through `onError` is working again.
+    var onRecovered: (@MainActor () -> Void)? { get set }
     /// Calls back on the main thread.
     func requestAuthorization(_ completion: @escaping (Bool) -> Void)
     func start() throws
