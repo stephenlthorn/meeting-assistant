@@ -42,6 +42,11 @@ struct Transcript {
 
     var text: String { committed.text + pending.text }
 
+    /// The highest utterance number `speaker` has reported so far, if any.
+    func highestUtterance(of speaker: Speaker) -> Int? {
+        turns.lazy.filter { $0.speaker == speaker }.map(\.utterance).max()
+    }
+
     /// The end of the transcript in at most `limit` characters, cut at a line
     /// break. A single line longer than `limit` keeps its speaker label and is
     /// cut at a word instead.

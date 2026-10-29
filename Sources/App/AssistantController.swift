@@ -69,6 +69,7 @@ final class AssistantController {
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
 
     @ObservationIgnored private var transcript = Transcript()
+    @ObservationIgnored private var clearedThrough: [Speaker: Int] = [:]
     @ObservationIgnored private var answerTask: Task<Void, Never>?
     @ObservationIgnored private var answerRequest = 0
     @ObservationIgnored private var lastAutoAnswer = Date.distantPast
@@ -293,12 +294,19 @@ final class AssistantController {
 
     // MARK: - Transcript
 
+    /// Utterances that were already underway keep reporting their whole text,
+    /// so they are ignored from here on instead of bringing the old words back.
     func clearTranscript() {
+        let seen = Dictionary(uniqueKeysWithValues: [Speaker.them, .you].compactMap { speaker in
+            transcript.highestUtterance(of: speaker).map { (speaker, $0) }
+        })
         resetTranscriptAndAnswer()
+        clearedThrough = seen
     }
 
     private func resetTranscriptAndAnswer() {
         transcript = Transcript()
+        clearedThrough = [:]
         transcriptDisplay = ""
         answerTask?.cancel()
         answerRequest += 1
@@ -307,6 +315,7 @@ final class AssistantController {
     }
 
     private func receive(_ segment: TranscriptSegment, from speaker: Speaker) {
+        guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
         guard let finished, finished.speaker == .them,
