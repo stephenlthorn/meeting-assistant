@@ -57,6 +57,8 @@ final class AssistantController {
     private(set) var transcriptDisplay = ""
     private(set) var answer = ""
     private(set) var isAnswering = false
+    /// A quiet one-line note under the answer, e.g. a question that waited too long and was skipped.
+    private(set) var answerNote: String?
 
     var isListening: Bool { listening != .idle }
     /// The transcript for Copy Transcript. Once a long call trimmed its early
@@ -107,6 +109,8 @@ final class AssistantController {
     @ObservationIgnored private var answerTask: Task<Void, Never>?
     @ObservationIgnored private var answerRequest = 0
     @ObservationIgnored private var lastAutoAnswer = Date.distantPast
+    @ObservationIgnored private var questions = QuestionQueue()
+    @ObservationIgnored private var questionWakeScheduled = false
     @ObservationIgnored private var sampleAnswersShown = 0
 
     init(settings: AppSettings,
@@ -199,6 +203,7 @@ final class AssistantController {
         listening = .idle
         status = "Stopped"
         clearNotices()
+        questions.clear()
         flushArchive()
         if hadTranscribers { drain(stopped) }
     }
@@ -563,6 +568,8 @@ final class AssistantController {
         answerTask?.cancel()
         answerRequest += 1
         answer = ""
+        answerNote = nil
+        questions.clear()
         isAnswering = false
     }
 
@@ -573,7 +580,7 @@ final class AssistantController {
         archive?.append(transcript.collectCommitted())
         guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
-        autoAnswerIfDue()
+        questionAsked(finished.text)
     }
 
     // MARK: - Saved transcript
@@ -671,6 +678,8 @@ final class AssistantController {
     // MARK: - Answers
 
     func answerNow() {
+        questions.clear()
+        answerNote = nil
         let inSample = listening == .sample
         guard inSample || settings.hasAcceptedTerms else {
             onTermsNeeded?({ [weak self] in self?.answerNow() })
@@ -717,16 +726,54 @@ final class AssistantController {
     private func finishAnswer(_ request: Int, error: Error?) {
         guard request == answerRequest else { return }
         isAnswering = false
-        guard let error, !(error is CancellationError) else { return }
-        let message = "Error: \(error.localizedDescription)"
-        answer = answer.isEmpty ? message : answer + "\n\n" + message
+        if let error, !(error is CancellationError) {
+            let message = "Error: \(error.localizedDescription)"
+            answer = answer.isEmpty ? message : answer + "\n\n" + message
+        }
+        answerWaitingQuestion()
     }
 
-    private func autoAnswerIfDue() {
-        guard settings.autoAnswer, !isAnswering,
-              now().timeIntervalSince(lastAutoAnswer) >= Self.autoAnswerInterval else { return }
+    /// Auto-answer: their latest question is kept until it can be answered
+    /// (nothing streaming, and the pause since the last auto-answer is over).
+    private func questionAsked(_ text: String) {
+        guard settings.autoAnswer else { return }
+        questions.hold(text, at: now())
+        answerWaitingQuestion()
+    }
+
+    /// Answers the waiting question if it can be answered now. It is asked
+    /// again when the answer in progress finishes or the pause ends; one that
+    /// waited past `QuestionQueue.maxAge` is dropped with a note.
+    private func answerWaitingQuestion() {
+        guard let waiting = questions.waiting else { return }
+        guard settings.autoAnswer, listening == .listening || listening == .starting else {
+            questions.clear()
+            return
+        }
+        guard !isAnswering else { return }
+        guard now().timeIntervalSince(waiting.detectedAt) <= QuestionQueue.maxAge else {
+            answerNote = QuestionQueue.skippedNote(for: waiting, at: now())
+            questions.clear()
+            return
+        }
+        let pause = Self.autoAnswerInterval - now().timeIntervalSince(lastAutoAnswer)
+        guard pause <= 0 else {
+            scheduleQuestionCheck(after: pause)
+            return
+        }
         lastAutoAnswer = now()
         answerNow()
+    }
+
+    private func scheduleQuestionCheck(after delay: TimeInterval) {
+        guard !questionWakeScheduled else { return }
+        questionWakeScheduled = true
+        schedule(delay) { [weak self] in
+            deliverOnMain {
+                self?.questionWakeScheduled = false
+                self?.answerWaitingQuestion()
+            }
+        }
     }
 
     // MARK: - Sample meeting

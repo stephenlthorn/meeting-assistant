@@ -162,6 +162,12 @@ private struct AnswerSection: View {
                     .help("Copy the answer")
                 }
             }
+            if let note = controller.answerNote {
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
             ScrollView {
                 Text(OverlayText.answer(controller.answer, isAnswering: controller.isAnswering,
                                         hasKey: settings.apiKeyPresent,
