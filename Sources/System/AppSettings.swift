@@ -14,8 +14,9 @@ final class AppSettings: ObservableObject {
 
     /// Bump when the privacy terms shown on the welcome screen change, so
     /// everyone is asked to agree again. 2: Apple's speech servers are named,
-    /// and used only after their own opt-in.
-    static let termsVersion = 2
+    /// and used only after their own opt-in. 3: Summarize Meeting sends the
+    /// whole transcript to Claude, and saved transcripts are mentioned.
+    static let termsVersion = 3
     static let bundleID = "com.stephenthorn.meetingassistant"
     static let legacyBundleID = "com.example.meetingassistant"
 
@@ -31,6 +32,12 @@ final class AppSettings: ObservableObject {
         return AppSettings(defaults: defaults, secrets: secrets,
                            environment: ProcessInfo.processInfo.environment, anthropicKeyFile: keyFile)
     }()
+
+    /// Where saved transcripts go until the user picks a folder. Not sandboxed, so a plain path is enough.
+    static var defaultTranscriptFolder: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/Meeting Assistant", isDirectory: true)
+    }
 
     private static let anthropicAccount = "anthropic_api_key"
     private static let deepgramAccount = "deepgram_api_key"
@@ -48,6 +55,9 @@ final class AppSettings: ObservableObject {
     @Published var answerHotKey: HotKeyCombo { didSet { defaults.set(answerHotKey.label, forKey: "answerHotKey") } }
     @Published var overlayHotKey: HotKeyCombo { didSet { defaults.set(overlayHotKey.label, forKey: "overlayHotKey") } }
     @Published var showsOverlay: Bool { didSet { defaults.set(showsOverlay, forKey: "showsOverlay") } }
+    /// Off until the user turns it on: transcripts are only written to disk by choice.
+    @Published var saveTranscripts: Bool { didSet { defaults.set(saveTranscripts, forKey: "saveTranscripts") } }
+    @Published var transcriptFolder: URL { didSet { defaults.set(transcriptFolder.path, forKey: "transcriptFolder") } }
     @Published private(set) var acceptedTermsVersion: Int {
         didSet { defaults.set(acceptedTermsVersion, forKey: "acceptedTermsVersion") }
     }
@@ -104,6 +114,9 @@ final class AppSettings: ObservableObject {
         overlayHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "overlayHotKey"),
                                            in: HotKeyCombo.overlayChoices)
         showsOverlay = defaults.object(forKey: "showsOverlay") as? Bool ?? true
+        saveTranscripts = defaults.bool(forKey: "saveTranscripts")
+        transcriptFolder = defaults.string(forKey: "transcriptFolder").flatMap { $0.isEmpty ? nil : $0 }
+            .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Self.defaultTranscriptFolder
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
         serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
         refreshKeySources()

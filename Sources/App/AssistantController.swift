@@ -33,6 +33,12 @@ enum ListeningState: Equatable {
 /// to be listening to something that is not there. The microphone retries
 /// itself and reports only when that fails or recovers.
 ///
+/// With "Save transcripts" on, the call is also written to a Markdown file (see
+/// `TranscriptArchive`), and the in-memory transcript keeps only its newest turns,
+/// because the older ones are already on disk. "Summarize Meeting" sends the whole
+/// transcript, not just the recent tail an answer gets. A question the other side
+/// asks while an answer is streaming waits for it instead of being dropped.
+///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
 /// sample meeting needs no terms, since it records nothing.
@@ -43,9 +49,12 @@ final class AssistantController {
     static let promptCharacters = 4_000
     static let autoAnswerInterval: TimeInterval = 6
     static let defaultDrainWindow: TimeInterval = 2
+    /// How often the transcript is written to disk while saving is on.
+    static let archiveInterval: TimeInterval = 30
     /// Waits before each attempt to restart system audio; when they run out, it gives up.
     static let systemAudioRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15, 15]
     private static let maxProblems = 3
+    private static let trimmedAndSavedNote = "[earlier lines trimmed - they are in your saved transcript file]"
 
     private(set) var listening: ListeningState = .idle
     private(set) var status = "Idle"
@@ -54,9 +63,19 @@ final class AssistantController {
     private(set) var transcriptDisplay = ""
     private(set) var answer = ""
     private(set) var isAnswering = false
+    /// A quiet one-line note under the answer, e.g. a question that waited too long and was skipped.
+    private(set) var answerNote: String?
+    private(set) var summary = ""
+    /// Shown with the summary when it does not cover the whole call.
+    private(set) var summaryNote: String?
+    private(set) var isSummarizing = false
 
     var isListening: Bool { listening != .idle }
-    var transcriptText: String { transcript.text }
+    /// The transcript for Copy Transcript. Once a long call trimmed its early
+    /// lines it starts with a marker, which says where they are if they were saved.
+    var transcriptText: String {
+        transcript.text(trimmedNote: archive == nil ? Transcript.trimmedMarker : Self.trimmedAndSavedNote)
+    }
 
     /// Asked to show the privacy terms; call the closure once they are accepted.
     @ObservationIgnored var onTermsNeeded: ((@escaping () -> Void) -> Void)?
@@ -72,6 +91,7 @@ final class AssistantController {
     @ObservationIgnored private let schedule: (TimeInterval, @escaping () -> Void) -> Void
     @ObservationIgnored private let sampleWordDelay: TimeInterval
     @ObservationIgnored private let drainWindow: TimeInterval
+    @ObservationIgnored private let transcriptFiles: TranscriptFileStoring
 
     @ObservationIgnored private let themSlot = TranscriberSlot()
     @ObservationIgnored private let youSlot = TranscriberSlot()
@@ -91,10 +111,19 @@ final class AssistantController {
     @ObservationIgnored private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
 
     @ObservationIgnored private var transcript = Transcript()
+    @ObservationIgnored private var archive: TranscriptArchive?
+    @ObservationIgnored private var archiveProblem: Problem?
+    @ObservationIgnored private var sessionStartedAt: Date?
+    @ObservationIgnored private let markdown = TranscriptMarkdown()
     @ObservationIgnored private var clearedThrough: [Speaker: Int] = [:]
     @ObservationIgnored private var answerTask: Task<Void, Never>?
     @ObservationIgnored private var answerRequest = 0
     @ObservationIgnored private var lastAutoAnswer = Date.distantPast
+    @ObservationIgnored private var questions = QuestionQueue()
+    @ObservationIgnored private var summaryTask: Task<Void, Never>?
+    @ObservationIgnored private var summaryRequest = 0
+    @ObservationIgnored private var summaryProblem: Problem?
+    @ObservationIgnored private var questionWakeScheduled = false
     @ObservationIgnored private var sampleAnswersShown = 0
 
     init(settings: AppSettings,
@@ -106,6 +135,7 @@ final class AssistantController {
          schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
          sampleWordDelay: TimeInterval = 0.04,
          drainWindow: TimeInterval = AssistantController.defaultDrainWindow,
+         transcriptFiles: TranscriptFileStoring = DiskTranscriptFiles(),
          workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
          notifications: NotificationCenter = .default) {
         self.settings = settings
@@ -117,6 +147,7 @@ final class AssistantController {
         self.schedule = schedule
         self.sampleWordDelay = sampleWordDelay
         self.drainWindow = drainWindow
+        self.transcriptFiles = transcriptFiles
         systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
         microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
         observeEnvironment(workspace: workspaceNotifications, screens: notifications)
@@ -157,6 +188,8 @@ final class AssistantController {
         themRecovery += 1
         clearNotices()
         resetTranscriptAndAnswer()
+        resetSummary()
+        beginArchive()
         beginPrivacySession()
         watchCapture(session: current)
 
@@ -184,6 +217,8 @@ final class AssistantController {
         listening = .idle
         status = "Stopped"
         clearNotices()
+        questions.clear()
+        flushArchive()
         if hadTranscribers { drain(stopped) }
     }
 
@@ -193,7 +228,11 @@ final class AssistantController {
     private func drain(_ stopped: Int) {
         drainingSession = stopped
         schedule(drainWindow) { [weak self] in
-            deliverOnMain { if self?.drainingSession == stopped { self?.drainingSession = nil } }
+            deliverOnMain {
+                guard self?.drainingSession == stopped else { return }
+                self?.drainingSession = nil
+                self?.flushArchive()
+            }
         }
     }
 
@@ -530,17 +569,21 @@ final class AssistantController {
         let seen = Dictionary(uniqueKeysWithValues: [Speaker.them, .you].compactMap { speaker in
             transcript.highestUtterance(of: speaker).map { (speaker, $0) }
         })
+        keepWhatWasSaved()
         resetTranscriptAndAnswer()
         clearedThrough = seen
     }
 
     private func resetTranscriptAndAnswer() {
         transcript = Transcript()
+        transcript.collectsCommitted = archive != nil
         clearedThrough = [:]
         transcriptDisplay = ""
         answerTask?.cancel()
         answerRequest += 1
         answer = ""
+        answerNote = nil
+        questions.clear()
         isAnswering = false
     }
 
@@ -548,14 +591,126 @@ final class AssistantController {
         guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
+        archive?.append(transcript.collectCommitted())
         guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
-        autoAnswerIfDue()
+        questionAsked(finished.text)
+    }
+
+    // MARK: - Saved transcript
+
+    /// Decided once per Start: with saving on, this call gets a file. Turning
+    /// saving on in the middle of a call waits for the next Start.
+    private func beginArchive() {
+        sessionStartedAt = now()
+        archive = nil
+        guard settings.saveTranscripts else {
+            transcript.collectsCommitted = false
+            return
+        }
+        archive = TranscriptArchive(folder: settings.transcriptFolder, started: now(), files: transcriptFiles,
+                                    format: markdown)
+        transcript.collectsCommitted = true
+        scheduleArchiveFlush(session: session)
+        // Now, not at the first write: macOS may ask permission for a folder like
+        // Documents, and a bad folder should be said so at Start, not 30 s in.
+        do {
+            try transcriptFiles.prepareFolder(settings.transcriptFolder)
+        } catch {
+            showSaveProblem(error)
+        }
+    }
+
+    private func endArchive() {
+        archive = nil
+        transcript.collectsCommitted = false
+    }
+
+    private func scheduleArchiveFlush(session current: Int) {
+        schedule(Self.archiveInterval) { [weak self] in
+            deliverOnMain { self?.archiveFlushDue(session: current) }
+        }
+    }
+
+    private func archiveFlushDue(session current: Int) {
+        guard session == current, isListening else { return }
+        flushArchive()
+        scheduleArchiveFlush(session: current)
+    }
+
+    /// Writes the transcript so far. Turning saving off stops writing at once.
+    private func flushArchive() {
+        guard let archive else { return }
+        guard settings.saveTranscripts else {
+            endArchive()
+            return
+        }
+        archive.append(transcript.collectCommitted())
+        archive.flush(snapshot: transcript.uncommittedTurns)
+        showSaveProblem(archive.lastError)
+    }
+
+    /// Quitting in the middle of a call: what was said since the last write is saved too.
+    func saveBeforeQuit() {
+        flushArchive()
+    }
+
+    /// Clearing the overlay's transcript must not lose lines from the saved one.
+    private func keepWhatWasSaved() {
+        guard let archive, settings.saveTranscripts else { return }
+        archive.append(transcript.collectCommitted() + transcript.uncommittedTurns)
+        archive.flush(snapshot: [])
+        showSaveProblem(archive.lastError)
+    }
+
+    private func showSaveProblem(_ error: Error?) {
+        showProblem(error, saving: "transcript", in: &archiveProblem)
+    }
+
+    /// Shows why a save failed, replacing the last such problem; no error clears it.
+    private func showProblem(_ error: Error?, saving noun: String, in slot: inout Problem?) {
+        if let old = slot {
+            problems.removeAll { $0 == old }
+            slot = nil
+        }
+        guard let error else { return }
+        let problem = Problem(message: "Couldn't save the \(noun): \(error.localizedDescription)")
+        slot = problem
+        report(problem)
+    }
+
+    /// The file name Save Transcript... starts with.
+    var suggestedTranscriptFileName: String {
+        markdown.fileStem(started: sessionStartedAt ?? now()) + ".md"
+    }
+
+    /// Save Transcript...: writes this call's transcript to `url`, whether or not
+    /// saving is on. When early lines were trimmed and a saved file has them, the
+    /// whole file is copied; otherwise what is in memory is written, with a note
+    /// if it is not the whole call.
+    func saveTranscript(to url: URL) {
+        guard let started = sessionStartedAt, !transcript.isEmpty else { return }
+        let document = savedSessionDocument() ?? Data(markdown.document(
+            started: started, turns: transcript.visibleTurns,
+            trimmedNote: transcript.hasTrimmedText ? Transcript.trimmedMarker : nil).utf8)
+        do {
+            try transcriptFiles.replace(url, with: document)
+        } catch {
+            report(Problem(message: "Couldn't save the transcript: \(error.localizedDescription)"))
+        }
+    }
+
+    private func savedSessionDocument() -> Data? {
+        guard transcript.hasTrimmedText, let archive, settings.saveTranscripts else { return nil }
+        flushArchive()
+        return archive.contents()
     }
 
     // MARK: - Answers
 
     func answerNow() {
+        questions.clear()
+        answerNote = nil
         let inSample = listening == .sample
         guard inSample || settings.hasAcceptedTerms else {
             onTermsNeeded?({ [weak self] in self?.answerNow() })
@@ -578,9 +733,7 @@ final class AssistantController {
         } else if inSample {
             stream = nextSampleAnswer()
         } else {
-            answer = settings.apiKeySource == .unreadable
-                ? "Can't read your API key from the Keychain. Allow access when macOS asks, or save the key again in Settings."
-                : "No API key. Add one in Settings (menu bar icon, then Settings…)."
+            answer = missingKeyMessage
             isAnswering = false
             return
         }
@@ -602,16 +755,151 @@ final class AssistantController {
     private func finishAnswer(_ request: Int, error: Error?) {
         guard request == answerRequest else { return }
         isAnswering = false
-        guard let error, !(error is CancellationError) else { return }
-        let message = "Error: \(error.localizedDescription)"
-        answer = answer.isEmpty ? message : answer + "\n\n" + message
+        if let error, !(error is CancellationError) {
+            let message = "Error: \(error.localizedDescription)"
+            answer = answer.isEmpty ? message : answer + "\n\n" + message
+        }
+        answerWaitingQuestion()
     }
 
-    private func autoAnswerIfDue() {
-        guard settings.autoAnswer, !isAnswering,
-              now().timeIntervalSince(lastAutoAnswer) >= Self.autoAnswerInterval else { return }
+    /// Auto-answer: their latest question is kept until it can be answered
+    /// (nothing streaming, and the pause since the last auto-answer is over).
+    private func questionAsked(_ text: String) {
+        guard settings.autoAnswer else { return }
+        questions.hold(text, at: now())
+        answerWaitingQuestion()
+    }
+
+    /// Answers the waiting question if it can be answered now. It is asked
+    /// again when the answer in progress finishes or the pause ends; one that
+    /// waited past `QuestionQueue.maxAge` is dropped with a note.
+    private func answerWaitingQuestion() {
+        guard let waiting = questions.waiting else { return }
+        guard settings.autoAnswer, listening == .listening || listening == .starting else {
+            questions.clear()
+            return
+        }
+        guard !isAnswering else { return }
+        guard now().timeIntervalSince(waiting.detectedAt) <= QuestionQueue.maxAge else {
+            answerNote = QuestionQueue.skippedNote(for: waiting, at: now())
+            questions.clear()
+            return
+        }
+        let pause = Self.autoAnswerInterval - now().timeIntervalSince(lastAutoAnswer)
+        guard pause <= 0 else {
+            scheduleQuestionCheck(after: pause)
+            return
+        }
         lastAutoAnswer = now()
         answerNow()
+    }
+
+    private func scheduleQuestionCheck(after delay: TimeInterval) {
+        guard !questionWakeScheduled else { return }
+        questionWakeScheduled = true
+        schedule(delay) { [weak self] in
+            deliverOnMain {
+                self?.questionWakeScheduled = false
+                self?.answerWaitingQuestion()
+            }
+        }
+    }
+
+    private var missingKeyMessage: String {
+        settings.apiKeySource == .unreadable
+            ? "Can't read your API key from the Keychain. Allow access when macOS asks, or save the key again in Settings."
+            : "No API key. Add one in Settings (menu bar icon, then Settings…)."
+    }
+
+    // MARK: - Summary
+
+    /// Sends the whole transcript (not the recent excerpt an answer gets) and
+    /// streams back a summary with decisions and action items. With saving on, a
+    /// finished summary is also saved next to the transcript.
+    func summarizeMeeting() {
+        let inSample = listening == .sample
+        guard inSample || settings.hasAcceptedTerms else {
+            onTermsNeeded?({ [weak self] in self?.summarizeMeeting() })
+            return
+        }
+        summaryTask?.cancel()
+        summaryRequest += 1
+        let current = summaryRequest
+        summaryNote = nil
+        guard !transcript.isEmpty else {
+            summary = "No transcript yet. Start listening first."
+            isSummarizing = false
+            return
+        }
+        guard let apiKey = settings.resolveAPIKey() else {
+            summary = missingKeyMessage
+            isSummarizing = false
+            return
+        }
+        let source = summarySource()
+        let input = SummaryInput(transcript: source.text, isPartial: source.isPartial)
+        summaryNote = input.isPartial ? partialSummaryNote(trimmed: source.isPartial) : nil
+        summary = ""
+        isSummarizing = true
+        let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
+                                                   system: SummaryPrompt.system(extraInstructions: settings.extraInstructions),
+                                                   user: SummaryPrompt.user(input)))
+        summaryTask = Task { [weak self] in
+            do {
+                for try await chunk in stream {
+                    guard let self, self.summaryRequest == current else { return }
+                    self.summary += chunk
+                }
+                self?.finishSummary(current, error: nil)
+            } catch {
+                self?.finishSummary(current, error: error)
+            }
+        }
+    }
+
+    /// The call's text for a summary. Once early lines were trimmed from memory,
+    /// the saved file (if there is one) still has them all.
+    private func summarySource() -> (text: String, isPartial: Bool) {
+        guard transcript.hasTrimmedText else { return (transcript.text, false) }
+        if let archive, settings.saveTranscripts {
+            flushArchive()
+            if archive.lastError == nil, let saved = archive.body() { return (saved, false) }
+        }
+        return (transcript.text, true)
+    }
+
+    private func partialSummaryNote(trimmed: Bool) -> String {
+        guard trimmed else { return "Covers only the most recent part of the call; it was too long to send in full." }
+        let note = "Covers only the most recent part of the call; earlier lines were trimmed."
+        return settings.saveTranscripts ? note : note + " Turn on Save transcripts in Settings to summarize a long call in full."
+    }
+
+    private func finishSummary(_ request: Int, error: Error?) {
+        guard request == summaryRequest else { return }
+        isSummarizing = false
+        if let error {
+            guard !(error is CancellationError) else { return }
+            let message = "Error: \(error.localizedDescription)"
+            summary = summary.isEmpty ? message : summary + "\n\n" + message
+            return
+        }
+        saveSummaryNextToTranscript()
+    }
+
+    private func saveSummaryNextToTranscript() {
+        guard let archive, settings.saveTranscripts, !summary.isEmpty else { return }
+        flushArchive()
+        archive.saveSummary(summary)
+        showProblem(archive.lastSummaryError, saving: "summary", in: &summaryProblem)
+    }
+
+    private func resetSummary() {
+        summaryTask?.cancel()
+        summaryRequest += 1
+        summary = ""
+        summaryNote = nil
+        isSummarizing = false
+        showProblem(nil, saving: "summary", in: &summaryProblem)
     }
 
     // MARK: - Sample meeting
@@ -625,7 +913,10 @@ final class AssistantController {
         status = "Sample meeting (nothing is recorded)"
         problems = []
         clearNotices()
+        endArchive()
         resetTranscriptAndAnswer()
+        resetSummary()
+        sessionStartedAt = now()
         sampleAnswersShown = 0
         scheduleSampleLine(0, session: session)
     }

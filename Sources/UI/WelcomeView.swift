@@ -3,7 +3,7 @@ import SwiftUI
 /// The welcome screen's privacy wording, kept apart from the layout so a test
 /// can check that it still names everywhere call data can go.
 enum WelcomeText {
-    static let whereYourDataGoes = "Speech is transcribed on this Mac. On macOS 14 and 15, if your Mac can't transcribe your language on-device, Apple's speech servers are used only if you separately turn that on in Settings. When you ask for help, or auto-answer is on, the last few minutes of transcript text go to Anthropic's Claude using your own API key. If you turn on Deepgram, call audio streams to Deepgram instead. Nothing is sent to the developer."
+    static let whereYourDataGoes = "Speech is transcribed on this Mac. On macOS 14 and 15, if your Mac can't transcribe your language on-device, Apple's speech servers are used only if you separately turn that on in Settings. When you ask for help, or auto-answer is on, the last few minutes of transcript text go to Anthropic's Claude using your own API key. If you choose Summarize Meeting, the whole transcript of the call goes to Claude the same way. If you turn on Deepgram, call audio streams to Deepgram instead. If you turn on saving, transcripts are written as files only on this Mac. Nothing is sent to the developer."
 }
 
 /// First-run screen: what the app listens to, where the data goes, and a

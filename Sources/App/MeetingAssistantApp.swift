@@ -10,7 +10,8 @@ struct MeetingAssistantApp: App {
         MenuBarExtra {
             MenuContent(controller: appDelegate.controller, settings: appDelegate.settings,
                         hotKeys: appDelegate.hotKeys, toggleOverlay: appDelegate.toggleOverlay,
-                        trySample: appDelegate.trySample, showWelcome: { appDelegate.showWelcome() })
+                        trySample: appDelegate.trySample, showWelcome: { appDelegate.showWelcome() },
+                        saveTranscript: appDelegate.saveTranscript, summarizeMeeting: appDelegate.summarizeMeeting)
         } label: {
             MenuBarIcon(controller: appDelegate.controller)
         }
@@ -28,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var controller = AssistantController.live(settings: settings)
     private var panel: OverlayPanel?
     private var welcomeWindow: NSWindow?
+    private var summaryWindow: NSWindow?
     private var afterTerms: (() -> Void)?
     private var subscriptions: Set<AnyCancellable> = []
 
@@ -48,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &subscriptions)
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        controller.saveBeforeQuit()
+    }
+
     func toggleOverlay() {
         guard let panel else { return }
         settings.showsOverlay.toggle()
@@ -62,6 +68,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         welcomeWindow?.close()
         if !settings.showsOverlay { toggleOverlay() }
         controller.startSample()
+    }
+
+    /// Save Transcript...: asks where, then writes this call's transcript there.
+    func saveTranscript() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = controller.suggestedTranscriptFileName
+        panel.directoryURL = settings.transcriptFolder
+        panel.canCreateDirectories = true
+        NSApp.activate()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        controller.saveTranscript(to: url)
+    }
+
+    /// Summarize Meeting: asks Claude for the summary and shows it in its own window.
+    func summarizeMeeting() {
+        controller.summarizeMeeting()
+        if summaryWindow == nil {
+            let window = NSWindow(contentViewController: NSHostingController(rootView: SummaryView(controller: controller)))
+            window.title = "Meeting Summary"
+            window.styleMask = [.titled, .closable, .resizable]
+            window.setContentSize(NSSize(width: 460, height: 380))
+            window.isReleasedWhenClosed = false
+            window.center()
+            summaryWindow = window
+        }
+        NSApp.activate()
+        summaryWindow?.makeKeyAndOrderFront(nil)
     }
 
     /// Shows the welcome screen; `resume` runs once the terms are accepted.
@@ -129,6 +162,8 @@ struct MenuContent: View {
     let toggleOverlay: () -> Void
     let trySample: () -> Void
     let showWelcome: () -> Void
+    let saveTranscript: () -> Void
+    let summarizeMeeting: () -> Void
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -153,6 +188,12 @@ struct MenuContent: View {
             .disabled(controller.answer.isEmpty)
         Button("Copy Transcript") { Clipboard.copy(controller.transcriptText) }
             .disabled(controller.transcriptDisplay.isEmpty)
+        Button("Save Transcript…") { saveTranscript() }
+            .disabled(controller.transcriptDisplay.isEmpty)
+        Button("Summarize Meeting") { summarizeMeeting() }
+            .disabled(controller.transcriptDisplay.isEmpty || controller.isSummarizing)
+        Button("Copy Summary") { Clipboard.copy(controller.summary) }
+            .disabled(controller.summary.isEmpty)
         Button("Clear Transcript") { controller.clearTranscript() }
 
         Divider()

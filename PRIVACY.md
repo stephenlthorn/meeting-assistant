@@ -15,7 +15,7 @@ Capture only happens while you are listening; the menu bar icon shows a record s
 
 - **Your Mac.** Speech is transcribed with Apple's on-device speech recognition. On macOS 26 and later this always stays on your Mac.
 - **Apple's speech servers, only if you allow it (macOS 14 and 15).** If your Mac cannot transcribe your language on-device, Meeting Assistant does not transcribe, and says so, until you separately turn on "Allow Apple's speech servers" in Settings. It is off by default and asks you to confirm. Once on, audio from both sides of your calls streams to Apple for transcription and [Apple's privacy terms](https://www.apple.com/legal/privacy/) apply. Turning it off takes effect immediately, even in the middle of a call, and so does withdrawing your agreement.
-- **Anthropic (Claude).** When you ask for help, or auto-answer is on, the most recent transcript text (up to about 4,000 characters) and your profile and extra instructions are sent to Anthropic's API using your own API key. [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy) applies.
+- **Anthropic (Claude).** When you ask for help, or auto-answer is on, the most recent transcript text (up to about 4,000 characters) and your profile and extra instructions are sent to Anthropic's API using your own API key. When you choose "Summarize Meeting", the **whole transcript** of the call (up to about 400,000 characters; if it is longer, the newest part) and your extra instructions are sent the same way, so the summary can cover the full call. Nothing is sent to Anthropic unless you ask for help, summarize, or leave auto-answer on. [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy) applies.
 - **Deepgram, only if you turn it on.** After you confirm, audio from both sides of your calls streams to Deepgram for transcription using your own Deepgram key. [Deepgram's privacy policy](https://deepgram.com/privacy) applies. Turning Deepgram off, removing its key or withdrawing your agreement stops the audio immediately, even in the middle of a call.
 - **No one else.** There are no analytics, no tracking, no accounts and no developer server.
 
@@ -23,7 +23,8 @@ Capture only happens while you are listening; the menu bar icon shows a record s
 
 - Your API keys, in the macOS Keychain.
 - Preferences such as model, profile, extra instructions, shortcuts and the overlay's position, and whether you agreed to the privacy terms, to Deepgram and to Apple's speech servers.
-- Transcripts and answers stay in memory while the app runs and are gone when you quit, unless you copy them.
+- Transcripts and answers stay in memory while the app runs and are gone when you quit, unless you copy them, save them with "Save Transcript..." in the menu, or turn on saving (below). A very long call keeps only its most recent turns in memory; Copy Transcript then starts with a note that earlier lines were trimmed.
+- **Saved transcripts, only if you turn them on.** "Save transcripts" in Settings is off by default. When on, each call is written as a Markdown file with timestamps, every 30 seconds and when you stop, into `~/Documents/Meeting Assistant` or the folder you choose. The files are readable only by your macOS account, are never sent anywhere by Meeting Assistant, and are yours to move or delete. Turning it off stops saving immediately. With saving on, a summary you ask for is also saved next to the transcript, as `<transcript name>-summary.md`, and a very long call can be summarized from the whole file.
 
 ## The people you talk to
 
