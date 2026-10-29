@@ -19,8 +19,10 @@ enum ListeningState: Equatable {
 /// Everything here runs on the main actor except audio, which capture threads
 /// hand to the current transcribers through lock-protected slots. Each Start
 /// and Stop begins a new session, and callbacks from older sessions are
-/// ignored. Starting and stopping system audio is chained, so a Start never
-/// overlaps the previous Stop.
+/// ignored, except that segments from the session that was just stopped are
+/// still accepted for `drainWindow`, so the last sentence of a call is not lost.
+/// Starting and stopping system audio is chained, so a Start never overlaps the
+/// previous Stop.
 ///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
@@ -31,6 +33,7 @@ final class AssistantController {
     static let displayCharacters = 1_500
     static let promptCharacters = 4_000
     static let autoAnswerInterval: TimeInterval = 6
+    static let defaultDrainWindow: TimeInterval = 2
     private static let maxProblems = 3
 
     private(set) var listening: ListeningState = .idle
@@ -57,6 +60,7 @@ final class AssistantController {
     @ObservationIgnored private let now: () -> Date
     @ObservationIgnored private let schedule: (TimeInterval, @escaping () -> Void) -> Void
     @ObservationIgnored private let sampleWordDelay: TimeInterval
+    @ObservationIgnored private let drainWindow: TimeInterval
 
     @ObservationIgnored private let themSlot = TranscriberSlot()
     @ObservationIgnored private let youSlot = TranscriberSlot()
@@ -66,6 +70,7 @@ final class AssistantController {
     @ObservationIgnored private var youSide = SideState.off
     @ObservationIgnored private var backendName = ""
     @ObservationIgnored private var session = 0
+    @ObservationIgnored private var drainingSession: Int?
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
 
     @ObservationIgnored private var transcript = Transcript()
@@ -82,7 +87,8 @@ final class AssistantController {
          answerer: AnswerStreaming,
          now: @escaping () -> Date = Date.init,
          schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
-         sampleWordDelay: TimeInterval = 0.04) {
+         sampleWordDelay: TimeInterval = 0.04,
+         drainWindow: TimeInterval = AssistantController.defaultDrainWindow) {
         self.settings = settings
         self.systemAudio = systemAudio
         self.microphone = microphone
@@ -91,6 +97,7 @@ final class AssistantController {
         self.now = now
         self.schedule = schedule
         self.sampleWordDelay = sampleWordDelay
+        self.drainWindow = drainWindow
         systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
         microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
         systemAudio.onError = { [weak self] message in
@@ -122,6 +129,7 @@ final class AssistantController {
             return
         }
         session += 1
+        drainingSession = nil
         let current = session
         listening = .starting
         status = "Starting…"
@@ -146,11 +154,24 @@ final class AssistantController {
 
     func stop() {
         guard listening != .idle else { return }
+        let stopped = session
+        let hadTranscribers = themTranscriber != nil || youTranscriber != nil
         session += 1
         tearDown()
         listening = .idle
         status = "Stopped"
         notice = nil
+        if hadTranscribers { drain(stopped) }
+    }
+
+    /// The transcribers were just told to stop, and a recognizer that was
+    /// mid-sentence reports the rest of it a moment later. Segments from that
+    /// session are accepted until the window closes or a new session starts.
+    private func drain(_ stopped: Int) {
+        drainingSession = stopped
+        schedule(drainWindow) { [weak self] in
+            deliverOnMain { if self?.drainingSession == stopped { self?.drainingSession = nil } }
+        }
     }
 
     private func speechAuthorizationResolved(_ granted: Bool, session current: Int) {
@@ -266,8 +287,8 @@ final class AssistantController {
 
     private func wire(_ transcriber: LiveTranscriber, as speaker: Speaker, session current: Int) {
         transcriber.onSegment = { [weak self] segment in
-            guard let self, self.session == current else { return }
-            self.receive(segment, from: speaker)
+            guard let self, self.session == current || self.drainingSession == current else { return }
+            self.receive(segment, from: speaker, isLive: self.session == current)
         }
         transcriber.onError = { [weak self] message in
             guard let self, self.session == current else { return }
@@ -314,11 +335,11 @@ final class AssistantController {
         isAnswering = false
     }
 
-    private func receive(_ segment: TranscriptSegment, from speaker: Speaker) {
+    private func receive(_ segment: TranscriptSegment, from speaker: Speaker, isLive: Bool) {
         guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
-        guard let finished, finished.speaker == .them,
+        guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
         autoAnswerIfDue()
     }

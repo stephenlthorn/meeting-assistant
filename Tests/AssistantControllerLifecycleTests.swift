@@ -44,4 +44,92 @@ final class AssistantControllerLifecycleTests: XCTestCase {
 
         XCTAssertEqual(h.controller.transcriptText, "Them: Hi again")
     }
+
+    // MARK: - Stopping (AUD-7)
+
+    func testTheLastWordsOfACallStillArriveJustAfterStopping() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        let them = h.transcribers.latest(.them)
+        them?.emit("We should ship in", isFinal: false)
+
+        h.controller.stop()
+        them?.emit("We should ship in May.", isFinal: true)
+
+        XCTAssertEqual(h.controller.transcriptText, "Them: We should ship in May.")
+        XCTAssertEqual(h.controller.listening, .idle)
+    }
+
+    func testNothingIsAcceptedOnceTheDrainWindowIsOver() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        let them = h.transcribers.latest(.them)
+        them?.emit("We should ship in", isFinal: false)
+        h.controller.stop()
+        XCTAssertEqual(h.scheduler.delays, [AssistantController.defaultDrainWindow])
+
+        h.scheduler.fireAll()
+        await settle()
+        them?.emit("We should ship in May.", isFinal: true)
+
+        XCTAssertEqual(h.controller.transcriptText, "Them: We should ship in")
+    }
+
+    func testTheDrainWindowIsConfigurable() async {
+        let h = LifecycleHarness(testCase: self, drainWindow: 0.25)
+        await h.startListening()
+
+        h.controller.stop()
+
+        XCTAssertEqual(h.scheduler.delays, [0.25])
+    }
+
+    func testStartingAgainEndsTheDrainSoOldWordsNeverReachTheNewSession() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        let oldThem = h.transcribers.latest(.them)
+        h.controller.stop()
+
+        await h.startListening()
+        oldThem?.emit("stale words", isFinal: true)
+
+        XCTAssertEqual(h.controller.transcriptText, "")
+    }
+
+    func testAWordAfterStoppingNeverStartsAnAutoAnswer() async {
+        let h = LifecycleHarness(testCase: self)
+        h.settings.autoAnswer = true
+        await h.startListening()
+        let them = h.transcribers.latest(.them)
+
+        h.controller.stop()
+        them?.emit("What's the timeline?", isFinal: true)
+
+        XCTAssertEqual(h.controller.transcriptText, "Them: What's the timeline?")
+        XCTAssertTrue(h.answerer.requests.isEmpty)
+    }
+
+    func testErrorsAndNoticesFromAStoppedSessionAreStillIgnored() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        let them = h.transcribers.latest(.them)
+
+        h.controller.stop()
+        them?.fail("Late failure")
+        them?.notice("Late notice")
+
+        XCTAssertEqual(h.controller.problems, [])
+        XCTAssertNil(h.controller.notice)
+    }
+
+    func testStoppingASampleMeetingSchedulesNoDrain() async {
+        let h = LifecycleHarness(testCase: self)
+        h.controller.startSample()
+        h.scheduler.fireAll()
+        await settle()
+
+        h.controller.stop()
+
+        XCTAssertFalse(h.scheduler.delays.contains(AssistantController.defaultDrainWindow))
+    }
 }

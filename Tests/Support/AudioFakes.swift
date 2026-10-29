@@ -10,24 +10,27 @@ struct LifecycleHarness {
     let systemAudio: FakeSystemAudio
     let microphone: FakeMicrophone
     let transcribers: FakeTranscriberFactory
+    let answerer: FakeAnswerer
     let clock: TestClock
     let scheduler: ManualScheduler
     let workspaceNotifications: NotificationCenter
     let screenNotifications: NotificationCenter
 
-    init(testCase: XCTestCase, acceptTerms: Bool = true) {
+    init(testCase: XCTestCase, acceptTerms: Bool = true,
+         drainWindow: TimeInterval = AssistantController.defaultDrainWindow) {
         settings = makeTestSettings(for: testCase, acceptTerms: acceptTerms)
         systemAudio = FakeSystemAudio()
         microphone = FakeMicrophone()
         transcribers = FakeTranscriberFactory()
+        answerer = FakeAnswerer()
         clock = TestClock()
         scheduler = ManualScheduler()
         workspaceNotifications = NotificationCenter()
         screenNotifications = NotificationCenter()
         controller = AssistantController(settings: settings, systemAudio: systemAudio, microphone: microphone,
-                                         makeTranscriber: transcribers.make, answerer: FakeAnswerer(),
+                                         makeTranscriber: transcribers.make, answerer: answerer,
                                          now: { [clock] in clock.now }, schedule: scheduler.schedule,
-                                         sampleWordDelay: 0)
+                                         sampleWordDelay: 0, drainWindow: drainWindow)
     }
 
     /// Starts listening and waits until both sides are up.
