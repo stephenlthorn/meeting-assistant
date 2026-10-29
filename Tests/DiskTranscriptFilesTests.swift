@@ -15,6 +15,15 @@ final class DiskTranscriptFilesTests: XCTestCase {
         XCTAssertEqual(try permissions(of: folder), 0o700)
     }
 
+    func testPreparingCreatesAnOwnerOnlyFolderAndIsHarmlessWhenItExists() throws {
+        let folder = try makeFolder().appendingPathComponent("Meeting Assistant")
+
+        try files.prepareFolder(folder)
+        try files.prepareFolder(folder)
+
+        XCTAssertEqual(try permissions(of: folder), 0o700)
+    }
+
     func testReplacingKeepsTheFileOwnerOnlyEvenIfItWasOpenToOthers() throws {
         let file = try makeFolder().appendingPathComponent("call.md")
         try Data("old".utf8).write(to: file)

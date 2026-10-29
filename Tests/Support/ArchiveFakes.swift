@@ -6,6 +6,7 @@ final class FakeTranscriptFiles: TranscriptFileStoring {
     private(set) var files: [URL: Data] = [:]
     private(set) var writes: [URL] = []
     private(set) var reads = 0
+    private(set) var prepared: [URL] = []
     var failure: Error?
 
     func read(_ url: URL) -> Data? {
@@ -15,6 +16,11 @@ final class FakeTranscriptFiles: TranscriptFileStoring {
 
     func exists(_ url: URL) -> Bool {
         files[url] != nil
+    }
+
+    func prepareFolder(_ url: URL) throws {
+        if let failure { throw failure }
+        prepared.append(url)
     }
 
     func replace(_ url: URL, with data: Data) throws {

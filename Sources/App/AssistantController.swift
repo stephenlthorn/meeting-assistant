@@ -33,6 +33,12 @@ enum ListeningState: Equatable {
 /// to be listening to something that is not there. The microphone retries
 /// itself and reports only when that fails or recovers.
 ///
+/// With "Save transcripts" on, the call is also written to a Markdown file (see
+/// `TranscriptArchive`), and the in-memory transcript keeps only its newest turns,
+/// because the older ones are already on disk. "Summarize Meeting" sends the whole
+/// transcript, not just the recent tail an answer gets. A question the other side
+/// asks while an answer is streaming waits for it instead of being dropped.
+///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
 /// sample meeting needs no terms, since it records nothing.
@@ -606,6 +612,13 @@ final class AssistantController {
                                     format: markdown)
         transcript.collectsCommitted = true
         scheduleArchiveFlush(session: session)
+        // Now, not at the first write: macOS may ask permission for a folder like
+        // Documents, and a bad folder should be said so at Start, not 30 s in.
+        do {
+            try transcriptFiles.prepareFolder(settings.transcriptFolder)
+        } catch {
+            showSaveProblem(error)
+        }
     }
 
     private func endArchive() {
@@ -635,6 +648,11 @@ final class AssistantController {
         archive.append(transcript.collectCommitted())
         archive.flush(snapshot: transcript.uncommittedTurns)
         showSaveProblem(archive.lastError)
+    }
+
+    /// Quitting in the middle of a call: what was said since the last write is saved too.
+    func saveBeforeQuit() {
+        flushArchive()
     }
 
     /// Clearing the overlay's transcript must not lose lines from the saved one.

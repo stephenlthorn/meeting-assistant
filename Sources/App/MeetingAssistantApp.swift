@@ -50,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &subscriptions)
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        controller.saveBeforeQuit()
+    }
+
     func toggleOverlay() {
         guard let panel else { return }
         settings.showsOverlay.toggle()

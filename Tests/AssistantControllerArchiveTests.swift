@@ -19,6 +19,36 @@ final class AssistantControllerArchiveTests: XCTestCase {
         XCTAssertFalse(h.scheduler.delays.contains(AssistantController.archiveInterval))
     }
 
+    func testTheFolderIsPreparedWhenTheCallStartsSoAProblemShowsThenNotThirtySecondsIn() async {
+        let h = makeHarness()
+        h.files.failure = TestFailure(message: "The folder can't be created")
+
+        h.controller.start()
+
+        XCTAssertEqual(h.controller.problems.map(\.message), ["Couldn't save the transcript: The folder can't be created"])
+        await eventually { h.controller.listening == .listening }
+    }
+
+    func testTheFolderIsCreatedAtStartWhenSavingIsOnAndNotWhenItIsOff() async {
+        let on = makeHarness(saving: true)
+        await startListening(on)
+        let off = makeHarness(saving: false)
+        await startListening(off)
+
+        XCTAssertEqual(on.files.prepared, [folder])
+        XCTAssertEqual(off.files.prepared, [])
+    }
+
+    func testQuittingMidCallSavesWhatWasSaidSinceTheLastWrite() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("Said just before the quit.", utterance: 0)
+
+        h.controller.saveBeforeQuit()
+
+        XCTAssertTrue(savedText(h).contains("Said just before the quit."))
+    }
+
     func testTheTranscriptIsWrittenEveryThirtySeconds() async {
         let h = makeHarness()
         await startListening(h)

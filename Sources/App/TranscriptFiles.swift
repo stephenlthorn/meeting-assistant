@@ -5,6 +5,10 @@ import Foundation
 protocol TranscriptFileStoring {
     func read(_ url: URL) -> Data?
     func exists(_ url: URL) -> Bool
+    /// Creates the folder if needed. Called when a call starts, so a folder macOS
+    /// asks permission for, or one that cannot be used, shows up then and not
+    /// in the middle of the call.
+    func prepareFolder(_ url: URL) throws
     /// Replaces the file at `url` with `data` in one step, creating its folder
     /// if needed. A reader never sees half a file, and the file is private to
     /// the user.
@@ -20,13 +24,17 @@ struct DiskTranscriptFiles: TranscriptFileStoring {
         FileManager.default.fileExists(atPath: url.path)
     }
 
+    func prepareFolder(_ url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+    }
+
     /// Writes a sibling file that is owner-only from the moment it exists (so
     /// there is no window where it is readable by others), then renames it over
     /// the target. A folder this creates is owner-only too.
     func replace(_ url: URL, with data: Data) throws {
         let directory = url.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
+        try prepareFolder(directory)
         let partial = directory.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).partial")
         let descriptor = open(partial.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
         guard descriptor >= 0 else { throw Self.failure() }
