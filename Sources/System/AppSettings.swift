@@ -58,6 +58,12 @@ final class AppSettings: ObservableObject {
     /// Off until the user turns it on: transcripts are only written to disk by choice.
     @Published var saveTranscripts: Bool { didSet { defaults.set(saveTranscripts, forKey: "saveTranscripts") } }
     @Published var transcriptFolder: URL { didSet { defaults.set(transcriptFolder.path, forKey: "transcriptFolder") } }
+    /// The one app whose audio is captured, by bundle identifier; nil listens to
+    /// every app. Read each time system audio starts, so a change takes effect
+    /// at the next Start (or restart), not mid-stream.
+    @Published var captureAppBundleID: String? {
+        didSet { defaults.set(captureAppBundleID, forKey: "captureAppBundleID") }
+    }
     @Published private(set) var acceptedTermsVersion: Int {
         didSet { defaults.set(acceptedTermsVersion, forKey: "acceptedTermsVersion") }
     }
@@ -117,6 +123,7 @@ final class AppSettings: ObservableObject {
         saveTranscripts = defaults.bool(forKey: "saveTranscripts")
         transcriptFolder = defaults.string(forKey: "transcriptFolder").flatMap { $0.isEmpty ? nil : $0 }
             .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Self.defaultTranscriptFolder
+        captureAppBundleID = defaults.string(forKey: "captureAppBundleID").flatMap { $0.isEmpty ? nil : $0 }
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
         serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
         refreshKeySources()

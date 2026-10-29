@@ -24,7 +24,13 @@ protocol SystemAudioCapturing: AnyObject {
     /// the stream that is current reports: a late error from one that was
     /// already stopped or replaced is dropped.
     var onError: (@MainActor (CaptureFailure) -> Void)? { get set }
-    func start() async throws
+    /// Called on the main actor after each start with what the user should know
+    /// about it, or nil when there is nothing: capture works, but not exactly as
+    /// asked (the chosen app was not running, so every app is heard).
+    var onNotice: (@MainActor (String?) -> Void)? { get set }
+    /// Listens to the app with this bundle identifier when it is running, and to
+    /// every app when it is nil or the app is not running.
+    func start(application bundleID: String?) async throws
     func stop() async
 }
 
@@ -41,6 +47,11 @@ protocol MicrophoneCapturing: AnyObject {
     func requestAuthorization(_ completion: @escaping (Bool) -> Void)
     func start() throws
     func stop()
+    /// Tears the capture down and builds it again, as if the input device had
+    /// changed: for a microphone that is armed but delivers nothing. A failed
+    /// attempt retries with the same backoff and reports through `onError` and
+    /// `onRecovered`. Does nothing unless the microphone is running.
+    @MainActor func reconnect()
 }
 
 enum SystemAudioError: LocalizedError, Equatable {

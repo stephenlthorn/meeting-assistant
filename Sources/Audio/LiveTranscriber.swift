@@ -10,6 +10,12 @@ protocol LiveTranscriber: AnyObject {
     var backendName: String { get }
     var onSegment: (@MainActor (TranscriptSegment) -> Void)? { get set }
     var onError: (@MainActor (String) -> Void)? { get set }
+    /// The transcriber has stopped for good and will not recover on its own: it
+    /// refused to start (a missing or rejected key, no on-device model) or ran
+    /// out of retries. The reason is also reported through `onError`, so a
+    /// consumer that only lists problems needs nothing more; this is how the
+    /// owner learns the side is dead rather than merely struggling.
+    var onFatal: (@MainActor (String) -> Void)? { get set }
     /// A passing status such as a model download; nil clears it.
     var onNotice: (@MainActor (String?) -> Void)? { get set }
     /// Calls back on the main thread.

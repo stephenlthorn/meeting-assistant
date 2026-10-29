@@ -203,6 +203,47 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         XCTAssertTrue(h.engine.sessions.isEmpty)
     }
 
+    // MARK: - Fatal failures (M1)
+
+    func testAnUnavailableRecognizerIsFatal() async {
+        let h = makeHarness()
+        h.engine.isAvailable = false
+
+        h.transcriber.start()
+        h.flush()
+
+        await eventually { !h.fatals.isEmpty }
+        XCTAssertEqual(h.fatals, ["Speech recognition isn't available for this language right now."])
+    }
+
+    func testRefusingServerRecognitionIsFatal() async {
+        let h = makeHarness()
+        h.engine.supportsOnDeviceRecognition = false
+
+        h.transcriber.start()
+        h.flush()
+
+        await eventually { !h.fatals.isEmpty }
+        XCTAssertEqual(h.fatals, h.errors, "the same words are shown to the user")
+        XCTAssertTrue(h.fatals.first?.hasPrefix("On-device speech recognition isn't available") ?? false)
+    }
+
+    func testRecognitionThatKeepsFailingIsAWarningNotFatal() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        for _ in 0..<LegacySpeechTranscriber.failuresBeforeReporting {
+            h.engine.sessions.last?.fail()
+            h.flush()
+            h.scheduler.fireAll()
+            h.flush()
+        }
+
+        await eventually { !h.errors.isEmpty }
+        XCTAssertEqual(h.fatals, [], "it keeps retrying, so the side is not dead")
+    }
+
     // MARK: - Apple's servers (APP-1)
 
     func testWithoutOnDeviceRecognitionNoSessionStartsAndTheUserIsToldHowToFixIt() async {
@@ -332,6 +373,7 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         let startTime: Date
         var segments: [TranscriptSegment] = []
         var errors: [String] = []
+        var fatals: [String] = []
         var notices: [String] = []
 
         init(allowServerRecognition: Bool) {
@@ -352,6 +394,7 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         let h = Harness(allowServerRecognition: allowServerRecognition)
         h.transcriber.onSegment = { [weak h] in h?.segments.append($0) }
         h.transcriber.onError = { [weak h] in h?.errors.append($0) }
+        h.transcriber.onFatal = { [weak h] in h?.fatals.append($0) }
         h.transcriber.onNotice = { [weak h] in if let notice = $0 { h?.notices.append(notice) } }
         return h
     }

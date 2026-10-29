@@ -44,6 +44,7 @@ final class AnalyzerTranscriber: LiveTranscriber {
     let backendName = "on-device"
     var onSegment: (@MainActor (TranscriptSegment) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
     private let makePipeline: AnalyzerPipelineFactory
@@ -176,8 +177,11 @@ final class AnalyzerTranscriber: LiveTranscriber {
             failures += 1
             return failures
         }
-        if !retryable || count == Self.failuresBeforeReporting { report(message) }
-        guard retryable else { return }
+        guard retryable else {
+            fatal(message)
+            return
+        }
+        if count == Self.failuresBeforeReporting { report(message) }
         let delay = min(Self.maximumBackoff, pow(2, Double(count - 1)))
         schedule(delay) { [weak self] in
             guard let self, self.isCurrent(run) else { return }
@@ -210,6 +214,17 @@ final class AnalyzerTranscriber: LiveTranscriber {
     private func report(_ message: String) {
         let onError = self.onError
         deliverOnMain { onError?(message) }
+    }
+
+    /// Reported like any problem, and also announced as the end of this
+    /// transcriber, so the owner can show the side as failed.
+    private func fatal(_ message: String) {
+        let onError = self.onError
+        let onFatal = self.onFatal
+        deliverOnMain {
+            onError?(message)
+            onFatal?(message)
+        }
     }
 
     private func notify(_ message: String?) {

@@ -92,6 +92,11 @@ final class MicCapture: MicrophoneCapturing {
         engine.stop()
     }
 
+    @MainActor
+    func reconnect() {
+        restartAfterConfigurationChange()
+    }
+
     /// Checks there is an input, then taps it in whatever format it has now. The
     /// format is not read first and passed in: if the device changes in between,
     /// AVAudioEngine raises an Objective-C exception that Swift cannot catch.

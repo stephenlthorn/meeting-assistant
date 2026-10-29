@@ -34,6 +34,7 @@ final class CloudTranscriber: LiveTranscriber {
     let backendName = "Deepgram"
     var onSegment: (@MainActor (TranscriptSegment) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
     private let apiKey: String
@@ -82,7 +83,7 @@ final class CloudTranscriber: LiveTranscriber {
     func start() {
         queue.async { [self] in
             guard !apiKey.isEmpty else {
-                report("Missing Deepgram API key.")
+                fatal("Missing Deepgram API key.")
                 return
             }
             if draining { endDrain() }
@@ -214,7 +215,7 @@ final class CloudTranscriber: LiveTranscriber {
             reconnecting = false
             notify(nil)
         }
-        report(message)
+        fatal(message)
     }
 
     private func reconnect(after droppedGeneration: Int) {
@@ -312,6 +313,17 @@ final class CloudTranscriber: LiveTranscriber {
     private func report(_ message: String) {
         let onError = self.onError
         deliverOnMain { onError?(message) }
+    }
+
+    /// Reported like any problem, and also announced as the end of this
+    /// transcriber, so the owner can show the side as failed.
+    private func fatal(_ message: String) {
+        let onError = self.onError
+        let onFatal = self.onFatal
+        deliverOnMain {
+            onError?(message)
+            onFatal?(message)
+        }
     }
 
     private func notify(_ message: String?) {

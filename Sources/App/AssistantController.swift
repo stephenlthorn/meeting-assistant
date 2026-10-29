@@ -39,6 +39,17 @@ enum ListeningState: Equatable {
 /// transcript, not just the recent tail an answer gets. A question the other side
 /// asks while an answer is streaming waits for it instead of being dropped.
 ///
+/// A side can also break without saying so. A transcriber that gives up says so
+/// (`onFatal`) and its side is marked failed at once. A watchdog per side, checked
+/// every `watchdogInterval` while its session lasts, restarts capture that stopped
+/// delivering audio and a transcriber that hears speech and writes nothing; if the
+/// side is still broken afterwards the user is told once. The same per-side meters
+/// feed `levels` for the overlay's indicator.
+///
+/// System audio is limited to the app chosen in Settings when that app is running
+/// (`AppSettings.captureAppBundleID`, read at each start and restart); otherwise
+/// every app is heard, and a notice says so.
+///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
 /// sample meeting needs no terms, since it records nothing.
@@ -53,6 +64,8 @@ final class AssistantController {
     static let archiveInterval: TimeInterval = 30
     /// Waits before each attempt to restart system audio; when they run out, it gives up.
     static let systemAudioRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15, 15]
+    /// How often each side's audio is checked for silent breakage.
+    static let watchdogInterval: TimeInterval = 5
     private static let maxProblems = 3
     private static let trimmedAndSavedNote = "[earlier lines trimmed - they are in your saved transcript file]"
 
@@ -69,6 +82,9 @@ final class AssistantController {
     /// Shown with the summary when it does not cover the whole call.
     private(set) var summaryNote: String?
     private(set) var isSummarizing = false
+///
+    /// Per-side loudness for the overlay's level indicator.
+    let levels = CaptureLevels()
 
     var isListening: Bool { listening != .idle }
     /// The transcript for Copy Transcript. Once a long call trimmed its early
@@ -92,14 +108,18 @@ final class AssistantController {
     @ObservationIgnored private let sampleWordDelay: TimeInterval
     @ObservationIgnored private let drainWindow: TimeInterval
     @ObservationIgnored private let transcriptFiles: TranscriptFileStoring
+    @ObservationIgnored private let watchdogSchedule: (TimeInterval, @escaping () -> Void) -> Void
 
     @ObservationIgnored private let themSlot = TranscriberSlot()
     @ObservationIgnored private let youSlot = TranscriberSlot()
     @ObservationIgnored private var themTranscriber: LiveTranscriber?
     @ObservationIgnored private var youTranscriber: LiveTranscriber?
-    @ObservationIgnored private var themSide = SideState.off
-    @ObservationIgnored private var youSide = SideState.off
+    @ObservationIgnored private var themSide = SideState.off { didSet { sideChanged(.them, to: themSide) } }
+    @ObservationIgnored private var youSide = SideState.off { didSet { sideChanged(.you, to: youSide) } }
+    @ObservationIgnored private let themMeter: AudioMeter
+    @ObservationIgnored private let youMeter: AudioMeter
     @ObservationIgnored private var speakerNotices: [Speaker: String] = [:]
+    @ObservationIgnored private var captureNotice: String?
     @ObservationIgnored private var backendName = ""
     @ObservationIgnored private var session = 0
     @ObservationIgnored private var drainingSession: Int?
@@ -108,6 +128,11 @@ final class AssistantController {
     @ObservationIgnored private var themAttempts = 0
     @ObservationIgnored private var themCanRevive = false
     @ObservationIgnored private var captureProblems: [Speaker: Problem] = [:]
+    @ObservationIgnored private var watchdogs: [Speaker: SideWatchdog] = [:]
+    /// Sides whose replacement transcriber is waiting for its permission answer.
+    /// Nothing is judged for them: the transcriber has not been started yet.
+    @ObservationIgnored private var awaitingSpeechPermission: Set<Speaker> = []
+    @ObservationIgnored private var lastWatchdogTick = Date.distantPast
     @ObservationIgnored private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
 
     @ObservationIgnored private var transcript = Transcript()
@@ -137,7 +162,9 @@ final class AssistantController {
          drainWindow: TimeInterval = AssistantController.defaultDrainWindow,
          transcriptFiles: TranscriptFileStoring = DiskTranscriptFiles(),
          workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
-         notifications: NotificationCenter = .default) {
+         notifications: NotificationCenter = .default,
+         meterClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         watchdogSchedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
         self.settings = settings
         self.systemAudio = systemAudio
         self.microphone = microphone
@@ -148,8 +175,22 @@ final class AssistantController {
         self.sampleWordDelay = sampleWordDelay
         self.drainWindow = drainWindow
         self.transcriptFiles = transcriptFiles
-        systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
-        microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
+        self.watchdogSchedule = watchdogSchedule
+        let levels = self.levels
+        themMeter = AudioMeter(clock: meterClock, onLevel: { level in
+            deliverOnMain { levels.update(.them, rms: level) }
+        })
+        youMeter = AudioMeter(clock: meterClock, onLevel: { level in
+            deliverOnMain { levels.update(.you, rms: level) }
+        })
+        systemAudio.onBuffer = { [themSlot, themMeter] buffer in
+            themMeter.observe(buffer)
+            themSlot.append(buffer)
+        }
+        microphone.onBuffer = { [youSlot, youMeter] buffer in
+            youMeter.observe(buffer)
+            youSlot.append(buffer)
+        }
         observeEnvironment(workspace: workspaceNotifications, screens: notifications)
     }
 
@@ -186,12 +227,15 @@ final class AssistantController {
         captureProblems = [:]
         themCanRevive = false
         themRecovery += 1
+        awaitingSpeechPermission = []
         clearNotices()
         resetTranscriptAndAnswer()
         resetSummary()
         beginArchive()
         beginPrivacySession()
         watchCapture(session: current)
+        lastWatchdogTick = now()
+        scheduleWatchdog(session: current)
 
         let them = makeTranscriber(.them)
         let you = makeTranscriber(.you)
@@ -258,12 +302,14 @@ final class AssistantController {
         lifecycle = Task { [weak self, systemAudio] in
             await previous?.value
             do {
-                try await systemAudio.start()
+                try await systemAudio.start(application: self?.settings.captureAppBundleID)
                 guard let self, self.session == current else {
                     await systemAudio.stop()
                     return
                 }
-                self.themSide = .up
+                // Their transcriber may have given up while this was starting; the
+                // stop it queued is next in the chain, so the side stays failed.
+                if self.themSide == .pending { self.themSide = .up }
                 self.resolveStartup()
             } catch {
                 guard let self, self.session == current else { return }
@@ -319,6 +365,21 @@ final class AssistantController {
         }
     }
 
+    /// A side is metered and watched only while its capture is up. A side that is
+    /// reconnecting keeps its watchdog, so what was already restarted is remembered.
+    private func sideChanged(_ speaker: Speaker, to state: SideState) {
+        levels.setActive(speaker, state == .up)
+        switch state {
+        case .up: armWatchdog(for: speaker)
+        case .reconnecting: break
+        case .off, .pending, .failed: watchdogs[speaker] = nil
+        }
+        if speaker == .them, state == .failed, captureNotice != nil {
+            captureNotice = nil
+            refreshNotice()
+        }
+    }
+
     private func listeningStatus() -> String {
         let scope: String? = switch (themSide, youSide) {
         case (.up, .failed): "their side only"
@@ -341,6 +402,7 @@ final class AssistantController {
         if youSide != .failed { youTranscriber?.stop() }
         themTranscriber = nil
         youTranscriber = nil
+        awaitingSpeechPermission = []
         themSide = .off
         youSide = .off
     }
@@ -366,6 +428,11 @@ final class AssistantController {
         }
         microphone.onRecovered = { [weak self] in
             self?.microphoneRecovered(session: current)
+        }
+        systemAudio.onNotice = { [weak self] message in
+            guard let self, self.session == current else { return }
+            self.captureNotice = message
+            self.refreshNotice()
         }
     }
 
@@ -405,7 +472,7 @@ final class AssistantController {
             guard let self, self.isRecovering(session: current, recovery: recovery) else { return }
             await systemAudio.stop()
             do {
-                try await systemAudio.start()
+                try await systemAudio.start(application: self.settings.captureAppBundleID)
                 guard self.session == current, self.themSide == .reconnecting else {
                     await systemAudio.stop()
                     return
@@ -506,6 +573,89 @@ final class AssistantController {
         ]
     }
 
+    // MARK: - Sides that break without saying so
+
+    private func meter(for speaker: Speaker) -> AudioMeter {
+        speaker == .them ? themMeter : youMeter
+    }
+
+    private func armWatchdog(for speaker: Speaker) {
+        let reading = meter(for: speaker).reading()
+        guard watchdogs[speaker] != nil else {
+            watchdogs[speaker] = SideWatchdog(at: now(), reading: reading)
+            return
+        }
+        watchdogs[speaker]?.rearm(at: now(), reading: reading)
+    }
+
+    private func scheduleWatchdog(session current: Int) {
+        watchdogSchedule(Self.watchdogInterval) { [weak self] in
+            deliverOnMain { self?.watchdogTick(session: current) }
+        }
+    }
+
+    /// Never acts for a session that has ended, so a Stop (and its drain) is
+    /// left alone. A gap far longer than the interval means the Mac slept: the
+    /// silence that followed is not the sides' fault, so counting starts over.
+    private func watchdogTick(session current: Int) {
+        guard session == current, listening != .idle else { return }
+        scheduleWatchdog(session: current)
+        let time = now()
+        let slept = time.timeIntervalSince(lastWatchdogTick) > Self.watchdogInterval * 3
+        lastWatchdogTick = time
+        for speaker in [Speaker.them, .you] {
+            inspect(speaker, at: time, slept: slept)
+        }
+    }
+
+    private func inspect(_ speaker: Speaker, at time: Date, slept: Bool) {
+        guard (speaker == .them ? themSide : youSide) == .up, var watch = watchdogs[speaker] else { return }
+        let reading = meter(for: speaker).reading()
+        guard !slept, !awaitingSpeechPermission.contains(speaker) else {
+            watch.rearm(at: time, reading: reading)
+            watchdogs[speaker] = watch
+            return
+        }
+        let verdict = watch.check(reading, at: time)
+        watchdogs[speaker] = watch
+        if !watch.isHearingAudio { levels.silence(speaker) }
+        guard let verdict else { return }
+        act(on: verdict, for: speaker)
+    }
+
+    private func act(on verdict: SideWatchdog.Verdict, for speaker: Speaker) {
+        switch verdict {
+        case .restartCapture:
+            restartCapture(of: speaker)
+        case .captureStillSilent:
+            let source = speaker == .them ? "the meeting" : "your microphone"
+            let advice = speaker == .them ? "If people are talking, stop and start listening."
+                                          : "Check its input in System Settings, then stop and start listening."
+            reportCaptureProblem(Problem(message: "No audio is coming from \(source). \(advice)"), for: speaker)
+        case .captureResumed:
+            clearCaptureProblem(for: speaker)
+        case .restartTranscriber:
+            guard let transcriber = speaker == .them ? themTranscriber : youTranscriber else { return }
+            transcriber.stop()
+            transcriber.start()
+        case .transcriberStillSilent:
+            let side = speaker == .them ? "Their" : "Your"
+            reportCaptureProblem(Problem(message: "\(side) side is being heard but nothing is being transcribed. Stop and start listening to try again."),
+                                 for: speaker)
+        }
+    }
+
+    /// Their side goes through the same backoff as a stream that reports its own
+    /// death; the microphone has its own, behind `reconnect()`.
+    private func restartCapture(of speaker: Speaker) {
+        switch speaker {
+        case .them:
+            systemAudioStopped("No audio came from the meeting for a while.", session: session)
+        case .you:
+            microphone.reconnect()
+        }
+    }
+
     /// A capture problem goes away again once that capture works, instead of
     /// lingering in the list as if it were still true.
     private func reportCaptureProblem(_ problem: Problem, for speaker: Speaker) {
@@ -522,11 +672,16 @@ final class AssistantController {
     private func wire(_ transcriber: LiveTranscriber, as speaker: Speaker, session current: Int) {
         transcriber.onSegment = { [weak self] segment in
             guard let self, self.session == current || self.drainingSession == current else { return }
+            if self.session == current { self.heardText(segment, from: speaker) }
             self.receive(segment, from: speaker, isLive: self.session == current)
         }
         transcriber.onError = { [weak self] message in
             guard let self, self.session == current else { return }
             self.report(Problem(message: "\(speaker.rawValue): \(message)"))
+        }
+        transcriber.onFatal = { [weak self, weak transcriber] message in
+            guard let self, let transcriber, self.session == current else { return }
+            self.transcriberGaveUp(transcriber, as: speaker, message: message)
         }
         transcriber.onNotice = { [weak self] message in
             guard let self, self.session == current else { return }
@@ -534,17 +689,54 @@ final class AssistantController {
         }
     }
 
+    /// Words arriving prove the transcriber works, and take down a report that it did not.
+    private func heardText(_ segment: TranscriptSegment, from speaker: Speaker) {
+        guard !segment.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if watchdogs[speaker]?.noteText() == true { clearCaptureProblem(for: speaker) }
+    }
+
+    /// A transcriber that gave up will not come back by itself, so its side is
+    /// marked failed and its capture released: the status says which side is
+    /// left (or the session ends if both are), and a wake cannot revive it. A
+    /// transcriber that has since been replaced no longer speaks for its side.
+    private func transcriberGaveUp(_ transcriber: LiveTranscriber, as speaker: Speaker, message: String) {
+        switch speaker {
+        case .them:
+            guard themTranscriber === transcriber,
+                  themSide == .pending || themSide == .up || themSide == .reconnecting else { return }
+            themSide = .failed
+            themCanRevive = false
+            themRecovery += 1
+            themSlot.set(nil)
+            stopSystemAudio()
+        case .you:
+            guard youTranscriber === transcriber, youSide == .pending || youSide == .up else { return }
+            youSide = .failed
+            youSlot.set(nil)
+            microphone.stop()
+        }
+        transcriber.stop()
+        reportCaptureProblem(Problem(message: "\(speaker.rawValue): \(message)"), for: speaker)
+        resolveStartup()
+    }
+
     /// Each side has its own notice, so one finishing (or failing) a model
     /// download does not wipe the other's, and the same text is shown once.
     private func setNotice(_ message: String?, from speaker: Speaker) {
         speakerNotices[speaker] = message
-        let shown = [Speaker.them, .you].compactMap { speakerNotices[$0] }
+        refreshNotice()
+    }
+
+    /// What capture says about itself comes first, then each side's speech notice.
+    private func refreshNotice() {
+        let shown = [captureNotice].compactMap { $0 } + [Speaker.them, .you].compactMap { speakerNotices[$0] }
         notice = shown.isEmpty ? nil : shown.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
             .joined(separator: "\n")
     }
 
     private func clearNotices() {
         speakerNotices = [:]
+        captureNotice = nil
         notice = nil
     }
 
@@ -1034,6 +1226,7 @@ final class AssistantController {
                                            isFinal: segment.isFinal))
             }
             if speaker == .them { themTranscriber = fresh } else { youTranscriber = fresh }
+            if started { awaitingSpeechPermission.insert(speaker) }
             replaced.append(Replacement(speaker: speaker, transcriber: fresh, started: started))
         }
         guard let first = replaced.first else { return }
@@ -1046,6 +1239,7 @@ final class AssistantController {
 
     private func replacementsAuthorized(_ granted: Bool, replaced: [Replacement], session current: Int) {
         guard session == current else { return }
+        awaitingSpeechPermission.subtract(replaced.map(\.speaker))
         guard granted else {
             report(Problem(message: "Speech Recognition permission is off, so listening stopped. Allow Meeting Assistant in System Settings.",
                            fix: .speechRecognition))
