@@ -30,7 +30,9 @@ struct LifecycleHarness {
         controller = AssistantController(settings: settings, systemAudio: systemAudio, microphone: microphone,
                                          makeTranscriber: transcribers.make, answerer: answerer,
                                          now: { [clock] in clock.now }, schedule: scheduler.schedule,
-                                         sampleWordDelay: 0, drainWindow: drainWindow)
+                                         sampleWordDelay: 0, drainWindow: drainWindow,
+                                         workspaceNotifications: workspaceNotifications,
+                                         notifications: screenNotifications)
     }
 
     /// Starts listening and waits until both sides are up.

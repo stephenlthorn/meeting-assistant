@@ -10,12 +10,17 @@ import ScreenCaptureKit
 ///
 /// Permission: first `start()` triggers the system "Screen Recording" prompt
 /// (ScreenCaptureKit is gated by that TCC permission even for audio-only use).
+///
+/// Audio and errors are only accepted from the current stream: stopping or
+/// replacing it makes the old one irrelevant, so a late error from a stream
+/// that was already stopped cannot be mistaken for a failure of its successor.
 final class SystemAudioCapture: NSObject, SystemAudioCapturing, SCStreamOutput, SCStreamDelegate {
-    private var stream: SCStream?
+    private let lock = NSLock()
+    private var stream: SCStream? // guarded by `lock`
     private let audioQueue = DispatchQueue(label: "meetingassistant.audio.capture")
 
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
-    var onError: (@MainActor (String) -> Void)?
+    var onError: (@MainActor (CaptureFailure) -> Void)?
 
     func start() async throws {
         do {
@@ -32,14 +37,39 @@ final class SystemAudioCapture: NSObject, SystemAudioCapturing, SCStreamOutput, 
     }
 
     private func startStream() async throws {
+        await stop()
         let content = try await SCShareableContent.current
-        guard let display = content.displays.first else { throw SystemAudioError.noDisplay }
+        guard let display = Self.preferredDisplay(content.displays, mainDisplayID: CGMainDisplayID(),
+                                                  id: \.displayID) else { throw SystemAudioError.noDisplay }
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let stream = SCStream(filter: filter, configuration: Self.makeConfiguration(), delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
-        try await stream.startCapture()
-        self.stream = stream
+        lock.withLock { self.stream = stream }
+        do {
+            try await stream.startCapture()
+        } catch {
+            lock.withLock { if self.stream === stream { self.stream = nil } }
+            throw error
+        }
+    }
+
+    /// The system audio is the same whichever display is captured; the main one
+    /// is the least likely to be unplugged or put to sleep mid-call.
+    static func preferredDisplay<Display>(_ displays: [Display], mainDisplayID: CGDirectDisplayID,
+                                          id: KeyPath<Display, CGDirectDisplayID>) -> Display? {
+        displays.first { $0[keyPath: id] == mainDisplayID } ?? displays.first
+    }
+
+    /// Stopping on purpose, or the system's permission being withdrawn, will not
+    /// be undone by starting again (which could even re-prompt the user).
+    static func isRetryable(_ error: Error) -> Bool {
+        let error = error as NSError
+        guard error.domain == SCStreamErrorDomain else { return true }
+        switch SCStreamError.Code(rawValue: error.code) {
+        case .userStopped, .userDeclined, .missingEntitlements: return false
+        default: return true
+        }
     }
 
     /// Whole-display audio, mono at 16 kHz, without our own sounds. SCStream
@@ -57,8 +87,15 @@ final class SystemAudioCapture: NSObject, SystemAudioCapturing, SCStreamOutput, 
     }
 
     func stop() async {
+        let stream = lock.withLock { () -> SCStream? in
+            defer { self.stream = nil }
+            return self.stream
+        }
         try? await stream?.stopCapture()
-        stream = nil
+    }
+
+    private func isCurrent(_ stream: SCStream) -> Bool {
+        lock.withLock { self.stream === stream }
     }
 
     // MARK: - SCStreamOutput
@@ -66,6 +103,7 @@ final class SystemAudioCapture: NSObject, SystemAudioCapturing, SCStreamOutput, 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
         guard type == .audio,
+              isCurrent(stream),
               sampleBuffer.isValid,
               CMSampleBufferGetNumSamples(sampleBuffer) > 0,
               let pcm = Self.makePCMBuffer(from: sampleBuffer) else { return }
@@ -75,9 +113,15 @@ final class SystemAudioCapture: NSObject, SystemAudioCapturing, SCStreamOutput, 
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let wasCurrent = lock.withLock { () -> Bool in
+            guard self.stream === stream else { return false }
+            self.stream = nil
+            return true
+        }
+        guard wasCurrent else { return }
         let onError = self.onError
-        let message = error.localizedDescription
-        deliverOnMain { onError?(message) }
+        let failure = CaptureFailure(message: error.localizedDescription, isRetryable: Self.isRetryable(error))
+        deliverOnMain { onError?(failure) }
     }
 
     // MARK: - Conversion helpers

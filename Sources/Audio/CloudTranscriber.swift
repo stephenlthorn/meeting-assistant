@@ -96,7 +96,7 @@ final class CloudTranscriber: LiveTranscriber {
     func stop() {
         queue.async { [self] in
             running = false
-            guard let connection else { return }
+            guard let connection, !draining else { return }
             draining = true
             connection.send(.string(Self.closeMessage)) { _ in }
             let drainingGeneration = generation

@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import Foundation
 import Observation
@@ -24,6 +25,13 @@ enum ListeningState: Equatable {
 /// Starting and stopping system audio is chained, so a Start never overlaps the
 /// previous Stop.
 ///
+/// Capture that dies mid-call is brought back: system audio (a display going to
+/// sleep, a monitor unplugged) is restarted with backoff while its transcriber
+/// keeps running, and again at once when the Mac wakes or the displays change;
+/// if that fails for good the side is marked failed, so the status never claims
+/// to be listening to something that is not there. The microphone retries
+/// itself and reports only when that fails or recovers.
+///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
 /// sample meeting needs no terms, since it records nothing.
@@ -34,6 +42,8 @@ final class AssistantController {
     static let promptCharacters = 4_000
     static let autoAnswerInterval: TimeInterval = 6
     static let defaultDrainWindow: TimeInterval = 2
+    /// Waits before each attempt to restart system audio; when they run out, it gives up.
+    static let systemAudioRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15, 15]
     private static let maxProblems = 3
 
     private(set) var listening: ListeningState = .idle
@@ -50,7 +60,7 @@ final class AssistantController {
     /// Asked to show the privacy terms; call the closure once they are accepted.
     @ObservationIgnored var onTermsNeeded: ((@escaping () -> Void) -> Void)?
 
-    private enum SideState { case off, pending, up, failed }
+    private enum SideState { case off, pending, up, reconnecting, failed }
 
     @ObservationIgnored private let settings: AppSettings
     @ObservationIgnored private let systemAudio: SystemAudioCapturing
@@ -73,6 +83,11 @@ final class AssistantController {
     @ObservationIgnored private var session = 0
     @ObservationIgnored private var drainingSession: Int?
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
+    @ObservationIgnored private var themRecovery = 0
+    @ObservationIgnored private var themAttempts = 0
+    @ObservationIgnored private var themCanRevive = false
+    @ObservationIgnored private var captureProblems: [Speaker: Problem] = [:]
+    @ObservationIgnored private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
 
     @ObservationIgnored private var transcript = Transcript()
     @ObservationIgnored private var clearedThrough: [Speaker: Int] = [:]
@@ -89,7 +104,9 @@ final class AssistantController {
          now: @escaping () -> Date = Date.init,
          schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
          sampleWordDelay: TimeInterval = 0.04,
-         drainWindow: TimeInterval = AssistantController.defaultDrainWindow) {
+         drainWindow: TimeInterval = AssistantController.defaultDrainWindow,
+         workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
+         notifications: NotificationCenter = .default) {
         self.settings = settings
         self.systemAudio = systemAudio
         self.microphone = microphone
@@ -101,12 +118,11 @@ final class AssistantController {
         self.drainWindow = drainWindow
         systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
         microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
-        systemAudio.onError = { [weak self] message in
-            self?.report(Problem(message: "Meeting audio stopped: \(message)"))
-        }
-        microphone.onError = { [weak self] message in
-            self?.report(Problem(message: "Microphone stopped: \(message)"))
-        }
+        observeEnvironment(workspace: workspaceNotifications, screens: notifications)
+    }
+
+    deinit {
+        observers.forEach { $0.center.removeObserver($0.token) }
     }
 
     static func live(settings: AppSettings) -> AssistantController {
@@ -135,8 +151,12 @@ final class AssistantController {
         listening = .starting
         status = "Starting…"
         problems = []
+        captureProblems = [:]
+        themCanRevive = false
+        themRecovery += 1
         clearNotices()
         resetTranscriptAndAnswer()
+        watchCapture(session: current)
 
         let them = makeTranscriber(.them)
         let you = makeTranscriber(.you)
@@ -245,14 +265,14 @@ final class AssistantController {
 
     private func resolveStartup() {
         switch (themSide, youSide) {
-        case (.up, _), (_, .up):
-            listening = .listening
-            status = listeningStatus()
         case (.failed, .failed):
             session += 1
             tearDown()
             listening = .idle
             status = "Not listening"
+        case (.up, _), (_, .up), (.reconnecting, _), (_, .reconnecting):
+            listening = .listening
+            status = listeningStatus()
         default:
             break
         }
@@ -262,28 +282,200 @@ final class AssistantController {
         let scope: String? = switch (themSide, youSide) {
         case (.up, .failed): "their side only"
         case (.failed, .up): "your side only"
+        case (.reconnecting, .up): "reconnecting their side"
         default: nil
         }
-        return "Listening (" + ([backendName] + [scope].compactMap { $0 }).joined(separator: ", ") + ")"
+        let heading = themSide == .up || youSide == .up ? "Listening" : "Reconnecting"
+        return heading + " (" + ([backendName] + [scope].compactMap { $0 }).joined(separator: ", ") + ")"
     }
 
     private func tearDown() {
         themSlot.set(nil)
         youSlot.set(nil)
-        if youSide == .up { microphone.stop() }
-        if themSide == .pending || themSide == .up {
-            let previous = lifecycle
-            lifecycle = Task { [systemAudio] in
-                await previous?.value
-                await systemAudio.stop()
-            }
+        if youSide == .up || youSide == .failed { microphone.stop() }
+        if themSide == .pending || themSide == .up || themSide == .reconnecting {
+            stopSystemAudio()
         }
-        themTranscriber?.stop()
-        youTranscriber?.stop()
+        if themSide != .failed { themTranscriber?.stop() }
+        if youSide != .failed { youTranscriber?.stop() }
         themTranscriber = nil
         youTranscriber = nil
         themSide = .off
         youSide = .off
+    }
+
+    private func stopSystemAudio() {
+        let previous = lifecycle
+        lifecycle = Task { [systemAudio] in
+            await previous?.value
+            await systemAudio.stop()
+        }
+    }
+
+    // MARK: - Capture that stops mid-call
+
+    /// Each session listens for its own capture callbacks, so an error that was
+    /// already on its way when the session ended cannot land in the next one.
+    private func watchCapture(session current: Int) {
+        systemAudio.onError = { [weak self] failure in
+            self?.systemAudioStopped(failure, session: current)
+        }
+        microphone.onError = { [weak self] message in
+            self?.microphoneFailed(message, session: current)
+        }
+        microphone.onRecovered = { [weak self] in
+            self?.microphoneRecovered(session: current)
+        }
+    }
+
+    private func systemAudioStopped(_ failure: CaptureFailure, session current: Int) {
+        guard session == current, themSide == .up else { return }
+        guard failure.isRetryable else {
+            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped: \(failure.message)"), canRevive: false)
+            return
+        }
+        themSide = .reconnecting
+        themAttempts = 0
+        status = listeningStatus()
+        scheduleSystemAudioRestart(session: current)
+    }
+
+    private func scheduleSystemAudioRestart(session current: Int) {
+        themRecovery += 1
+        let recovery = themRecovery
+        let delays = Self.systemAudioRetryDelays
+        schedule(delays[min(themAttempts, delays.count - 1)]) { [weak self] in
+            deliverOnMain { self?.restartSystemAudio(session: current, recovery: recovery) }
+        }
+    }
+
+    private func isRecovering(session current: Int, recovery: Int) -> Bool {
+        session == current && themSide == .reconnecting && themRecovery == recovery
+    }
+
+    /// Stops the dead stream and starts a new one through the same chain as
+    /// Start and Stop, so the two never overlap. The transcriber is untouched:
+    /// it keeps its state and utterance numbering across the gap.
+    private func restartSystemAudio(session current: Int, recovery: Int) {
+        guard isRecovering(session: current, recovery: recovery) else { return }
+        let previous = lifecycle
+        lifecycle = Task { [weak self, systemAudio] in
+            await previous?.value
+            guard let self, self.isRecovering(session: current, recovery: recovery) else { return }
+            await systemAudio.stop()
+            do {
+                try await systemAudio.start()
+                guard self.session == current, self.themSide == .reconnecting else {
+                    await systemAudio.stop()
+                    return
+                }
+                self.themSide = .up
+                self.themAttempts = 0
+                self.clearCaptureProblem(for: .them)
+                self.status = self.listeningStatus()
+            } catch {
+                guard self.isRecovering(session: current, recovery: recovery) else { return }
+                self.systemAudioRestartFailed(error, session: current)
+            }
+        }
+    }
+
+    private func systemAudioRestartFailed(_ error: Error, session current: Int) {
+        if (error as? SystemAudioError) == .permissionDenied {
+            giveUpOnSystemAudio(Self.problem(forSystemAudioError: error), canRevive: false)
+            return
+        }
+        themAttempts += 1
+        guard themAttempts < Self.systemAudioRetryDelays.count else {
+            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped and couldn't be restarted: \(error.localizedDescription)"),
+                                canRevive: true)
+            return
+        }
+        scheduleSystemAudioRestart(session: current)
+    }
+
+    /// Their side is marked failed, so the status says so (or the session ends
+    /// if the microphone is down too). `canRevive` lets a wake or display change
+    /// try again, which is pointless after a user stop or a permission problem.
+    private func giveUpOnSystemAudio(_ problem: Problem, canRevive: Bool) {
+        themSide = .failed
+        themCanRevive = canRevive
+        themRecovery += 1
+        themSlot.set(nil)
+        themTranscriber?.stop()
+        reportCaptureProblem(problem, for: .them)
+        stopSystemAudio()
+        resolveStartup()
+    }
+
+    private func microphoneFailed(_ message: String, session current: Int) {
+        guard session == current, youSide == .up else { return }
+        youSide = .failed
+        youSlot.set(nil)
+        youTranscriber?.stop()
+        reportCaptureProblem(Problem(message: "Microphone stopped: \(message)"), for: .you)
+        resolveStartup()
+    }
+
+    private func microphoneRecovered(session current: Int) {
+        guard session == current, youSide == .failed, let you = youTranscriber else { return }
+        youSide = .up
+        clearCaptureProblem(for: .you)
+        you.start()
+        youSlot.set(you)
+        status = listeningStatus()
+    }
+
+    /// The Mac woke up or the displays changed: a good moment to bring system
+    /// audio back, without waiting for the next backoff. A stream that is
+    /// still up is left alone; if it died it reports that itself.
+    func captureEnvironmentChanged() {
+        guard listening == .listening else { return }
+        switch themSide {
+        case .reconnecting:
+            themAttempts = 0
+            themRecovery += 1
+            restartSystemAudio(session: session, recovery: themRecovery)
+        case .failed where themCanRevive:
+            themSide = .reconnecting
+            themCanRevive = false
+            themAttempts = 0
+            clearCaptureProblem(for: .them)
+            themTranscriber?.start()
+            themSlot.set(themTranscriber)
+            status = listeningStatus()
+            themRecovery += 1
+            restartSystemAudio(session: session, recovery: themRecovery)
+        default:
+            break
+        }
+    }
+
+    private func observeEnvironment(workspace: NotificationCenter, screens: NotificationCenter) {
+        let changed: @Sendable (Notification) -> Void = { [weak self] _ in
+            MainActor.assumeIsolated { self?.captureEnvironmentChanged() }
+        }
+        observers = [
+            (workspace, workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil,
+                                              queue: .main, using: changed)),
+            (workspace, workspace.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil,
+                                              queue: .main, using: changed)),
+            (screens, screens.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil,
+                                          queue: .main, using: changed)),
+        ]
+    }
+
+    /// A capture problem goes away again once that capture works, instead of
+    /// lingering in the list as if it were still true.
+    private func reportCaptureProblem(_ problem: Problem, for speaker: Speaker) {
+        clearCaptureProblem(for: speaker)
+        captureProblems[speaker] = problem
+        report(problem)
+    }
+
+    private func clearCaptureProblem(for speaker: Speaker) {
+        guard let problem = captureProblems.removeValue(forKey: speaker) else { return }
+        problems.removeAll { $0 == problem }
     }
 
     private func wire(_ transcriber: LiveTranscriber, as speaker: Speaker, session current: Int) {

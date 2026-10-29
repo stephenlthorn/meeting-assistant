@@ -249,6 +249,18 @@ final class CloudTranscriberTests: XCTestCase {
         XCTAssertEqual(h.sockets.requests.count, 2)
     }
 
+    func testStoppingTwiceAsksTheServerToFinishOnce() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        h.transcriber.stop()
+        h.transcriber.stop()
+        h.flush()
+
+        XCTAssertEqual(h.sockets.latest?.sentText, [#"{"type":"CloseStream"}"#])
+    }
+
     func testStoppingWhileDisconnectedHasNothingToDrain() {
         let h = makeHarness()
         h.transcriber.start()

@@ -52,7 +52,7 @@ final class FakeTranscriberFactory {
 /// open to reproduce overlapping lifecycles.
 final class FakeSystemAudio: SystemAudioCapturing {
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
-    var onError: (@MainActor (String) -> Void)?
+    var onError: (@MainActor (CaptureFailure) -> Void)?
     @MainActor var startError: Error?
     @MainActor var holdsStart = false
     @MainActor var holdsStop = false
