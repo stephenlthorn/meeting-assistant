@@ -69,9 +69,14 @@ final class LegacySpeechTranscriber: LiveTranscriber {
         self.schedule = schedule
     }
 
-    convenience init(localeIdentifier: String = "en-US") {
+    convenience init(localeIdentifier: String = "en-US", allowServerRecognition: Bool = false) {
         self.init(engine: AppleSpeechEngine(localeIdentifier: localeIdentifier))
+        self.allowsServerRecognition = allowServerRecognition
     }
+
+    /// Whether the user allowed Apple's speech servers when this Mac cannot
+    /// transcribe on-device. Not acted on yet in this branch.
+    private(set) var allowsServerRecognition = false
 
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) {
         engine.requestAuthorization(completion)

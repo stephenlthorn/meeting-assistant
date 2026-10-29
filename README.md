@@ -10,7 +10,9 @@ overlay while the conversation is still happening.
 </p>
 
 - **Your call audio stays on your Mac.** Transcription runs on-device; only the
-  transcript excerpt behind a question goes to Claude, with your own API key.
+  transcript excerpt behind a question goes to Claude, with your own API key. (On
+  macOS 14-15, if your Mac can't transcribe your language on-device, Apple's speech
+  servers are used only after a separate opt-in.)
 - **No bot joins the call.** Nothing appears in the participant list, and it works
   with any app that plays sound.
 - **Help while it's still useful.** Press ⌃⌥Space for suggestions, or let auto-answer
@@ -51,7 +53,9 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 
 - Two-sided transcription: system audio (them) + microphone (you), merged into one
   speaker-labeled transcript in the order people spoke.
-- On-device STT: SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14–15.
+- On-device STT: SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14–15. If a
+  14–15 Mac can't transcribe your language on-device, nothing is transcribed
+  unless you separately allow Apple's speech servers in Settings.
 - Optional **Deepgram** cloud STT for the hardest audio, off until you confirm
   sending it audio. It keeps the stream alive through silences and reconnects if
   the connection drops.
@@ -135,7 +139,9 @@ the right privacy pane.
 ## Privacy
 
 Speech is transcribed on your Mac. Transcript excerpts go to Anthropic only when an
-answer is requested, and audio goes to Deepgram only if you turn it on. There are no
+answer is requested, audio goes to Deepgram only if you turn it on, and (macOS 14-15
+only, when on-device recognition isn't available for your language) audio goes to
+Apple's speech servers only if you separately allow it. There are no
 analytics, accounts or developer servers. The full policy is in [PRIVACY.md](PRIVACY.md).
 
 ## File map
@@ -159,7 +165,7 @@ analytics, accounts or developer servers. The full policy is in [PRIVACY.md](PRI
 | `Sources/Transcript/Transcript.swift` | Merged, speaker-labeled transcript |
 | `Sources/Transcript/QuestionDetector.swift` / `EchoDetector.swift` | Auto-answer trigger / echo suppression |
 | `Sources/LLM/AnthropicClient.swift` | Streaming Claude Messages API client |
-| `Sources/LLM/Profiles.swift` | Per-use-case system prompts |
+| `Sources/LLM/Profiles.swift` / `AnswerPrompt.swift` | Per-use-case system prompts / the fenced transcript sent as the user message |
 | `Sources/UI/OverlayPanel.swift` / `OverlayView.swift` / `OverlayText.swift` | Floating overlay |
 | `Sources/UI/WelcomeView.swift` | Welcome screen: what is captured and where it goes |
 | `Sources/UI/SettingsView.swift` | Preferences window |

@@ -13,8 +13,9 @@ final class AppSettings: ObservableObject {
     }
 
     /// Bump when the privacy terms shown on the welcome screen change, so
-    /// everyone is asked to agree again.
-    static let termsVersion = 1
+    /// everyone is asked to agree again. 2: Apple's speech servers are named,
+    /// and used only after their own opt-in.
+    static let termsVersion = 2
     static let bundleID = "com.stephenthorn.meetingassistant"
     static let legacyBundleID = "com.example.meetingassistant"
 
@@ -52,6 +53,11 @@ final class AppSettings: ObservableObject {
     }
     @Published private(set) var cloudAudioAccepted: Bool {
         didSet { defaults.set(cloudAudioAccepted, forKey: "cloudAudioAccepted") }
+    }
+    /// The user allowed call audio to go to Apple's speech servers when this
+    /// Mac cannot transcribe on-device (macOS 14-15). Off until they say so.
+    @Published private(set) var serverSpeechAccepted: Bool {
+        didSet { defaults.set(serverSpeechAccepted, forKey: "serverSpeechAccepted") }
     }
     @Published private(set) var apiKeySource: KeySource?
     @Published private(set) var deepgramKeySource: KeySource?
@@ -99,6 +105,7 @@ final class AppSettings: ObservableObject {
                                            in: HotKeyCombo.overlayChoices)
         showsOverlay = defaults.object(forKey: "showsOverlay") as? Bool ?? true
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
+        serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
         refreshKeySources()
     }
 
@@ -115,17 +122,28 @@ final class AppSettings: ObservableObject {
         acceptedTermsVersion = Self.termsVersion
     }
 
-    /// Withdrawing the terms also stops any audio going to Deepgram.
+    /// Withdrawing the terms also stops any audio going to Deepgram or Apple.
     func withdrawTerms() {
         acceptedTermsVersion = 0
         cloudAudioAccepted = false
         useCloudSTT = false
+        serverSpeechAccepted = false
     }
 
     /// The user agreed to stream call audio to Deepgram; turns cloud STT on.
     func acceptCloudAudio() {
         cloudAudioAccepted = true
         useCloudSTT = true
+    }
+
+    /// The user agreed to send call audio to Apple's speech servers when
+    /// on-device recognition is unavailable.
+    func acceptServerSpeech() {
+        serverSpeechAccepted = true
+    }
+
+    func revokeServerSpeech() {
+        serverSpeechAccepted = false
     }
 
     // MARK: - Keys

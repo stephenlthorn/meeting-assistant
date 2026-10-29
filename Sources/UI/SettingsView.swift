@@ -1,8 +1,9 @@
 import SwiftUI
 
 /// Preferences window: API key (Keychain), model, behavior, shortcuts, extra
-/// prompt instructions, optional Deepgram cloud STT (only after agreeing to send
-/// it audio), privacy terms, and links to the permissions the app needs.
+/// prompt instructions, optional Deepgram cloud STT and Apple's speech servers
+/// (each only after agreeing to send audio there), privacy terms, and links to
+/// the permissions the app needs.
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var hotKeys: HotKeyBinder
@@ -12,6 +13,7 @@ struct SettingsView: View {
     @State private var deepgramField = ""
     @State private var saveFailed = false
     @State private var confirmingCloudAudio = false
+    @State private var confirmingServerSpeech = false
 
     var body: some View {
         Form {
@@ -75,9 +77,21 @@ struct SettingsView: View {
                     Button("Remove") { settings.removeDeepgramKey() }
                         .disabled(!canRemove(settings.deepgramKeySource))
                 }
-                Text("On-device is the default (private). Cloud STT sends call audio to Deepgram and applies the next time you Start Listening.")
+                Text("On-device is the default (private). Turning cloud STT on sends call audio to Deepgram from the next time you Start Listening. Turning it off, or removing the key, stops that right away.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if !TranscriberFactory.analyzerAvailable {
+                    Toggle("Allow Apple's speech servers if on-device isn't available", isOn: serverSpeechBinding)
+                        .alert("Send call audio to Apple?", isPresented: $confirmingServerSpeech) {
+                            Button("Allow Apple's Servers") { settings.acceptServerSpeech() }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("If your Mac can't transcribe your language on-device, audio from both sides of your calls will stream to Apple's speech servers instead of staying on your Mac. Apple's privacy terms apply. You can turn this off any time, even mid-call.")
+                        }
+                    Text("Off by default. Without it, nothing is transcribed when on-device speech is unavailable. Downloading the language in System Settings, Keyboard, Dictation avoids needing it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Extra instructions") {
@@ -143,6 +157,19 @@ struct SettingsView: View {
                     confirmingCloudAudio = true
                 } else {
                     settings.useCloudSTT = turnOn
+                }
+            })
+    }
+
+    /// Turning Apple's servers on always asks; turning them off applies at once.
+    private var serverSpeechBinding: Binding<Bool> {
+        Binding(
+            get: { settings.serverSpeechAccepted },
+            set: { turnOn in
+                if turnOn {
+                    confirmingServerSpeech = true
+                } else {
+                    settings.revokeServerSpeech()
                 }
             })
     }

@@ -1,6 +1,6 @@
 # Privacy Policy
 
-Last updated: September 27, 2026
+Last updated: October 29, 2026
 
 Meeting Assistant is an open-source Mac app that transcribes your calls and asks Claude for help. The short version: the developer never receives any of your data.
 
@@ -13,15 +13,16 @@ Capture only happens while you are listening; the menu bar icon shows a record s
 
 ## Where your data goes
 
-- **Your Mac.** Speech is transcribed with Apple's on-device speech recognition. On macOS 14 and 15, if on-device recognition is not available for your language, Apple's speech service is used instead and the app tells you so.
+- **Your Mac.** Speech is transcribed with Apple's on-device speech recognition. On macOS 26 and later this always stays on your Mac.
+- **Apple's speech servers, only if you allow it (macOS 14 and 15).** If your Mac cannot transcribe your language on-device, Meeting Assistant does not transcribe, and says so, until you separately turn on "Allow Apple's speech servers" in Settings. It is off by default and asks you to confirm. Once on, audio from both sides of your calls streams to Apple for transcription and [Apple's privacy terms](https://www.apple.com/legal/privacy/) apply. Turning it off takes effect immediately, even in the middle of a call, and so does withdrawing your agreement.
 - **Anthropic (Claude).** When you ask for help, or auto-answer is on, the most recent transcript text (up to about 4,000 characters) and your profile and extra instructions are sent to Anthropic's API using your own API key. [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy) applies.
-- **Deepgram, only if you turn it on.** After you confirm, audio from both sides of your calls streams to Deepgram for transcription using your own Deepgram key. [Deepgram's privacy policy](https://deepgram.com/privacy) applies.
+- **Deepgram, only if you turn it on.** After you confirm, audio from both sides of your calls streams to Deepgram for transcription using your own Deepgram key. [Deepgram's privacy policy](https://deepgram.com/privacy) applies. Turning Deepgram off, removing its key or withdrawing your agreement stops the audio immediately, even in the middle of a call.
 - **No one else.** There are no analytics, no tracking, no accounts and no developer server.
 
 ## What is stored on your Mac
 
 - Your API keys, in the macOS Keychain.
-- Preferences such as model, profile, extra instructions, shortcuts and the overlay's position.
+- Preferences such as model, profile, extra instructions, shortcuts and the overlay's position, and whether you agreed to the privacy terms, to Deepgram and to Apple's speech servers.
 - Transcripts and answers stay in memory while the app runs and are gone when you quit, unless you copy them.
 
 ## The people you talk to

@@ -19,8 +19,8 @@ targets:
         CFBundleDisplayName: Meeting Assistant
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        NSSpeechRecognitionUsageDescription: "Transcribes meeting audio on this device to provide live assistance."
-        NSMicrophoneUsageDescription: "Captures your microphone so your side of the call is transcribed on-device."
+        NSSpeechRecognitionUsageDescription: "Transcribes call audio into text, on this Mac. If your Mac cannot do that for your language, audio goes to Apple's speech servers only after you allow it in Settings."
+        NSMicrophoneUsageDescription: "Captures your microphone so your side of the call can be transcribed. It is transcribed on this Mac unless you turn on Deepgram or Apple's speech servers in Settings."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stephenthorn.meetingassistant

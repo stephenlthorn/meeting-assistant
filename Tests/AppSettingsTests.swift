@@ -363,6 +363,47 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertFalse(settings.useCloudSTT)
     }
 
+    func testSendingAudioToAppleServersIsOffUntilTheUserAllowsIt() {
+        XCTAssertFalse(makeSettings().serverSpeechAccepted)
+    }
+
+    func testAllowingAppleServersPersistsAndCanBeRevoked() {
+        let defaults = freshDefaults()
+        let first = makeSettings(defaults: defaults)
+
+        first.acceptServerSpeech()
+        XCTAssertTrue(makeSettings(defaults: defaults).serverSpeechAccepted)
+
+        first.revokeServerSpeech()
+        XCTAssertFalse(makeSettings(defaults: defaults).serverSpeechAccepted)
+    }
+
+    func testAllowingAppleServersDoesNotTurnOnDeepgram() {
+        let settings = makeSettings()
+
+        settings.acceptServerSpeech()
+
+        XCTAssertFalse(settings.useCloudSTT)
+        XCTAssertFalse(settings.cloudAudioAccepted)
+    }
+
+    func testWithdrawingTheTermsAlsoRevokesAppleServers() {
+        let settings = makeSettings()
+        settings.acceptTerms()
+        settings.acceptServerSpeech()
+
+        settings.withdrawTerms()
+
+        XCTAssertFalse(settings.serverSpeechAccepted)
+    }
+
+    func testTermsAcceptedBeforeTheAppleServersWordingMustBeAcceptedAgain() {
+        let defaults = freshDefaults()
+        defaults.set(1, forKey: "acceptedTermsVersion")
+
+        XCTAssertFalse(makeSettings(defaults: defaults).hasAcceptedTerms)
+    }
+
     // MARK: - Migration from the com.example bundle id
 
     func testSettingsAndKeysMoveOverFromTheOldBundleID() {
@@ -396,6 +437,17 @@ final class AppSettingsTests: XCTestCase {
 
         XCTAssertFalse(settings.useCloudSTT)
         XCTAssertFalse(settings.cloudAudioAccepted)
+    }
+
+    func testMigrationNeverCopiesTheAppleServersConsent() {
+        let legacyDefaults = freshDefaults()
+        legacyDefaults.set(true, forKey: "serverSpeechAccepted")
+        let defaults = freshDefaults()
+
+        AppSettings.migrateLegacySettings(from: legacyDefaults, legacySecrets: InMemorySecretStore(),
+                                          to: defaults, secrets: InMemorySecretStore())
+
+        XCTAssertFalse(makeSettings(defaults: defaults).serverSpeechAccepted)
     }
 
     func testADeepgramSwitchLeftOnWithoutAgreementIsShownOff() {
