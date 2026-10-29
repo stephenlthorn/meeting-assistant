@@ -57,6 +57,7 @@ final class AnalyzerTranscriber: LiveTranscriber {
     private var draining = false
     private var run = 0
     private var pipeline: AnalyzerPipeline?
+    private var task: Task<Void, Never>?
     private var failures = 0
     private var utterance = 0
     private var reportedFallingBehind = false
@@ -97,12 +98,13 @@ final class AnalyzerTranscriber: LiveTranscriber {
     }
 
     func stop() {
-        let pipeline = lock.withLock { () -> AnalyzerPipeline? in
+        let (pipeline, settingUp) = lock.withLock { () -> (AnalyzerPipeline?, Task<Void, Never>?) in
             running = false
             defer { self.pipeline = nil }
             draining = self.pipeline != nil
-            return self.pipeline
+            return (self.pipeline, self.pipeline == nil ? task : nil)
         }
+        settingUp?.cancel()
         guard let pipeline else { return }
         Task { await pipeline.finish() }
         schedule(drainTimeout) { Task { await pipeline.cancel() } }
@@ -121,8 +123,14 @@ final class AnalyzerTranscriber: LiveTranscriber {
     /// Results still count while a stopped pipeline finishes what it heard.
     private func canDeliver(_ run: Int) -> Bool { lock.withLock { (running || draining) && self.run == run } }
 
+    /// Setup can take minutes (a model download), so the task is kept: stopping
+    /// before there is a pipeline cancels it instead of finishing the download.
     private func launch(run: Int) {
-        Task { [weak self] in await self?.attempt(run: run) }
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.attempt(run: run)
+        }
+        lock.withLock { if self.run == run { self.task = task } }
     }
 
     /// Builds one pipeline and delivers its results until it ends.

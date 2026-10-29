@@ -128,6 +128,31 @@ final class AnalyzerTranscriberTests: XCTestCase {
         XCTAssertEqual(h.segments, [TranscriptSegment(utterance: 0, text: "new words", isFinal: false)])
     }
 
+    func testStoppingDuringSetupCancelsTheSetupInsteadOfFinishingTheDownload() async {
+        let h = makeHarness()
+        h.gate.holds = true
+        h.transcriber.start()
+        await eventually { h.gate.waiting }
+
+        h.transcriber.stop()
+        h.gate.release()
+
+        await eventually { h.gate.sawCancellation }
+    }
+
+    func testStoppingWhileADrainIsUnderwayDoesNotCancelTheResults() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        await eventually { h.gate.handedOut }
+        await settle()
+
+        h.transcriber.stop()
+        await eventually { h.gate.pipeline.finished }
+        h.gate.pipeline.emit("last words", isFinal: true)
+
+        await eventually { h.segments.count == 1 }
+    }
+
     func testSetupProgressShowsAsANotice() async {
         let h = makeHarness()
         h.gate.progress = ["Downloading the on-device speech model…", nil]
@@ -419,8 +444,11 @@ final class PipelineGate: @unchecked Sendable {
     private var held: CheckedContinuation<Void, Never>?
     private var isWaiting = false
     private var didHandOut = false
+    private var cancelledDuringSetup = false
 
     var waiting: Bool { lock.withLock { isWaiting } }
+    /// Whether the build task was cancelled while it waited.
+    var sawCancellation: Bool { lock.withLock { cancelledDuringSetup } }
     var handedOut: Bool { lock.withLock { didHandOut } }
     /// How many times a pipeline was asked for.
     var makes: Int { lock.withLock { made } }
@@ -441,6 +469,7 @@ final class PipelineGate: @unchecked Sendable {
                 }
             }
         }
+        if Task.isCancelled { lock.withLock { cancelledDuringSetup = true } }
         if let error { throw error }
         return lock.withLock {
             let pipeline = built[handedOutCount]
