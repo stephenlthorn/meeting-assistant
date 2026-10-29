@@ -1,8 +1,9 @@
 import SwiftUI
 
 /// Preferences window: API key (Keychain), model, behavior, shortcuts, extra
-/// prompt instructions, optional Deepgram cloud STT (only after agreeing to send
-/// it audio), privacy terms, and links to the permissions the app needs.
+/// prompt instructions, optional Deepgram cloud STT and Apple's speech servers
+/// (each only after agreeing to send audio there), privacy terms, and links to
+/// the permissions the app needs.
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var hotKeys: HotKeyBinder
@@ -12,6 +13,7 @@ struct SettingsView: View {
     @State private var deepgramField = ""
     @State private var saveFailed = false
     @State private var confirmingCloudAudio = false
+    @State private var confirmingServerSpeech = false
 
     var body: some View {
         Form {
@@ -24,7 +26,12 @@ struct SettingsView: View {
                               file: "~/.config/meeting-assistant/anthropic_key")
                     Spacer()
                     Button("Remove") { settings.removeAPIKey() }
-                        .disabled(settings.apiKeySource != .keychain)
+                        .disabled(!canRemove(settings.apiKeySource))
+                }
+                if settings.apiKeySource == .unreadable {
+                    Text("macOS wouldn't let Meeting Assistant read the saved key. Allow access when it asks, or save the key again.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
                 if saveFailed {
                     Text("Couldn't save the key to the Keychain.")
@@ -68,11 +75,23 @@ struct SettingsView: View {
                     keyStatus(settings.deepgramKeySource, environmentName: "DEEPGRAM_API_KEY", file: nil)
                     Spacer()
                     Button("Remove") { settings.removeDeepgramKey() }
-                        .disabled(settings.deepgramKeySource != .keychain)
+                        .disabled(!canRemove(settings.deepgramKeySource))
                 }
-                Text("On-device is the default (private). Cloud STT sends call audio to Deepgram and applies the next time you Start Listening.")
+                Text("On-device is the default (private). Turning cloud STT on sends call audio to Deepgram from the next time you Start Listening. Turning it off, or removing the key, stops that right away.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if !TranscriberFactory.analyzerAvailable {
+                    Toggle("Allow Apple's speech servers if on-device isn't available", isOn: serverSpeechBinding)
+                        .alert("Send call audio to Apple?", isPresented: $confirmingServerSpeech) {
+                            Button("Allow Apple's Servers") { settings.acceptServerSpeech() }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("If your Mac can't transcribe your language on-device, audio from both sides of your calls will stream to Apple's speech servers instead of staying on your Mac. Apple's privacy terms apply. You can turn this off any time, even mid-call.")
+                        }
+                    Text("Off by default. Without it, nothing is transcribed when on-device speech is unavailable. Downloading the language in System Settings, Keyboard, Dictation avoids needing it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Extra instructions") {
@@ -142,6 +161,19 @@ struct SettingsView: View {
             })
     }
 
+    /// Turning Apple's servers on always asks; turning them off applies at once.
+    private var serverSpeechBinding: Binding<Bool> {
+        Binding(
+            get: { settings.serverSpeechAccepted },
+            set: { turnOn in
+                if turnOn {
+                    confirmingServerSpeech = true
+                } else {
+                    settings.revokeServerSpeech()
+                }
+            })
+    }
+
     private func save(_ write: () -> Bool, clear: () -> Void) {
         saveFailed = !write()
         if !saveFailed { clear() }
@@ -153,10 +185,17 @@ struct SettingsView: View {
         case .keychain: text = "Saved in Keychain"
         case .environment: text = "Using \(environmentName)"
         case .file: text = "Using \(file ?? "key file")"
+        case .unreadable: text = "Allow Keychain access"
         case nil: text = "No key set"
         }
-        return Label(text, systemImage: source == nil ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
-            .foregroundStyle(source == nil ? .orange : .green)
+        let usable = source != nil && source != .unreadable
+        return Label(text, systemImage: usable ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+            .foregroundStyle(usable ? .green : .orange)
+    }
+
+    /// Only a Keychain item can be removed here, readable or not.
+    private func canRemove(_ source: AppSettings.KeySource?) -> Bool {
+        source == .keychain || source == .unreadable
     }
 
     private func modelLabel(_ id: String) -> String {

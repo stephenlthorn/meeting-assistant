@@ -55,7 +55,17 @@ final class AnthropicClientTests: XCTestCase {
 
     func testErrorEventsAreParsed() {
         let line = #"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
-        XCTAssertEqual(AnthropicStreamEvent.parse(line: line), .failure(message: "Overloaded"))
+        XCTAssertEqual(AnthropicStreamEvent.parse(line: line), .failure(message: "Overloaded", isOverloaded: true))
+    }
+
+    func testOtherErrorEventsAreNotOverloads() {
+        let line = #"data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#
+        XCTAssertEqual(AnthropicStreamEvent.parse(line: line),
+                       .failure(message: "Internal server error", isOverloaded: false))
+    }
+
+    func testTheEndOfTheMessageIsParsed() {
+        XCTAssertEqual(AnthropicStreamEvent.parse(line: #"data: {"type":"message_stop"}"#), .finished)
     }
 
     // MARK: - Error messages
@@ -161,16 +171,180 @@ final class AnthropicClientTests: XCTestCase {
         }
     }
 
+    // MARK: - Truncated streams
+
+    func testAStreamThatClosesWithoutAStopIsReportedAsCutOff() async {
+        stub(status: 200, sse: [
+            #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"- first"}}"#,
+        ])
+        var received = ""
+
+        do {
+            for try await chunk in client().stream(request(model: "claude-haiku-4-5")) { received += chunk }
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(received, "- first")
+            XCTAssertEqual(error.localizedDescription,
+                           "The answer was cut off: the connection closed before Claude finished. Ask again.")
+        }
+    }
+
+    func testAnEmptyStreamIsReportedAsCutOffToo() async {
+        stub(status: 200, sse: [])
+
+        do {
+            _ = try await collect(client().stream(request(model: "claude-haiku-4-5")))
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error as? AnthropicError, AnthropicError.cutOff)
+        }
+    }
+
+    func testTheEndOfTheMessageCountsAsComplete() async throws {
+        stub(status: 200, sse: [
+            #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done"}}"#,
+            #"{"type":"message_stop"}"#,
+        ])
+
+        let text = try await collect(client().stream(request(model: "claude-haiku-4-5")))
+
+        XCTAssertEqual(text, "Done")
+    }
+
+    // MARK: - Retries
+
+    func testAnOverloadedResponseIsRetriedAndTheAnswerArrives() async throws {
+        let script = ResponseScript([.status(529), .answer("Hello")])
+        let sleeps = SleepLog()
+
+        let text = try await collect(client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")))
+
+        XCTAssertEqual(text, "Hello")
+        XCTAssertEqual(script.requestCount, 2)
+        XCTAssertEqual(sleeps.delays.count, 1)
+    }
+
+    func testARateLimitIsRetriedAfterTheTimeTheServerAsksFor() async throws {
+        let script = ResponseScript([.status(429, headers: ["retry-after": "3"]), .answer("Hello")])
+        let sleeps = SleepLog()
+
+        let text = try await collect(client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")))
+
+        XCTAssertEqual(text, "Hello")
+        XCTAssertEqual(script.requestCount, 2)
+        XCTAssertEqual(sleeps.delays, [3])
+    }
+
+    func testAWaitLongerThanALiveCallCanSpareIsNotWaitedOut() async {
+        let script = ResponseScript([.status(429, headers: ["retry-after": "60"]), .answer("Hello")])
+        let sleeps = SleepLog()
+
+        do {
+            _ = try await collect(client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")))
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Rate limited by Anthropic (429). Wait a moment and try again.")
+        }
+        XCTAssertEqual(script.requestCount, 1)
+        XCTAssertEqual(sleeps.delays, [])
+    }
+
+    func testItGivesUpAfterTwoRetriesWithGrowingBackoff() async {
+        let script = ResponseScript([.status(529), .status(529), .status(529), .answer("never")])
+        let sleeps = SleepLog(jitter: 0)
+
+        do {
+            _ = try await collect(client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")))
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Claude is overloaded right now (529). Try again in a moment.")
+        }
+        XCTAssertEqual(script.requestCount, 3)
+        XCTAssertEqual(sleeps.delays, [0.5, 1])
+    }
+
+    func testBackoffIsJittered() async {
+        let script = ResponseScript([.status(529), .status(529), .status(529)])
+        let sleeps = SleepLog(jitter: 1)
+
+        _ = try? await collect(client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")))
+
+        XCTAssertEqual(script.requestCount, 3)
+        XCTAssertEqual(sleeps.delays, [1, 2])
+    }
+
+    func testErrorsThatRetryingCannotFixAreNotRetried() async {
+        let script = ResponseScript([.status(401), .answer("never")])
+        let sleeps = SleepLog()
+
+        do {
+            _ = try await collect(client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")))
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Anthropic rejected the API key (401). Check it in Settings.")
+        }
+        XCTAssertEqual(script.requestCount, 1)
+    }
+
+    func testAnOverloadedEventBeforeAnyTextIsRetried() async throws {
+        let script = ResponseScript([
+            .events([#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#]),
+            .answer("Hello"),
+        ])
+        let sleeps = SleepLog()
+
+        let text = try await collect(client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")))
+
+        XCTAssertEqual(text, "Hello")
+        XCTAssertEqual(script.requestCount, 2)
+    }
+
+    func testOnceTextHasBeenShownAnOverloadIsNotRetried() async {
+        let script = ResponseScript([
+            .events([
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+                #"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            ]),
+            .answer("Hello"),
+        ])
+        let sleeps = SleepLog()
+        var received = ""
+
+        do {
+            for try await chunk in client(retry: sleeps.policy).stream(request(model: "claude-haiku-4-5")) {
+                received += chunk
+            }
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Claude stopped mid-answer: Overloaded")
+        }
+        XCTAssertEqual(received, "Hi")
+        XCTAssertEqual(script.requestCount, 1)
+    }
+
+    func testCancellingDuringTheWaitEndsTheStream() async {
+        let script = ResponseScript([.status(529), .answer("Hello")])
+        let policy = RetryPolicy(sleep: { _ in throw CancellationError() })
+
+        do {
+            _ = try await collect(client(retry: policy).stream(request(model: "claude-haiku-4-5")))
+            XCTFail("expected an error")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(script.requestCount, 1)
+    }
+
     // MARK: - Helpers
 
     private func request(model: String) -> AnswerRequest {
         AnswerRequest(apiKey: "sk-test", model: model, system: "Be brief.", user: "Transcript here")
     }
 
-    private func client() -> AnthropicClient {
+    private func client(retry: RetryPolicy = RetryPolicy(sleep: { _ in })) -> AnthropicClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
-        return AnthropicClient(session: URLSession(configuration: configuration))
+        return AnthropicClient(session: URLSession(configuration: configuration), retry: retry)
     }
 
     private func stub(status: Int, sse events: [String]) {
@@ -186,6 +360,68 @@ final class AnthropicClientTests: XCTestCase {
         var text = ""
         for try await chunk in stream { text += chunk }
         return text
+    }
+}
+
+/// Records the waits a retry would have slept, without sleeping.
+private final class SleepLog {
+    private let lock = NSLock()
+    private var recorded: [TimeInterval] = []
+    private let jitter: Double
+
+    init(jitter: Double = 0.5) {
+        self.jitter = jitter
+    }
+
+    var delays: [TimeInterval] { lock.withLock { recorded } }
+
+    var policy: RetryPolicy {
+        RetryPolicy(jitter: { [jitter] in jitter },
+                    sleep: { [self] seconds in lock.withLock { recorded.append(seconds) } })
+    }
+}
+
+/// Plays one canned response per request, in order, and counts the requests.
+private final class ResponseScript {
+    enum Step {
+        case status(Int, headers: [String: String] = [:])
+        case events([String])
+
+        static func answer(_ text: String) -> Step {
+            .events([
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\#(text)"}}"#,
+                #"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+                #"{"type":"message_stop"}"#,
+            ])
+        }
+    }
+
+    private let lock = NSLock()
+    private var steps: [Step]
+    private var requests = 0
+
+    var requestCount: Int { lock.withLock { requests } }
+
+    init(_ steps: [Step]) {
+        self.steps = steps
+        StubURLProtocol.respond = { [self] request in next(for: request) }
+    }
+
+    private func next(for request: URLRequest) -> (HTTPURLResponse, Data) {
+        let step: Step = lock.withLock {
+            requests += 1
+            return steps.isEmpty ? .status(500) : steps.removeFirst()
+        }
+        switch step {
+        case .status(let code, let headers):
+            return (HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: nil, headerFields: headers)!,
+                    Data(#"{"type":"error","error":{"type":"x","message":"boom"}}"#.utf8))
+        case .events(let events):
+            let body = events.map { "event: x\ndata: \($0)\n\n" }.joined()
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil,
+                                    headerFields: ["content-type": "text/event-stream"])!,
+                    Data(body.utf8))
+        }
     }
 }
 

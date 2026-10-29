@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Foundation
 import Observation
 
@@ -127,6 +128,7 @@ final class AssistantController {
         problems = []
         notice = nil
         resetTranscriptAndAnswer()
+        beginPrivacySession()
 
         let them = makeTranscriber(.them)
         let you = makeTranscriber(.you)
@@ -339,7 +341,9 @@ final class AssistantController {
         } else if inSample {
             stream = nextSampleAnswer()
         } else {
-            answer = "No API key. Add one in Settings (menu bar icon, then Settings…)."
+            answer = settings.apiKeySource == .unreadable
+                ? "Can't read your API key from the Keychain. Allow access when macOS asks, or save the key again in Settings."
+                : "No API key. Add one in Settings (menu bar icon, then Settings…)."
             isAnswering = false
             return
         }
@@ -420,12 +424,110 @@ final class AssistantController {
     }
 
     private static func userPrompt(_ context: String) -> String {
-        """
-        Live conversation transcript so far (You = me, Them = the other participants):
+        AnswerPrompt.user(transcript: context)
+    }
 
-        \(context)
+    // MARK: - Privacy
 
-        Based on the latest exchange, give me help right now. Be concise.
-        """
+    private static let settingsRecheckInterval: TimeInterval = 0.25
+    /// Each restart numbers its utterances from here, so a new backend's
+    /// utterance 0 never lands on an earlier backend's open turn.
+    private static let restartUtteranceStride = 1_000_000
+
+    private struct Replacement {
+        let speaker: Speaker
+        let transcriber: LiveTranscriber
+        let started: Bool
+    }
+
+    /// What the running session's transcribers were built from.
+    @ObservationIgnored private var activePlan = SpeechPlan.analyzer
+    @ObservationIgnored private var restartGeneration = 0
+    @ObservationIgnored private var settingsObserver: AnyCancellable?
+
+    /// Runs at the start of every listening session, before any transcriber or
+    /// audio exists: reads the keys now, so a Keychain prompt never lands
+    /// mid-call, and remembers which backend this session is about to use.
+    private func beginPrivacySession() {
+        settings.loadKeysForListening()
+        activePlan = TranscriberFactory.plan(for: settings)
+        observeSettings()
+    }
+
+    private func observeSettings() {
+        guard settingsObserver == nil else { return }
+        settingsObserver = settings.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.speechSettingsMayHaveChanged() }
+    }
+
+    /// Turning Deepgram off, removing its key, or revoking Apple's servers
+    /// takes effect now, not at the next Start. Turning Deepgram on is left
+    /// for the next Start, as Settings says.
+    private func speechSettingsMayHaveChanged() {
+        guard listening == .starting || listening == .listening else { return }
+        let plan = TranscriberFactory.plan(for: settings)
+        guard plan != activePlan, plan != .deepgram else { return }
+        guard listening == .listening else {
+            schedule(Self.settingsRecheckInterval) { [weak self] in
+                deliverOnMain { self?.speechSettingsMayHaveChanged() }
+            }
+            return
+        }
+        restartTranscribers(to: plan)
+    }
+
+    /// Replaces the transcriber on every side that is capturing with one built
+    /// from the current settings. Audio is cut off from the old one first, so
+    /// nothing more reaches a backend the user switched off.
+    private func restartTranscribers(to plan: SpeechPlan) {
+        let current = session
+        activePlan = plan
+        restartGeneration += 1
+        let offset = restartGeneration * Self.restartUtteranceStride
+        var replaced: [Replacement] = []
+        for speaker in [Speaker.them, .you] {
+            let started: Bool
+            switch speaker == .them ? themSide : youSide {
+            case .up: started = true
+            case .pending: started = speaker == .them
+            case .off, .failed: continue
+            }
+            guard let old = speaker == .them ? themTranscriber : youTranscriber else { continue }
+            (speaker == .them ? themSlot : youSlot).set(nil)
+            if started { old.stop() }
+            let fresh = makeTranscriber(speaker)
+            wire(fresh, as: speaker, session: current)
+            let forward = fresh.onSegment
+            fresh.onSegment = { segment in
+                forward?(TranscriptSegment(utterance: segment.utterance + offset, text: segment.text,
+                                           isFinal: segment.isFinal))
+            }
+            if speaker == .them { themTranscriber = fresh } else { youTranscriber = fresh }
+            replaced.append(Replacement(speaker: speaker, transcriber: fresh, started: started))
+        }
+        guard let first = replaced.first else { return }
+        backendName = first.transcriber.backendName
+        if listening == .listening { status = listeningStatus() }
+        first.transcriber.requestAuthorization { [weak self] granted in
+            deliverOnMain { self?.replacementsAuthorized(granted, replaced: replaced, session: current) }
+        }
+    }
+
+    private func replacementsAuthorized(_ granted: Bool, replaced: [Replacement], session current: Int) {
+        guard session == current else { return }
+        guard granted else {
+            report(Problem(message: "Speech Recognition permission is off, so listening stopped. Allow Meeting Assistant in System Settings.",
+                           fix: .speechRecognition))
+            stop()
+            return
+        }
+        for item in replaced where item.started {
+            let side = item.speaker == .them ? themSide : youSide
+            let still = item.speaker == .them ? themTranscriber : youTranscriber
+            guard side == .up || side == .pending, still === item.transcriber else { continue }
+            item.transcriber.start()
+            (item.speaker == .them ? themSlot : youSlot).set(item.transcriber)
+        }
     }
 }

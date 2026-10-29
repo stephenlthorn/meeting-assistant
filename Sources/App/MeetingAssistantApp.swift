@@ -163,7 +163,9 @@ struct MenuContent: View {
         if let problem = hotKeys.problem {
             Text(problem)
         }
-        if !settings.apiKeyPresent {
+        if settings.apiKeySource == .unreadable {
+            Text("Allow Keychain access to your API key in Settings")
+        } else if !settings.apiKeyPresent {
             Text("Add your API key in Settings")
         }
         Button("Welcome & Privacy…") { showWelcome() }

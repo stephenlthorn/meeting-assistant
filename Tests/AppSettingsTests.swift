@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import XCTest
 
 @MainActor
@@ -18,7 +19,7 @@ final class AppSettingsTests: XCTestCase {
         first.profile = .sales
         first.extraInstructions = "Mention SOC 2."
         first.autoAnswer = true
-        first.useCloudSTT = true
+        first.acceptCloudAudio()
 
         let second = makeSettings(defaults: defaults)
 
@@ -121,6 +122,126 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertEqual(settings.apiKeySource, .environment)
     }
 
+    // MARK: - A Keychain that cannot be read
+
+    func testAKeychainKeyThatCannotBeReadIsNotReportedAsSaved() {
+        let settings = makeSettings(secrets: LockedSecretStore())
+
+        XCTAssertNil(settings.resolveAPIKey())
+
+        XCTAssertFalse(settings.apiKeyPresent)
+        XCTAssertEqual(settings.apiKeySource, .unreadable)
+    }
+
+    func testAnUnreadableKeychainKeyFallsBackToTheEnvironment() {
+        let settings = makeSettings(secrets: LockedSecretStore(), environment: ["ANTHROPIC_API_KEY": "sk-env"])
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-env")
+
+        XCTAssertTrue(settings.apiKeyPresent)
+        XCTAssertEqual(settings.apiKeySource, .environment)
+    }
+
+    func testTheKeychainKeyIsReadOnceAndReusedForTheSession() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-keychain"])
+        let settings = makeSettings(secrets: secrets)
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-keychain")
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-keychain")
+
+        XCTAssertEqual(secrets.reads, 1)
+    }
+
+    func testAFailedReadIsNotRetriedUntilTheNextSession() {
+        let secrets = LockedSecretStore()
+        let settings = makeSettings(secrets: secrets)
+
+        XCTAssertNil(settings.resolveAPIKey())
+        XCTAssertNil(settings.resolveAPIKey())
+
+        XCTAssertEqual(secrets.reads, 1)
+    }
+
+    func testLoadingKeysForListeningReadsTheKeyUpFront() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-keychain"])
+        let settings = makeSettings(secrets: secrets)
+
+        settings.loadKeysForListening()
+        XCTAssertEqual(secrets.reads, 1)
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-keychain")
+        XCTAssertEqual(secrets.reads, 1)
+    }
+
+    func testLoadingKeysForListeningTriesAgainAfterAFailedRead() {
+        let secrets = LockedSecretStore()
+        let settings = makeSettings(secrets: secrets)
+        settings.loadKeysForListening()
+        XCTAssertEqual(settings.apiKeySource, .unreadable)
+
+        secrets.readable = true
+        settings.loadKeysForListening()
+
+        XCTAssertEqual(settings.apiKeySource, .keychain)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-locked")
+    }
+
+    func testLoadingKeysForListeningLeavesTheDeepgramKeyUnreadUnlessItIsInUse() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk", "deepgram_api_key": "dg"])
+        let settings = makeSettings(secrets: secrets)
+
+        settings.loadKeysForListening()
+        XCTAssertEqual(secrets.reads, 1)
+
+        settings.acceptCloudAudio()
+        settings.loadKeysForListening()
+        XCTAssertEqual(secrets.reads, 3)
+    }
+
+    func testSavingTheKeyAgainRecoversFromAnUnreadableOne() {
+        let secrets = LockedSecretStore()
+        let settings = makeSettings(secrets: secrets)
+        XCTAssertNil(settings.resolveAPIKey())
+        secrets.readable = true
+
+        XCTAssertTrue(settings.setAPIKey("sk-new"))
+
+        XCTAssertEqual(settings.apiKeySource, .keychain)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-new")
+    }
+
+    func testReplacingTheKeyDropsTheCachedOne() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-old"])
+        let settings = makeSettings(secrets: secrets)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-old")
+
+        settings.setAPIKey("sk-new")
+
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-new")
+    }
+
+    func testRemovingTheKeyDropsTheCachedOne() {
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-old"])
+        let settings = makeSettings(secrets: secrets)
+        XCTAssertEqual(settings.resolveAPIKey(), "sk-old")
+
+        settings.removeAPIKey()
+
+        XCTAssertNil(settings.resolveAPIKey())
+        XCTAssertNil(settings.apiKeySource)
+    }
+
+    func testAnUnreadableDeepgramKeyIsNotUsed() {
+        let settings = makeSettings(secrets: LockedSecretStore(values: ["deepgram_api_key": "dg"]))
+        settings.acceptCloudAudio()
+        XCTAssertTrue(settings.sendsAudioToDeepgram)
+
+        XCTAssertNil(settings.resolveDeepgramKey())
+
+        XCTAssertEqual(settings.deepgramKeySource, .unreadable)
+        XCTAssertFalse(settings.sendsAudioToDeepgram)
+    }
+
     // MARK: - Deepgram key
 
     func testTheDeepgramKeyComesFromTheKeychainOrEnvironment() {
@@ -140,11 +261,30 @@ final class AppSettingsTests: XCTestCase {
 
     // MARK: - Shortcuts and overlay
 
-    func testShortcutsStartAsCommandShiftSpaceAndCommandShiftH() {
+    func testShortcutsStartAsControlOptionSpaceAndControlOptionH() {
         let settings = makeSettings()
 
-        XCTAssertEqual(settings.answerHotKey.label, "⌘⇧Space")
+        XCTAssertEqual(settings.answerHotKey.label, "⌃⌥Space")
+        XCTAssertEqual(settings.overlayHotKey.label, "⌃⌥H")
+    }
+
+    func testNoDefaultShortcutShadowsACommandShiftShortcutOtherAppsUse() {
+        let settings = makeSettings()
+
+        for combo in [settings.answerHotKey, settings.overlayHotKey] {
+            XCTAssertEqual(combo.modifiers, UInt32(controlKey | optionKey), combo.label)
+        }
+    }
+
+    func testAShortcutSavedBeforeTheDefaultsChangedIsKept() {
+        let defaults = freshDefaults()
+        defaults.set("⌘⇧H", forKey: "overlayHotKey")
+        defaults.set("⌘⇧Space", forKey: "answerHotKey")
+
+        let settings = makeSettings(defaults: defaults)
+
         XCTAssertEqual(settings.overlayHotKey.label, "⌘⇧H")
+        XCTAssertEqual(settings.answerHotKey.label, "⌘⇧Space")
     }
 
     func testChosenShortcutsPersist() {
@@ -223,6 +363,47 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertFalse(settings.useCloudSTT)
     }
 
+    func testSendingAudioToAppleServersIsOffUntilTheUserAllowsIt() {
+        XCTAssertFalse(makeSettings().serverSpeechAccepted)
+    }
+
+    func testAllowingAppleServersPersistsAndCanBeRevoked() {
+        let defaults = freshDefaults()
+        let first = makeSettings(defaults: defaults)
+
+        first.acceptServerSpeech()
+        XCTAssertTrue(makeSettings(defaults: defaults).serverSpeechAccepted)
+
+        first.revokeServerSpeech()
+        XCTAssertFalse(makeSettings(defaults: defaults).serverSpeechAccepted)
+    }
+
+    func testAllowingAppleServersDoesNotTurnOnDeepgram() {
+        let settings = makeSettings()
+
+        settings.acceptServerSpeech()
+
+        XCTAssertFalse(settings.useCloudSTT)
+        XCTAssertFalse(settings.cloudAudioAccepted)
+    }
+
+    func testWithdrawingTheTermsAlsoRevokesAppleServers() {
+        let settings = makeSettings()
+        settings.acceptTerms()
+        settings.acceptServerSpeech()
+
+        settings.withdrawTerms()
+
+        XCTAssertFalse(settings.serverSpeechAccepted)
+    }
+
+    func testTermsAcceptedBeforeTheAppleServersWordingMustBeAcceptedAgain() {
+        let defaults = freshDefaults()
+        defaults.set(1, forKey: "acceptedTermsVersion")
+
+        XCTAssertFalse(makeSettings(defaults: defaults).hasAcceptedTerms)
+    }
+
     // MARK: - Migration from the com.example bundle id
 
     func testSettingsAndKeysMoveOverFromTheOldBundleID() {
@@ -243,6 +424,37 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(settings.autoAnswer)
         XCTAssertEqual(settings.resolveAPIKey(), "sk-legacy")
         XCTAssertNil(legacySecrets.values["anthropic_api_key"])
+    }
+
+    func testMigrationDoesNotTurnOnDeepgramWithoutTheUserAgreeingToIt() {
+        let legacyDefaults = freshDefaults()
+        legacyDefaults.set(true, forKey: "useCloudSTT")
+        let defaults = freshDefaults()
+
+        AppSettings.migrateLegacySettings(from: legacyDefaults, legacySecrets: InMemorySecretStore(),
+                                          to: defaults, secrets: InMemorySecretStore())
+        let settings = makeSettings(defaults: defaults)
+
+        XCTAssertFalse(settings.useCloudSTT)
+        XCTAssertFalse(settings.cloudAudioAccepted)
+    }
+
+    func testMigrationNeverCopiesTheAppleServersConsent() {
+        let legacyDefaults = freshDefaults()
+        legacyDefaults.set(true, forKey: "serverSpeechAccepted")
+        let defaults = freshDefaults()
+
+        AppSettings.migrateLegacySettings(from: legacyDefaults, legacySecrets: InMemorySecretStore(),
+                                          to: defaults, secrets: InMemorySecretStore())
+
+        XCTAssertFalse(makeSettings(defaults: defaults).serverSpeechAccepted)
+    }
+
+    func testADeepgramSwitchLeftOnWithoutAgreementIsShownOff() {
+        let defaults = freshDefaults()
+        defaults.set(true, forKey: "useCloudSTT")
+
+        XCTAssertFalse(makeSettings(defaults: defaults).useCloudSTT)
     }
 
     func testMigrationNeverOverwritesNewerSettings() {

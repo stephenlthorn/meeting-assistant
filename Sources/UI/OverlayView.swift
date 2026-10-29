@@ -164,7 +164,9 @@ private struct AnswerSection: View {
             }
             ScrollView {
                 Text(OverlayText.answer(controller.answer, isAnswering: controller.isAnswering,
-                                        hasKey: settings.apiKeyPresent, shortcut: settings.answerHotKey.label))
+                                        hasKey: settings.apiKeyPresent,
+                                        keyUnreadable: settings.apiKeySource == .unreadable,
+                                        shortcut: settings.answerHotKey.label))
                     .font(.system(size: 13, weight: .medium))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)

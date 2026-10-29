@@ -19,17 +19,51 @@ protocol LiveTranscriber: AnyObject {
     func append(_ buffer: AVAudioPCMBuffer)
 }
 
+/// Which backend a listening session uses, decided from the settings alone
+/// (no Keychain read). The controller keeps the plan a session started with
+/// and compares it to the current one when a setting changes mid-call.
+enum SpeechPlan: Equatable {
+    /// Audio streams to Deepgram: switched on, agreed to, and keyed.
+    case deepgram
+    /// SpeechAnalyzer, macOS 26+: always on this Mac.
+    case analyzer
+    /// SFSpeechRecognizer, macOS 14-15. It sends audio to Apple's servers only
+    /// when this Mac cannot transcribe the language on-device and the user
+    /// allowed that.
+    case legacy(allowServerRecognition: Bool)
+}
+
 /// Picks the backend: Deepgram cloud when enabled, agreed to and keyed,
-/// otherwise on-device (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14–15).
+/// otherwise on-device (SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14-15).
 enum TranscriberFactory {
+    /// Whether SpeechAnalyzer can run. Tests set it to reach the macOS 14-15
+    /// path on a newer system.
+    @MainActor static var analyzerAvailable: Bool = {
+        if #available(macOS 26, *) { return true }
+        return false
+    }()
+
+    @MainActor
+    static func plan(for settings: AppSettings) -> SpeechPlan {
+        plan(for: settings, analyzerAvailable: analyzerAvailable)
+    }
+
+    @MainActor
+    static func plan(for settings: AppSettings, analyzerAvailable: Bool) -> SpeechPlan {
+        if settings.sendsAudioToDeepgram { return .deepgram }
+        return analyzerAvailable ? .analyzer : .legacy(allowServerRecognition: settings.serverSpeechAccepted)
+    }
+
     @MainActor
     static func make(settings: AppSettings, localeIdentifier: String = "en-US") -> LiveTranscriber {
-        if settings.useCloudSTT, settings.cloudAudioAccepted, let key = settings.resolveDeepgramKey() {
+        if settings.sendsAudioToDeepgram, let key = settings.resolveDeepgramKey() {
             return CloudTranscriber(apiKey: key, localeIdentifier: localeIdentifier)
         }
-        if #available(macOS 26, *) {
+        // Past this point Deepgram is out, including when its key could not be read.
+        if analyzerAvailable, #available(macOS 26, *) {
             return AnalyzerTranscriber(localeIdentifier: localeIdentifier)
         }
-        return LegacySpeechTranscriber(localeIdentifier: localeIdentifier)
+        return LegacySpeechTranscriber(localeIdentifier: localeIdentifier,
+                                       allowServerRecognition: settings.serverSpeechAccepted)
     }
 }

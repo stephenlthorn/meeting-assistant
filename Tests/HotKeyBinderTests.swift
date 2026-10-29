@@ -32,7 +32,7 @@ final class HotKeyBinderTests: XCTestCase {
 
         binder.bind(answer: .answerChoices[0], overlay: .overlayChoices[0], onAnswer: {}, onOverlay: {})
 
-        XCTAssertEqual(binder.problem, "⌘⇧Space is already in use. Pick another shortcut in Settings.")
+        XCTAssertEqual(binder.problem, "⌃⌥Space is already in use. Pick another shortcut in Settings.")
         XCTAssertEqual(registry.live, [HotKeyCombo.overlayChoices[0]])
     }
 

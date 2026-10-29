@@ -7,11 +7,15 @@ import Foundation
 final class AppSettings: ObservableObject {
     enum KeySource: Equatable {
         case keychain, environment, file
+        /// A Keychain item exists but cannot be read: access was denied or the
+        /// Keychain is locked. Not a usable key.
+        case unreadable
     }
 
     /// Bump when the privacy terms shown on the welcome screen change, so
-    /// everyone is asked to agree again.
-    static let termsVersion = 1
+    /// everyone is asked to agree again. 2: Apple's speech servers are named,
+    /// and used only after their own opt-in.
+    static let termsVersion = 2
     static let bundleID = "com.stephenthorn.meetingassistant"
     static let legacyBundleID = "com.example.meetingassistant"
 
@@ -30,7 +34,9 @@ final class AppSettings: ObservableObject {
 
     private static let anthropicAccount = "anthropic_api_key"
     private static let deepgramAccount = "deepgram_api_key"
-    private static let preferenceKeys = ["model", "profile", "extraInstructions", "autoAnswer", "useCloudSTT"]
+    /// `useCloudSTT` is left out on purpose: it only means something next to
+    /// `cloudAudioAccepted`, which is the user's consent and is never copied.
+    private static let preferenceKeys = ["model", "profile", "extraInstructions", "autoAnswer"]
 
     let availableModels = ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
 
@@ -48,16 +54,37 @@ final class AppSettings: ObservableObject {
     @Published private(set) var cloudAudioAccepted: Bool {
         didSet { defaults.set(cloudAudioAccepted, forKey: "cloudAudioAccepted") }
     }
+    /// The user allowed call audio to go to Apple's speech servers when this
+    /// Mac cannot transcribe on-device (macOS 14-15). Off until they say so.
+    @Published private(set) var serverSpeechAccepted: Bool {
+        didSet { defaults.set(serverSpeechAccepted, forKey: "serverSpeechAccepted") }
+    }
     @Published private(set) var apiKeySource: KeySource?
     @Published private(set) var deepgramKeySource: KeySource?
 
-    var apiKeyPresent: Bool { apiKeySource != nil }
+    var apiKeyPresent: Bool { apiKeySource.map { $0 != .unreadable } ?? false }
     var hasAcceptedTerms: Bool { acceptedTermsVersion >= Self.termsVersion }
+
+    /// Whether a new listening session would stream call audio to Deepgram: the
+    /// switch is on, the user agreed to it, and a usable key exists. Decided
+    /// without reading the Keychain.
+    var sendsAudioToDeepgram: Bool {
+        guard useCloudSTT, cloudAudioAccepted else { return false }
+        return deepgramKeySource.map { $0 != .unreadable } ?? false
+    }
 
     private let defaults: UserDefaults
     private let secrets: SecretStore
     private let environment: [String: String]
     private let anthropicKeyFile: URL
+
+    /// Keychain secrets already read this session. Reading one can raise a
+    /// macOS access prompt that blocks the main thread, so it happens up front
+    /// (`loadKeysForListening`) and never again mid-call.
+    private var keychainKeys: [String: String] = [:]
+    /// Keychain items that exist but could not be read; not retried until the
+    /// next `loadKeysForListening` or a successful save.
+    private var unreadableAccounts: Set<String> = []
 
     init(defaults: UserDefaults, secrets: SecretStore, environment: [String: String], anthropicKeyFile: URL) {
         self.defaults = defaults
@@ -68,13 +95,17 @@ final class AppSettings: ObservableObject {
         profile = defaults.string(forKey: "profile").flatMap(Profile.init(rawValue:)) ?? .general
         extraInstructions = defaults.string(forKey: "extraInstructions") ?? ""
         autoAnswer = defaults.bool(forKey: "autoAnswer")
-        useCloudSTT = defaults.bool(forKey: "useCloudSTT")
+        let agreedToCloudAudio = defaults.bool(forKey: "cloudAudioAccepted")
+        cloudAudioAccepted = agreedToCloudAudio
+        // A switch left on without the agreement behind it (an earlier migration
+        // could do this) is not in effect, so it must not read as on.
+        useCloudSTT = defaults.bool(forKey: "useCloudSTT") && agreedToCloudAudio
         answerHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "answerHotKey"), in: HotKeyCombo.answerChoices)
         overlayHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "overlayHotKey"),
                                            in: HotKeyCombo.overlayChoices)
         showsOverlay = defaults.object(forKey: "showsOverlay") as? Bool ?? true
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
-        cloudAudioAccepted = defaults.bool(forKey: "cloudAudioAccepted")
+        serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
         refreshKeySources()
     }
 
@@ -91,11 +122,12 @@ final class AppSettings: ObservableObject {
         acceptedTermsVersion = Self.termsVersion
     }
 
-    /// Withdrawing the terms also stops any audio going to Deepgram.
+    /// Withdrawing the terms also stops any audio going to Deepgram or Apple.
     func withdrawTerms() {
         acceptedTermsVersion = 0
         cloudAudioAccepted = false
         useCloudSTT = false
+        serverSpeechAccepted = false
     }
 
     /// The user agreed to stream call audio to Deepgram; turns cloud STT on.
@@ -104,21 +136,40 @@ final class AppSettings: ObservableObject {
         useCloudSTT = true
     }
 
+    /// The user agreed to send call audio to Apple's speech servers when
+    /// on-device recognition is unavailable.
+    func acceptServerSpeech() {
+        serverSpeechAccepted = true
+    }
+
+    func revokeServerSpeech() {
+        serverSpeechAccepted = false
+    }
+
     // MARK: - Keys
 
     @discardableResult
     func setAPIKey(_ key: String) -> Bool { save(key, account: Self.anthropicAccount) }
 
     func removeAPIKey() {
-        secrets.delete(Self.anthropicAccount)
-        refreshKeySources()
+        remove(account: Self.anthropicAccount)
     }
 
     @discardableResult
     func setDeepgramKey(_ key: String) -> Bool { save(key, account: Self.deepgramAccount) }
 
     func removeDeepgramKey() {
-        secrets.delete(Self.deepgramAccount)
+        remove(account: Self.deepgramAccount)
+    }
+
+    /// Reads the keys this session needs, once, before any audio starts, so a
+    /// Keychain prompt appears while the user is looking rather than freezing
+    /// the overlay mid-call. A key that failed to read last time is tried again.
+    func loadKeysForListening() {
+        keychainKeys = [:]
+        unreadableAccounts = []
+        _ = resolveAPIKey()
+        if useCloudSTT && cloudAudioAccepted { _ = resolveDeepgramKey() }
         refreshKeySources()
     }
 
@@ -155,8 +206,20 @@ final class AppSettings: ObservableObject {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         let saved = secrets.write(trimmed, for: account)
+        if saved { forget(account) }
         refreshKeySources()
         return saved
+    }
+
+    private func remove(account: String) {
+        secrets.delete(account)
+        forget(account)
+        refreshKeySources()
+    }
+
+    private func forget(_ account: String) {
+        keychainKeys[account] = nil
+        unreadableAccounts.remove(account)
     }
 
     private func refreshKeySources() {
@@ -165,16 +228,32 @@ final class AppSettings: ObservableObject {
         deepgramKeySource = source(account: Self.deepgramAccount, environmentKey: "DEEPGRAM_API_KEY", file: nil)
     }
 
+    /// Where the key in effect comes from. Checking the Keychain only asks
+    /// whether the item exists, so this stays quiet at launch; a failed read
+    /// (`unreadableAccounts`) is what turns a saved key into `.unreadable`.
     private func source(account: String, environmentKey: String, file: URL?) -> KeySource? {
-        if secrets.contains(account) { return .keychain }
+        let inKeychain = secrets.contains(account)
+        if inKeychain && !unreadableAccounts.contains(account) { return .keychain }
         if nonEmpty(environment[environmentKey]) != nil { return .environment }
         if fileKey(file) != nil { return .file }
-        return nil
+        return inKeychain ? .unreadable : nil
     }
 
     private func resolve(account: String, environmentKey: String, file: URL?) -> String? {
-        if secrets.contains(account), let stored = nonEmpty(secrets.read(account)) { return stored }
+        if let stored = keychainValue(account) { return stored }
         return nonEmpty(environment[environmentKey]) ?? fileKey(file)
+    }
+
+    private func keychainValue(_ account: String) -> String? {
+        guard secrets.contains(account), !unreadableAccounts.contains(account) else { return nil }
+        if let cached = keychainKeys[account] { return cached }
+        guard let stored = nonEmpty(secrets.read(account)) else {
+            unreadableAccounts.insert(account)
+            refreshKeySources()
+            return nil
+        }
+        keychainKeys[account] = stored
+        return stored
     }
 
     private func fileKey(_ file: URL?) -> String? {

@@ -1,5 +1,11 @@
 import SwiftUI
 
+/// The welcome screen's privacy wording, kept apart from the layout so a test
+/// can check that it still names everywhere call data can go.
+enum WelcomeText {
+    static let whereYourDataGoes = "Speech is transcribed on this Mac. On macOS 14 and 15, if your Mac can't transcribe your language on-device, Apple's speech servers are used only if you separately turn that on in Settings. When you ask for help, or auto-answer is on, the last few minutes of transcript text go to Anthropic's Claude using your own API key. If you turn on Deepgram, call audio streams to Deepgram instead. Nothing is sent to the developer."
+}
+
 /// First-run screen: what the app listens to, where the data goes, and a
 /// reminder about the other people on the call. Listening waits for "Agree".
 struct WelcomeView: View {
@@ -22,7 +28,7 @@ struct WelcomeView: View {
             WelcomeSection(symbol: "ear", title: "What it listens to",
                            text: "The other people on your call (your Mac's sound output, which needs Screen Recording permission) and your microphone.")
             WelcomeSection(symbol: "lock.shield", title: "Where your data goes",
-                           text: "Speech is transcribed on this Mac. When you ask for help, or auto-answer is on, the last few minutes of transcript text go to Anthropic's Claude using your own API key. If you turn on Deepgram, call audio streams to Deepgram instead. Nothing is sent to the developer.")
+                           text: WelcomeText.whereYourDataGoes)
             WelcomeSection(symbol: "person.2", title: "The people you talk to",
                            text: "Recording and transcription laws vary, and some places require everyone's consent. Let people know you use an AI assistant.")
             HStack {
