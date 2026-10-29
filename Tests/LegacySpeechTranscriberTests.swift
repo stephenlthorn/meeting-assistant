@@ -159,6 +159,38 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         XCTAssertEqual(h.engine.sessions[0].appended, 0)
     }
 
+    func testTheLastRequestsFinalResultStillArrivesAfterStopping() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].result("We should ship in", isFinal: false)
+
+        h.transcriber.stop()
+        h.flush()
+        h.engine.sessions[0].result("We should ship in May.", isFinal: true)
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last?.text, "We should ship in May.")
+        XCTAssertEqual(h.segments.last?.isFinal, true)
+    }
+
+    func testARequestThatFailsWhileFinishingAfterStopStillFinishesItsWords() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].result("We should ship in", isFinal: false)
+
+        h.transcriber.stop()
+        h.flush()
+        h.engine.sessions[0].fail()
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: h.segments[0].utterance, text: "We should ship in", isFinal: true))
+        XCTAssertEqual(h.engine.sessions.count, 1, "a stopped transcriber does not start another request")
+    }
+
     func testAnUnavailableRecognizerReportsAnError() async {
         let h = makeHarness()
         h.engine.isAvailable = false

@@ -29,12 +29,16 @@ typealias AnalyzerPipelineFactory = (_ onProgress: @escaping (String?) -> Void) 
 /// ready, and stopping during setup shuts the pipeline down as soon as it
 /// arrives instead of leaving it running.
 ///
+/// Stopping lets the analyzer finish what it has already heard, so the last
+/// sentence of a call still arrives, and shuts it down after `drainTimeout`.
+///
 /// A pipeline that fails to build, errors, or ends by itself is rebuilt with
 /// backoff, and the problem is reported once if it keeps happening. Utterance
 /// numbers belong to this object, not to a pipeline, so a rebuilt pipeline
 /// never reuses a number the transcript already holds.
 final class AnalyzerTranscriber: LiveTranscriber {
     static let failuresBeforeReporting = 3
+    static let defaultDrainTimeout: TimeInterval = 1.5
     private static let maximumBackoff: TimeInterval = 30
 
     let backendName = "on-device"
@@ -44,10 +48,13 @@ final class AnalyzerTranscriber: LiveTranscriber {
 
     private let makePipeline: AnalyzerPipelineFactory
     private let schedule: (TimeInterval, @escaping () -> Void) -> Void
+    private let drainTimeout: TimeInterval
     private let lock = NSLock()
-    // Guarded by `lock`. `run` identifies one start()..stop() span so work left
-    // over from an earlier span can tell it is stale.
+    // Guarded by `lock`. `run` identifies one start() span so work left over
+    // from an earlier span can tell it is stale; `draining` means stop() was
+    // called and the pipeline is still reporting what it already heard.
     private var running = false
+    private var draining = false
     private var run = 0
     private var pipeline: AnalyzerPipeline?
     private var failures = 0
@@ -56,9 +63,11 @@ final class AnalyzerTranscriber: LiveTranscriber {
     private var converter: AVAudioConverter?
 
     init(makePipeline: @escaping AnalyzerPipelineFactory,
-         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
+         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
+         drainTimeout: TimeInterval = AnalyzerTranscriber.defaultDrainTimeout) {
         self.makePipeline = makePipeline
         self.schedule = schedule
+        self.drainTimeout = drainTimeout
     }
 
     @available(macOS 26, *)
@@ -78,6 +87,7 @@ final class AnalyzerTranscriber: LiveTranscriber {
     func start() {
         let current = lock.withLock { () -> Int in
             running = true
+            draining = false
             run += 1
             failures = 0
             reportedFallingBehind = false
@@ -89,13 +99,13 @@ final class AnalyzerTranscriber: LiveTranscriber {
     func stop() {
         let pipeline = lock.withLock { () -> AnalyzerPipeline? in
             running = false
-            run += 1
             defer { self.pipeline = nil }
+            draining = self.pipeline != nil
             return self.pipeline
         }
-        if let pipeline {
-            Task { await pipeline.cancel() }
-        }
+        guard let pipeline else { return }
+        Task { await pipeline.finish() }
+        schedule(drainTimeout) { Task { await pipeline.cancel() } }
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
@@ -107,6 +117,9 @@ final class AnalyzerTranscriber: LiveTranscriber {
     // MARK: - Pipeline lifecycle
 
     private func isCurrent(_ run: Int) -> Bool { lock.withLock { running && self.run == run } }
+
+    /// Results still count while a stopped pipeline finishes what it heard.
+    private func canDeliver(_ run: Int) -> Bool { lock.withLock { (running || draining) && self.run == run } }
 
     private func launch(run: Int) {
         Task { [weak self] in await self?.attempt(run: run) }
@@ -166,7 +179,7 @@ final class AnalyzerTranscriber: LiveTranscriber {
 
     private func deliverResults(of pipeline: AnalyzerPipeline, run: Int) async throws {
         for try await result in pipeline.results {
-            guard isCurrent(run) else { return }
+            guard canDeliver(run) else { return }
             let segment = lock.withLock { () -> TranscriptSegment in
                 failures = 0
                 let segment = TranscriptSegment(utterance: utterance, text: result.text, isFinal: result.isFinal)

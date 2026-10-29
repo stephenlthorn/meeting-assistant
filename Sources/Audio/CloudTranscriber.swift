@@ -18,7 +18,12 @@ protocol WebSocketConnection: AnyObject {
 /// goes out whenever no audio has been sent for a few seconds. A dropped
 /// connection is re-established with backoff; audio is dropped while
 /// disconnected, and the problem is reported once if reconnecting keeps failing.
+///
+/// Stopping asks Deepgram to finish (CloseStream) and keeps listening for a
+/// moment, since it answers with the words it was still working on and then
+/// closes the connection; the connection is closed at once if it does not.
 final class CloudTranscriber: LiveTranscriber {
+    static let defaultDrainTimeout: TimeInterval = 1.5
     static let keepAliveInterval: TimeInterval = 4
     static let failuresBeforeReporting = 3
     static let failuresBeforeGivingUp = 10
@@ -33,6 +38,7 @@ final class CloudTranscriber: LiveTranscriber {
 
     private let apiKey: String
     private let localeIdentifier: String
+    private let drainTimeout: TimeInterval
     private let connect: (URLRequest) -> WebSocketConnection
     private let queue: DispatchQueue
     private let now: () -> Date
@@ -42,6 +48,7 @@ final class CloudTranscriber: LiveTranscriber {
 
     // Only touched on `queue`.
     private var running = false
+    private var draining = false
     private var connection: WebSocketConnection?
     private var generation = 0
     private var heardFromServer = false
@@ -58,9 +65,11 @@ final class CloudTranscriber: LiveTranscriber {
          connect: @escaping (URLRequest) -> WebSocketConnection = URLSessionWebSocketConnection.connect,
          queue: DispatchQueue = DispatchQueue(label: "meetingassistant.deepgram"),
          now: @escaping () -> Date = Date.init,
-         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
+         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
+         drainTimeout: TimeInterval = CloudTranscriber.defaultDrainTimeout) {
         self.apiKey = apiKey
         self.localeIdentifier = localeIdentifier
+        self.drainTimeout = drainTimeout
         self.connect = connect
         self.queue = queue
         self.now = now
@@ -76,6 +85,7 @@ final class CloudTranscriber: LiveTranscriber {
                 report("Missing Deepgram API key.")
                 return
             }
+            if draining { endDrain() }
             running = true
             failures = 0
             openConnection()
@@ -86,9 +96,16 @@ final class CloudTranscriber: LiveTranscriber {
     func stop() {
         queue.async { [self] in
             running = false
-            connection?.send(.string(Self.closeMessage)) { _ in }
-            connection?.close()
-            connection = nil
+            guard let connection else { return }
+            draining = true
+            connection.send(.string(Self.closeMessage)) { _ in }
+            let drainingGeneration = generation
+            schedule(drainTimeout) { [weak self] in
+                self?.queue.async {
+                    guard let self, self.draining, self.generation == drainingGeneration else { return }
+                    self.endDrain()
+                }
+            }
         }
     }
 
@@ -120,7 +137,7 @@ final class CloudTranscriber: LiveTranscriber {
 
     private func received(_ result: Result<URLSessionWebSocketTask.Message, Error>,
                           on connection: WebSocketConnection, generation id: Int) {
-        guard running, id == generation else { return }
+        guard running || draining, id == generation else { return }
         switch result {
         case .success(let message):
             if !heardFromServer {
@@ -134,8 +151,21 @@ final class CloudTranscriber: LiveTranscriber {
             handle(message)
             receiveNext(on: connection, generation: id)
         case .failure(let error):
-            dropped(error)
+            if draining {
+                endDrain()
+            } else {
+                dropped(error)
+            }
         }
+    }
+
+    /// The server has said everything it will after CloseStream (or took too
+    /// long): close the connection and finish whatever utterance was open.
+    private func endDrain() {
+        draining = false
+        finishOpenUtterance()
+        connection?.close()
+        connection = nil
     }
 
     private func dropped(_ error: Error) {

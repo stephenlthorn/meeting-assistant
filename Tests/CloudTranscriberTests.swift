@@ -151,7 +151,7 @@ final class CloudTranscriberTests: XCTestCase {
         XCTAssertEqual(h.notices, ["Reconnecting to Deepgram…", nil])
     }
 
-    func testStoppingClosesTheStreamAndIgnoresLateResults() async {
+    func testStoppingAsksTheServerToFinishAndClosesAfterTheDrainWindow() async {
         let h = makeHarness()
         h.transcriber.start()
         h.flush()
@@ -159,13 +159,107 @@ final class CloudTranscriberTests: XCTestCase {
 
         h.transcriber.stop()
         h.flush()
+        XCTAssertEqual(socket?.sentText, [#"{"type":"CloseStream"}"#])
+        XCTAssertEqual(socket?.closed, false, "the server still has words to deliver")
+
+        h.scheduler.fire(delay: CloudTranscriber.defaultDrainTimeout)
+        h.flush()
+        XCTAssertEqual(socket?.closed, true)
+    }
+
+    func testResultsThatArriveWhileDrainingAreDelivered() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.sockets.latest?.serverSends(transcript: "We should ship in", isFinal: false)
+        h.flush()
+
+        h.transcriber.stop()
+        h.flush()
+        h.sockets.latest?.serverSends(transcript: "May.", isFinal: true, speechFinal: false)
+        h.flush()
+        h.sockets.latest?.serverDrops(URLError(.networkConnectionLost))
+        h.flush()
+
+        await eventually { h.segments.count == 3 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: 0, text: "May.", isFinal: true))
+        XCTAssertEqual(h.sockets.latest?.closed, true)
+        XCTAssertEqual(h.sockets.requests.count, 1, "a server close during the drain is not a reason to reconnect")
+        XCTAssertTrue(h.errors.isEmpty)
+    }
+
+    func testTheServerClosingEndsTheDrainAndFinishesAnOpenUtterance() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.sockets.latest?.serverSends(transcript: "last words", isFinal: true, speechFinal: false)
+        h.flush()
+
+        h.transcriber.stop()
+        h.flush()
+        h.sockets.latest?.serverDrops(URLError(.networkConnectionLost))
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: 0, text: "last words", isFinal: true))
+    }
+
+    func testNothingIsAcceptedAfterTheDrainWindowCloses() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        let socket = h.sockets.latest
+        h.transcriber.stop()
+        h.flush()
+        h.scheduler.fire(delay: CloudTranscriber.defaultDrainTimeout)
+        h.flush()
+
         socket?.serverSends(transcript: "late", isFinal: true)
         h.flush()
 
-        XCTAssertEqual(socket?.sentText, [#"{"type":"CloseStream"}"#])
-        XCTAssertEqual(socket?.closed, true)
         await settle()
         XCTAssertTrue(h.segments.isEmpty)
+    }
+
+    func testAudioIsNotSentWhileDraining() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.transcriber.stop()
+        h.flush()
+
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.flush()
+
+        XCTAssertEqual(h.sockets.latest?.sentData.count, 0)
+    }
+
+    func testStartingAgainClosesTheOldStreamAtOnce() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        let old = h.sockets.latest
+        h.transcriber.stop()
+        h.flush()
+
+        h.transcriber.start()
+        h.flush()
+
+        XCTAssertEqual(old?.closed, true)
+        XCTAssertEqual(h.sockets.requests.count, 2)
+    }
+
+    func testStoppingWhileDisconnectedHasNothingToDrain() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.sockets.latest?.serverDrops()
+        h.flush()
+
+        h.transcriber.stop()
+        h.flush()
+
+        XCTAssertEqual(h.sockets.latest?.sentText, [])
     }
 
     func testAMissingKeyIsReported() async {

@@ -66,15 +66,66 @@ final class AnalyzerTranscriberTests: XCTestCase {
         XCTAssertTrue(h.segments.isEmpty)
     }
 
-    func testStoppingShutsThePipelineDown() async {
+    func testStoppingLetsThePipelineFinishWhatItHeard() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        await eventually { h.gate.handedOut }
+        h.gate.pipeline.emit("We should ship in", isFinal: false)
+        await eventually { h.segments.count == 1 }
+
+        h.transcriber.stop()
+        await eventually { h.gate.pipeline.finished }
+        h.gate.pipeline.emit("We should ship in May.", isFinal: true)
+        h.gate.pipeline.endResults()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: 0, text: "We should ship in May.", isFinal: true))
+        await settle()
+        XCTAssertEqual(h.gate.makes, 1, "a pipeline that ended because we stopped is not rebuilt")
+        XCTAssertTrue(h.scheduler.delays.contains(AnalyzerTranscriber.defaultDrainTimeout))
+        XCTAssertTrue(h.errors.isEmpty)
+    }
+
+    func testAPipelineThatIsTakingTooLongToFinishIsShutDown() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        await eventually { h.gate.handedOut }
+        h.transcriber.stop()
+        await eventually { h.gate.pipeline.finished }
+
+        h.scheduler.fireAll()
+
+        await eventually { h.gate.pipeline.cancelled }
+    }
+
+    func testAudioIsNotFedWhileDraining() async {
         let h = makeHarness()
         h.transcriber.start()
         await eventually { h.gate.handedOut }
         await settle()
-
         h.transcriber.stop()
 
-        await eventually { h.gate.pipeline.cancelled }
+        h.transcriber.append(tone(amplitude: 0.2))
+
+        XCTAssertTrue(h.gate.pipeline.fed.isEmpty)
+    }
+
+    func testStartingAgainLeavesTheOldPipelinesResultsBehind() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        await eventually { h.gate.handedOut }
+        let old = h.gate.pipeline
+        h.transcriber.stop()
+        await eventually { old.finished }
+
+        h.transcriber.start()
+        await eventually { h.gate.pipelines.count == 2 }
+        old.emit("old words", isFinal: true)
+        h.gate.pipeline.emit("new words", isFinal: false)
+
+        await eventually { !h.segments.isEmpty }
+        await settle()
+        XCTAssertEqual(h.segments, [TranscriptSegment(utterance: 0, text: "new words", isFinal: false)])
     }
 
     func testSetupProgressShowsAsANotice() async {
