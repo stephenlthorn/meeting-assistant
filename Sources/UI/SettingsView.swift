@@ -9,6 +9,7 @@ struct SettingsView: View {
     @ObservedObject var hotKeys: HotKeyBinder
     let showWelcome: () -> Void
     let withdrawTerms: () -> Void
+    let chooseTranscriptFolder: () -> Void
     @State private var apiKeyField = ""
     @State private var deepgramField = ""
     @State private var saveFailed = false
@@ -207,18 +208,6 @@ struct SettingsView: View {
                     settings.revokeServerSpeech()
                 }
             })
-    }
-
-    private func chooseTranscriptFolder() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        panel.message = "Choose where Meeting Assistant saves transcripts."
-        panel.directoryURL = settings.transcriptFolder
-        if panel.runModal() == .OK, let url = panel.url { settings.transcriptFolder = url }
     }
 
     private static func runningBundleIDs() -> Set<String> {

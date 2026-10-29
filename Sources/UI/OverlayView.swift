@@ -36,7 +36,7 @@ private struct OverlayHeader: View {
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 1) {
-                Text(controller.status)
+                Text(StatusLine.text(status: controller.status, listening: controller.listening, model: settings.model))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let notice = controller.notice {

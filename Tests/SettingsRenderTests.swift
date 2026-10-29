@@ -9,7 +9,8 @@ final class SettingsRenderTests: XCTestCase {
     func testTheSettingsWindowRendersWithTheMeetingAudioChoice() throws {
         let settings = makeTestSettings(for: self)
         settings.captureAppBundleID = "us.zoom.xos"
-        let view = SettingsView(settings: settings, hotKeys: HotKeyBinder(), showWelcome: {}, withdrawTerms: {})
+        let view = SettingsView(settings: settings, hotKeys: HotKeyBinder(), showWelcome: {}, withdrawTerms: {},
+                            chooseTranscriptFolder: {})
 
         let png = try render(view, size: NSSize(width: 480, height: 720))
 
