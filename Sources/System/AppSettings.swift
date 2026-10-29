@@ -48,6 +48,12 @@ final class AppSettings: ObservableObject {
     @Published var answerHotKey: HotKeyCombo { didSet { defaults.set(answerHotKey.label, forKey: "answerHotKey") } }
     @Published var overlayHotKey: HotKeyCombo { didSet { defaults.set(overlayHotKey.label, forKey: "overlayHotKey") } }
     @Published var showsOverlay: Bool { didSet { defaults.set(showsOverlay, forKey: "showsOverlay") } }
+    /// The one app whose audio is captured, by bundle identifier; nil listens to
+    /// every app. Read each time system audio starts, so a change takes effect
+    /// at the next Start (or restart), not mid-stream.
+    @Published var captureAppBundleID: String? {
+        didSet { defaults.set(captureAppBundleID, forKey: "captureAppBundleID") }
+    }
     @Published private(set) var acceptedTermsVersion: Int {
         didSet { defaults.set(acceptedTermsVersion, forKey: "acceptedTermsVersion") }
     }
@@ -104,6 +110,7 @@ final class AppSettings: ObservableObject {
         overlayHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "overlayHotKey"),
                                            in: HotKeyCombo.overlayChoices)
         showsOverlay = defaults.object(forKey: "showsOverlay") as? Bool ?? true
+        captureAppBundleID = defaults.string(forKey: "captureAppBundleID").flatMap { $0.isEmpty ? nil : $0 }
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
         serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
         refreshKeySources()

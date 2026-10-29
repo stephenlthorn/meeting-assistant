@@ -1,9 +1,9 @@
 import SwiftUI
 
-/// Preferences window: API key (Keychain), model, behavior, shortcuts, extra
-/// prompt instructions, optional Deepgram cloud STT and Apple's speech servers
-/// (each only after agreeing to send audio there), privacy terms, and links to
-/// the permissions the app needs.
+/// Preferences window: API key (Keychain), model, behavior, shortcuts, which
+/// app's audio to listen to, extra prompt instructions, optional Deepgram cloud
+/// STT and Apple's speech servers (each only after agreeing to send audio
+/// there), privacy terms, and links to the permissions the app needs.
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var hotKeys: HotKeyBinder
@@ -14,6 +14,7 @@ struct SettingsView: View {
     @State private var saveFailed = false
     @State private var confirmingCloudAudio = false
     @State private var confirmingServerSpeech = false
+    @State private var runningApps = SettingsView.runningBundleIDs()
 
     var body: some View {
         Form {
@@ -64,6 +65,18 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+            }
+
+            Section("Meeting audio") {
+                Picker("Listen to", selection: $settings.captureAppBundleID) {
+                    Text("All apps").tag(String?.none)
+                    ForEach(MeetingApps.choices(running: runningApps, saved: settings.captureAppBundleID)) { app in
+                        Text(MeetingApps.label(for: app, running: runningApps)).tag(String?.some(app.bundleID))
+                    }
+                }
+                Text("Pick the app your calls happen in to keep music, notification sounds and other tabs out of the transcript. If it isn't running when you start listening, every app is heard and the overlay says so. Takes effect the next time you start listening.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Speech-to-text") {
@@ -140,6 +153,12 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 720)
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in
+            runningApps = Self.runningBundleIDs()
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in
+            runningApps = Self.runningBundleIDs()
+        }
         .alert("Send call audio to Deepgram?", isPresented: $confirmingCloudAudio) {
             Button("Send Audio to Deepgram") { settings.acceptCloudAudio() }
             Button("Cancel", role: .cancel) {}
@@ -172,6 +191,10 @@ struct SettingsView: View {
                     settings.revokeServerSpeech()
                 }
             })
+    }
+
+    private static func runningBundleIDs() -> Set<String> {
+        Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
     }
 
     private func save(_ write: () -> Bool, clear: () -> Void) {

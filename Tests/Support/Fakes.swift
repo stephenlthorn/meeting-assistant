@@ -60,10 +60,13 @@ final class FakeTranscriberFactory {
 final class FakeSystemAudio: SystemAudioCapturing {
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     var onError: (@MainActor (CaptureFailure) -> Void)?
+    var onNotice: (@MainActor (String?) -> Void)?
     @MainActor var startError: Error?
     @MainActor var holdsStart = false
     @MainActor var holdsStop = false
     @MainActor private(set) var events: [String] = []
+    /// The app each start asked for, in order; nil is every app.
+    @MainActor private(set) var applications: [String?] = []
     @MainActor private var heldStart: CheckedContinuation<Void, Never>?
     @MainActor private var heldStop: CheckedContinuation<Void, Never>?
 
@@ -71,8 +74,11 @@ final class FakeSystemAudio: SystemAudioCapturing {
         events.last(where: { $0 == "started" || $0 == "stopped" }) == "started"
     }
 
-    func start() async throws { try await startOnMain() }
+    func start(application bundleID: String?) async throws { try await startOnMain(application: bundleID) }
+
     func stop() async { await stopOnMain() }
+
+    @MainActor func notice(_ message: String?) { onNotice?(message) }
 
     @MainActor func releaseStart() {
         heldStart?.resume()
@@ -84,7 +90,8 @@ final class FakeSystemAudio: SystemAudioCapturing {
         heldStop = nil
     }
 
-    @MainActor private func startOnMain() async throws {
+    @MainActor private func startOnMain(application bundleID: String?) async throws {
+        applications.append(bundleID)
         events.append("start")
         if holdsStart { await withCheckedContinuation { heldStart = $0 } }
         if let startError {

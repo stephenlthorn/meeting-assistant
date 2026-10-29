@@ -24,7 +24,13 @@ protocol SystemAudioCapturing: AnyObject {
     /// the stream that is current reports: a late error from one that was
     /// already stopped or replaced is dropped.
     var onError: (@MainActor (CaptureFailure) -> Void)? { get set }
-    func start() async throws
+    /// Called on the main actor after each start with what the user should know
+    /// about it, or nil when there is nothing: capture works, but not exactly as
+    /// asked (the chosen app was not running, so every app is heard).
+    var onNotice: (@MainActor (String?) -> Void)? { get set }
+    /// Listens to the app with this bundle identifier when it is running, and to
+    /// every app when it is nil or the app is not running.
+    func start(application bundleID: String?) async throws
     func stop() async
 }
 

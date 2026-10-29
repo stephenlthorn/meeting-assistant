@@ -87,6 +87,7 @@ final class AssistantController {
     @ObservationIgnored private let themMeter: AudioMeter
     @ObservationIgnored private let youMeter: AudioMeter
     @ObservationIgnored private var speakerNotices: [Speaker: String] = [:]
+    @ObservationIgnored private var captureNotice: String?
     @ObservationIgnored private var backendName = ""
     @ObservationIgnored private var session = 0
     @ObservationIgnored private var drainingSession: Int?
@@ -246,7 +247,7 @@ final class AssistantController {
         lifecycle = Task { [weak self, systemAudio] in
             await previous?.value
             do {
-                try await systemAudio.start()
+                try await systemAudio.start(application: self?.settings.captureAppBundleID)
                 guard let self, self.session == current else {
                     await systemAudio.stop()
                     return
@@ -318,6 +319,10 @@ final class AssistantController {
         case .reconnecting: break
         case .off, .pending, .failed: watchdogs[speaker] = nil
         }
+        if speaker == .them, state == .failed, captureNotice != nil {
+            captureNotice = nil
+            refreshNotice()
+        }
     }
 
     private func listeningStatus() -> String {
@@ -368,6 +373,11 @@ final class AssistantController {
         microphone.onRecovered = { [weak self] in
             self?.microphoneRecovered(session: current)
         }
+        systemAudio.onNotice = { [weak self] message in
+            guard let self, self.session == current else { return }
+            self.captureNotice = message
+            self.refreshNotice()
+        }
     }
 
     private func systemAudioStopped(_ failure: CaptureFailure, session current: Int) {
@@ -406,7 +416,7 @@ final class AssistantController {
             guard let self, self.isRecovering(session: current, recovery: recovery) else { return }
             await systemAudio.stop()
             do {
-                try await systemAudio.start()
+                try await systemAudio.start(application: self.settings.captureAppBundleID)
                 guard self.session == current, self.themSide == .reconnecting else {
                     await systemAudio.stop()
                     return
@@ -658,13 +668,19 @@ final class AssistantController {
     /// download does not wipe the other's, and the same text is shown once.
     private func setNotice(_ message: String?, from speaker: Speaker) {
         speakerNotices[speaker] = message
-        let shown = [Speaker.them, .you].compactMap { speakerNotices[$0] }
+        refreshNotice()
+    }
+
+    /// What capture says about itself comes first, then each side's speech notice.
+    private func refreshNotice() {
+        let shown = [captureNotice].compactMap { $0 } + [Speaker.them, .you].compactMap { speakerNotices[$0] }
         notice = shown.isEmpty ? nil : shown.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
             .joined(separator: "\n")
     }
 
     private func clearNotices() {
         speakerNotices = [:]
+        captureNotice = nil
         notice = nil
     }
 
