@@ -78,7 +78,7 @@ struct Transcript {
             index = turns.count - 1
         }
         openTurns[key] = segment.isFinal ? nil : index
-        refreshEchoFlags(at: time)
+        refreshEchoFlags(updated: index)
         commitFinishedTurns()
         let turn = turns[index]
         return segment.isFinal && turn.isVisible ? turn : nil
@@ -104,16 +104,24 @@ struct Transcript {
 
     // MARK: - Echo
 
-    /// Uncommitted "You" turns are re-checked on every update, so an echo is
-    /// caught whichever recognizer reports first.
-    private mutating func refreshEchoFlags(at time: Date) {
-        let recentThem = turns.suffix(Transcript.echoLookback)
-            .filter { $0.speaker == .them && time.timeIntervalSince($0.updatedAt) <= Transcript.echoWindow }
+    /// A "You" turn is checked against what "Them" said around the time of its
+    /// own latest update, and is re-checked while it is still being spoken (so an
+    /// echo is caught whichever recognizer reports first). Once it is final the
+    /// decision is frozen: words "Them" says afterwards must not make a genuine
+    /// "You" line vanish, and time passing must not bring an echo back.
+    private mutating func refreshEchoFlags(updated index: Int) {
+        for candidate in committedCount..<turns.count
+        where turns[candidate].speaker == .you && (candidate == index || !turns[candidate].isFinal) {
+            turns[candidate].isEcho = isEcho(turns[candidate])
+        }
+    }
+
+    private func isEcho(_ turn: Turn) -> Bool {
+        let nearbyThem = turns.suffix(Transcript.echoLookback)
+            .filter { $0.speaker == .them && abs(turn.updatedAt.timeIntervalSince($0.updatedAt)) <= Transcript.echoWindow }
             .map(\.text)
             .joined(separator: " ")
-        for index in committedCount..<turns.count where turns[index].speaker == .you {
-            turns[index].isEcho = EchoDetector.isLikelyEcho(turns[index].text, of: recentThem)
-        }
+        return EchoDetector.isLikelyEcho(turn.text, of: nearbyThem)
     }
 }
 
