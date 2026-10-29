@@ -30,7 +30,9 @@ final class AppSettings: ObservableObject {
 
     private static let anthropicAccount = "anthropic_api_key"
     private static let deepgramAccount = "deepgram_api_key"
-    private static let preferenceKeys = ["model", "profile", "extraInstructions", "autoAnswer", "useCloudSTT"]
+    /// `useCloudSTT` is left out on purpose: it only means something next to
+    /// `cloudAudioAccepted`, which is the user's consent and is never copied.
+    private static let preferenceKeys = ["model", "profile", "extraInstructions", "autoAnswer"]
 
     let availableModels = ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
 
@@ -68,13 +70,16 @@ final class AppSettings: ObservableObject {
         profile = defaults.string(forKey: "profile").flatMap(Profile.init(rawValue:)) ?? .general
         extraInstructions = defaults.string(forKey: "extraInstructions") ?? ""
         autoAnswer = defaults.bool(forKey: "autoAnswer")
-        useCloudSTT = defaults.bool(forKey: "useCloudSTT")
+        let agreedToCloudAudio = defaults.bool(forKey: "cloudAudioAccepted")
+        cloudAudioAccepted = agreedToCloudAudio
+        // A switch left on without the agreement behind it (an earlier migration
+        // could do this) is not in effect, so it must not read as on.
+        useCloudSTT = defaults.bool(forKey: "useCloudSTT") && agreedToCloudAudio
         answerHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "answerHotKey"), in: HotKeyCombo.answerChoices)
         overlayHotKey = HotKeyCombo.choice(labeled: defaults.string(forKey: "overlayHotKey"),
                                            in: HotKeyCombo.overlayChoices)
         showsOverlay = defaults.object(forKey: "showsOverlay") as? Bool ?? true
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
-        cloudAudioAccepted = defaults.bool(forKey: "cloudAudioAccepted")
         refreshKeySources()
     }
 

@@ -13,7 +13,7 @@ overlay while the conversation is still happening.
   transcript excerpt behind a question goes to Claude, with your own API key.
 - **No bot joins the call.** Nothing appears in the participant list, and it works
   with any app that plays sound.
-- **Help while it's still useful.** Press ⌘⇧Space for suggestions, or let auto-answer
+- **Help while it's still useful.** Press ⌃⌥Space for suggestions, or let auto-answer
   respond whenever the other side asks a question.
 - **Free and open source** under the MIT license. Bring your own Anthropic API key;
   there is no subscription.
@@ -65,8 +65,8 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 - **Settings** (menu bar icon, then Settings…): API key in the macOS Keychain, model
   (Haiku / Sonnet / Opus), profile, extra instructions, shortcuts, privacy, and
   links to the macOS permissions.
-- Global shortcuts, changeable in Settings: ⌘⇧Space to answer, ⌘⇧H to show or hide
-  the overlay. The overlay remembers where you dragged it.
+- Global shortcuts, changeable in Settings: ⌃⌥Space to answer, ⌃⌥H to show or hide
+  the overlay (Control-Option, so they do not collide with Home in Finder and browsers). The overlay remembers where you dragged it.
 
 ## Download
 

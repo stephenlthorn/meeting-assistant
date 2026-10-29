@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import XCTest
 
 @MainActor
@@ -18,7 +19,7 @@ final class AppSettingsTests: XCTestCase {
         first.profile = .sales
         first.extraInstructions = "Mention SOC 2."
         first.autoAnswer = true
-        first.useCloudSTT = true
+        first.acceptCloudAudio()
 
         let second = makeSettings(defaults: defaults)
 
@@ -140,11 +141,30 @@ final class AppSettingsTests: XCTestCase {
 
     // MARK: - Shortcuts and overlay
 
-    func testShortcutsStartAsCommandShiftSpaceAndCommandShiftH() {
+    func testShortcutsStartAsControlOptionSpaceAndControlOptionH() {
         let settings = makeSettings()
 
-        XCTAssertEqual(settings.answerHotKey.label, "⌘⇧Space")
+        XCTAssertEqual(settings.answerHotKey.label, "⌃⌥Space")
+        XCTAssertEqual(settings.overlayHotKey.label, "⌃⌥H")
+    }
+
+    func testNoDefaultShortcutShadowsACommandShiftShortcutOtherAppsUse() {
+        let settings = makeSettings()
+
+        for combo in [settings.answerHotKey, settings.overlayHotKey] {
+            XCTAssertEqual(combo.modifiers, UInt32(controlKey | optionKey), combo.label)
+        }
+    }
+
+    func testAShortcutSavedBeforeTheDefaultsChangedIsKept() {
+        let defaults = freshDefaults()
+        defaults.set("⌘⇧H", forKey: "overlayHotKey")
+        defaults.set("⌘⇧Space", forKey: "answerHotKey")
+
+        let settings = makeSettings(defaults: defaults)
+
         XCTAssertEqual(settings.overlayHotKey.label, "⌘⇧H")
+        XCTAssertEqual(settings.answerHotKey.label, "⌘⇧Space")
     }
 
     func testChosenShortcutsPersist() {
@@ -243,6 +263,26 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(settings.autoAnswer)
         XCTAssertEqual(settings.resolveAPIKey(), "sk-legacy")
         XCTAssertNil(legacySecrets.values["anthropic_api_key"])
+    }
+
+    func testMigrationDoesNotTurnOnDeepgramWithoutTheUserAgreeingToIt() {
+        let legacyDefaults = freshDefaults()
+        legacyDefaults.set(true, forKey: "useCloudSTT")
+        let defaults = freshDefaults()
+
+        AppSettings.migrateLegacySettings(from: legacyDefaults, legacySecrets: InMemorySecretStore(),
+                                          to: defaults, secrets: InMemorySecretStore())
+        let settings = makeSettings(defaults: defaults)
+
+        XCTAssertFalse(settings.useCloudSTT)
+        XCTAssertFalse(settings.cloudAudioAccepted)
+    }
+
+    func testADeepgramSwitchLeftOnWithoutAgreementIsShownOff() {
+        let defaults = freshDefaults()
+        defaults.set(true, forKey: "useCloudSTT")
+
+        XCTAssertFalse(makeSettings(defaults: defaults).useCloudSTT)
     }
 
     func testMigrationNeverOverwritesNewerSettings() {

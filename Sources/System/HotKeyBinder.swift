@@ -4,18 +4,22 @@ import Foundation
 extension HotKeyCombo: Identifiable {
     var id: String { label }
 
+    /// The first choice is the default. Control-Option combinations lead because
+    /// no common app uses them; Command-Shift ones stay selectable (and keep
+    /// working for anyone who saved one) but shadow things like Home in Finder
+    /// and browsers, so they are not the default.
     static let answerChoices = [
-        HotKeyCombo(keyCode: UInt32(kVK_Space), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧Space"),
         HotKeyCombo(keyCode: UInt32(kVK_Space), modifiers: UInt32(controlKey | optionKey), label: "⌃⌥Space"),
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧A"),
         HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(controlKey | optionKey), label: "⌃⌥A"),
+        HotKeyCombo(keyCode: UInt32(kVK_Space), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧Space"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧A"),
     ]
 
     static let overlayChoices = [
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧H"),
         HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(controlKey | optionKey), label: "⌃⌥H"),
-        HotKeyCombo(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧O"),
         HotKeyCombo(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(controlKey | optionKey), label: "⌃⌥O"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧H"),
+        HotKeyCombo(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(cmdKey | shiftKey), label: "⌘⇧O"),
     ]
 
     /// The choice saved under `label`, or the first choice when it is unknown.
