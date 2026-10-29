@@ -38,3 +38,23 @@ struct LifecycleHarness {
         }
     }
 }
+
+/// Like `ManualScheduler`, but safe to call from background tasks.
+final class ThreadSafeScheduler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [(delay: TimeInterval, work: () -> Void)] = []
+
+    var delays: [TimeInterval] { lock.withLock { pending.map(\.delay) } }
+
+    func schedule(_ delay: TimeInterval, _ work: @escaping () -> Void) {
+        lock.withLock { pending.append((delay, work)) }
+    }
+
+    func fireAll() {
+        let due = lock.withLock { () -> [(delay: TimeInterval, work: () -> Void)] in
+            defer { pending = [] }
+            return pending
+        }
+        due.forEach { $0.work() }
+    }
+}
