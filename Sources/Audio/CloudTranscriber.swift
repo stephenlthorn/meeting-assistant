@@ -6,6 +6,8 @@ protocol WebSocketConnection: AnyObject {
     func send(_ message: URLSessionWebSocketTask.Message, completion: @escaping (Error?) -> Void)
     func receive(_ completion: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void)
     func close()
+    /// The HTTP status of a refused upgrade request (401 for a bad key), once the server has answered.
+    var handshakeStatusCode: Int? { get }
 }
 
 /// Optional cloud streaming STT via Deepgram. Sends 16 kHz mono linear16 PCM
@@ -19,6 +21,7 @@ protocol WebSocketConnection: AnyObject {
 final class CloudTranscriber: LiveTranscriber {
     static let keepAliveInterval: TimeInterval = 4
     static let failuresBeforeReporting = 3
+    static let failuresBeforeGivingUp = 10
     private static let maximumBackoff: TimeInterval = 15
     private static let keepAliveMessage = #"{"type":"KeepAlive"}"#
     private static let closeMessage = #"{"type":"CloseStream"}"#
@@ -46,6 +49,8 @@ final class CloudTranscriber: LiveTranscriber {
     private var failures = 0
     private var lastSent = Date.distantPast
     private var utterance = 0
+    private var confirmedText = ""
+    private var shownText = ""
     private var converter: AVAudioConverter?
 
     init(apiKey: String,
@@ -134,9 +139,20 @@ final class CloudTranscriber: LiveTranscriber {
     }
 
     private func dropped(_ error: Error) {
+        let status = connection?.handshakeStatusCode
         connection?.close()
         connection = nil
+        finishOpenUtterance()
+        if let message = Self.refusalMessage(forStatus: status) {
+            giveUp(message)
+            return
+        }
         failures += 1
+        guard failures < Self.failuresBeforeGivingUp else {
+            giveUp("Deepgram couldn't be reached after \(failures) tries: \(error.localizedDescription). "
+                   + "Stop listening and start again to retry.")
+            return
+        }
         if !reconnecting {
             reconnecting = true
             notify("Reconnecting to Deepgram…")
@@ -149,6 +165,26 @@ final class CloudTranscriber: LiveTranscriber {
         schedule(delay) { [weak self] in
             self?.queue.async { self?.reconnect(after: droppedGeneration) }
         }
+    }
+
+    /// A rejected key or an unpaid account will not fix itself, so retrying
+    /// only hides the real problem behind "reconnecting".
+    private static func refusalMessage(forStatus status: Int?) -> String? {
+        guard let status else { return nil }
+        switch status {
+        case 401, 403: return "Deepgram rejected the API key (\(status)). Check it in Settings."
+        case 402: return "Deepgram says this account needs payment or credit (402). Check your Deepgram billing."
+        default: return nil
+        }
+    }
+
+    private func giveUp(_ message: String) {
+        running = false
+        if reconnecting {
+            reconnecting = false
+            notify(nil)
+        }
+        report(message)
     }
 
     private func reconnect(after droppedGeneration: Int) {
@@ -181,6 +217,7 @@ final class CloudTranscriber: LiveTranscriber {
             URLQueryItem(name: "interim_results", value: "true"),
             URLQueryItem(name: "smart_format", value: "true"),
             URLQueryItem(name: "punctuate", value: "true"),
+            URLQueryItem(name: "utterance_end_ms", value: "1000"),
             URLQueryItem(name: "language", value: localeIdentifier),
         ]
         var request = URLRequest(url: components.url!)
@@ -197,15 +234,47 @@ final class CloudTranscriber: LiveTranscriber {
         case .string(let value): data = value.data(using: .utf8)
         @unknown default: data = nil
         }
-        guard let data,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let channel = object["channel"] as? [String: Any],
+        guard let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if object["type"] as? String == "UtteranceEnd" {
+            finishOpenUtterance()
+        } else {
+            handleResults(object)
+        }
+    }
+
+    /// Deepgram's `is_final` only means this chunk of words will not change; the
+    /// speaker may be mid-sentence. The utterance ends at `speech_final` (or an
+    /// UtteranceEnd message), so confirmed chunks accumulate until then and are
+    /// shown as one growing, not yet final, utterance.
+    private func handleResults(_ object: [String: Any]) {
+        guard let channel = object["channel"] as? [String: Any],
               let alternatives = channel["alternatives"] as? [[String: Any]],
               let transcript = alternatives.first?["transcript"] as? String else { return }
         let isFinal = (object["is_final"] as? Bool) ?? false
-        guard !transcript.isEmpty || isFinal else { return }
-        let segment = TranscriptSegment(utterance: utterance, text: transcript, isFinal: isFinal)
-        if isFinal { utterance += 1 }
+        let endsUtterance = (object["speech_final"] as? Bool) ?? false
+        let text = [confirmedText, transcript.trimmingCharacters(in: .whitespacesAndNewlines)]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        if isFinal { confirmedText = text }
+        guard !text.isEmpty || (endsUtterance && !shownText.isEmpty) else { return }
+        emit(text, isFinal: endsUtterance)
+    }
+
+    /// Ends whatever utterance is open with the words confirmed so far.
+    private func finishOpenUtterance() {
+        guard !shownText.isEmpty else { return }
+        emit(confirmedText.isEmpty ? shownText : confirmedText, isFinal: true)
+    }
+
+    private func emit(_ text: String, isFinal: Bool) {
+        let segment = TranscriptSegment(utterance: utterance, text: text, isFinal: isFinal)
+        if isFinal {
+            utterance += 1
+            confirmedText = ""
+            shownText = ""
+        } else {
+            shownText = text
+        }
         let onSegment = self.onSegment
         deliverOnMain { onSegment?(segment) }
     }
@@ -274,5 +343,9 @@ final class URLSessionWebSocketConnection: WebSocketConnection {
 
     func close() {
         task.cancel(with: .goingAway, reason: nil)
+    }
+
+    var handshakeStatusCode: Int? {
+        (task.response as? HTTPURLResponse)?.statusCode
     }
 }
