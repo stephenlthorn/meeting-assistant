@@ -63,6 +63,167 @@ final class AssistantControllerPrivacyTests: XCTestCase {
         XCTAssertTrue(request?.system.contains("untrusted") ?? false)
     }
 
+    // MARK: - Settings that change mid-call (AUD-5)
+
+    func testTurningDeepgramOffMidCallStopsItsAudioAndMovesToOnDeviceSpeech() async {
+        let h = makeHarness(configure: allowDeepgram)
+        h.transcribers.backendName = "Deepgram"
+        await startListening(h)
+        let cloudThem = h.transcribers.latest(.them)
+        let cloudYou = h.transcribers.latest(.you)
+        h.systemAudio.onBuffer?(silentBuffer())
+        XCTAssertEqual(cloudThem?.appended, 1)
+
+        h.transcribers.backendName = "on-device"
+        h.settings.useCloudSTT = false
+        await eventually { h.transcribers.made.count == 4 }
+
+        XCTAssertEqual(cloudThem?.stops, 1)
+        XCTAssertEqual(cloudYou?.stops, 1)
+        let onDeviceThem = h.transcribers.latest(.them)
+        XCTAssertEqual(onDeviceThem?.starts, 1)
+        XCTAssertEqual(h.transcribers.latest(.you)?.starts, 1)
+        h.systemAudio.onBuffer?(silentBuffer())
+        h.microphone.onBuffer?(silentBuffer())
+        XCTAssertEqual(cloudThem?.appended, 1)
+        XCTAssertEqual(cloudYou?.appended, 0)
+        XCTAssertEqual(onDeviceThem?.appended, 1)
+        XCTAssertEqual(h.transcribers.latest(.you)?.appended, 1)
+        XCTAssertEqual(h.controller.status, "Listening (on-device)")
+        XCTAssertEqual(h.controller.listening, .listening)
+    }
+
+    func testRemovingTheDeepgramKeyMidCallStopsItsAudio() async {
+        let h = makeHarness(configure: allowDeepgram)
+        h.transcribers.backendName = "Deepgram"
+        await startListening(h)
+        let cloudThem = h.transcribers.latest(.them)
+
+        h.transcribers.backendName = "on-device"
+        h.settings.removeDeepgramKey()
+        await eventually { h.transcribers.made.count == 4 }
+
+        XCTAssertEqual(cloudThem?.stops, 1)
+        h.systemAudio.onBuffer?(silentBuffer())
+        XCTAssertEqual(cloudThem?.appended, 0)
+    }
+
+    func testWithdrawingAgreementToDeepgramMidCallStopsItsAudio() async {
+        let h = makeHarness(configure: allowDeepgram)
+        h.transcribers.backendName = "Deepgram"
+        await startListening(h)
+        let cloudThem = h.transcribers.latest(.them)
+
+        h.transcribers.backendName = "on-device"
+        h.settings.withdrawTerms()
+        await eventually { h.transcribers.made.count == 4 }
+
+        XCTAssertEqual(cloudThem?.stops, 1)
+    }
+
+    func testRevokingAppleServersMidCallRestartsTranscriptionWithoutThem() async {
+        useTheOlderSpeechEngine()
+        let h = makeHarness { $0.acceptServerSpeech() }
+        await startListening(h)
+        let first = h.transcribers.latest(.them)
+
+        h.settings.revokeServerSpeech()
+        await eventually { h.transcribers.made.count == 4 }
+
+        XCTAssertEqual(first?.stops, 1)
+        XCTAssertEqual(h.transcribers.latest(.them)?.starts, 1)
+        h.systemAudio.onBuffer?(silentBuffer())
+        XCTAssertEqual(first?.appended, 0)
+        XCTAssertEqual(h.transcribers.latest(.them)?.appended, 1)
+    }
+
+    func testTurningDeepgramOnMidCallWaitsForTheNextSession() async {
+        let h = makeHarness()
+        await startListening(h)
+
+        h.settings.setDeepgramKey("dg-key")
+        h.settings.acceptCloudAudio()
+        await settle()
+
+        XCTAssertEqual(h.transcribers.made.count, 2)
+        XCTAssertEqual(h.transcribers.latest(.them)?.stops, 0)
+    }
+
+    func testSettingsThatDoNotTouchSpeechLeaveTheTranscribersAlone() async {
+        let h = makeHarness()
+        await startListening(h)
+
+        h.settings.model = "claude-sonnet-5"
+        h.settings.profile = .sales
+        h.settings.autoAnswer = true
+        await settle()
+
+        XCTAssertEqual(h.transcribers.made.count, 2)
+        XCTAssertEqual(h.transcribers.latest(.them)?.stops, 0)
+        XCTAssertEqual(h.transcribers.latest(.you)?.stops, 0)
+    }
+
+    func testNothingRestartsWhenNotListening() async {
+        let h = makeHarness(configure: allowDeepgram)
+
+        h.settings.useCloudSTT = false
+        await settle()
+
+        XCTAssertTrue(h.transcribers.made.isEmpty)
+    }
+
+    func testTheTranscriptCarriesOnAcrossTheSwitchWithoutMixingUtterances() async {
+        let h = makeHarness(configure: allowDeepgram)
+        h.transcribers.backendName = "Deepgram"
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("Old words", utterance: 0, isFinal: false)
+
+        h.settings.useCloudSTT = false
+        await eventually { h.transcribers.made.count == 4 }
+        h.transcribers.latest(.them)?.emit("New words", utterance: 0, isFinal: true)
+
+        XCTAssertEqual(h.controller.transcriptText, "Them: Old words New words")
+    }
+
+    func testIfSpeechPermissionIsRefusedAfterTheSwitchListeningStopsAndSaysWhy() async {
+        let h = makeHarness(configure: allowDeepgram)
+        h.transcribers.backendName = "Deepgram"
+        await startListening(h)
+
+        h.transcribers.backendName = "on-device"
+        h.transcribers.grantsAuthorization = false
+        h.settings.useCloudSTT = false
+
+        await eventually { h.controller.listening == .idle }
+        XCTAssertEqual(h.controller.problems.map(\.fix), [.speechRecognition])
+        XCTAssertFalse(h.microphone.isRunning)
+        await eventually { h.systemAudio.events.last == "stopped" }
+    }
+
+    func testASwitchDuringStartupIsAppliedOnceListeningBegins() async {
+        let h = makeHarness(configure: allowDeepgram)
+        h.transcribers.backendName = "Deepgram"
+        h.systemAudio.holdsStart = true
+        h.microphone.authorized = false
+        h.controller.start()
+        await eventually { h.systemAudio.events == ["start"] }
+        XCTAssertEqual(h.controller.listening, .starting)
+
+        h.transcribers.backendName = "on-device"
+        h.settings.useCloudSTT = false
+        await settle()
+        h.scheduler.fireAll()
+        await settle()
+        XCTAssertEqual(h.transcribers.made.count, 2)
+
+        h.systemAudio.releaseStart()
+        await eventually { h.controller.listening == .listening }
+        h.scheduler.fireAll()
+
+        await eventually { h.transcribers.made.count == 3 }
+        XCTAssertEqual(h.transcribers.latest(.them)?.starts, 1)
+    }
+
     // MARK: - Harness
 
     private struct Harness {
@@ -90,6 +251,18 @@ final class AssistantControllerPrivacyTests: XCTestCase {
         return Harness(controller: controller, settings: settings, systemAudio: systemAudio,
                        microphone: microphone, transcribers: transcribers, answerer: answerer,
                        scheduler: scheduler)
+    }
+
+    private func allowDeepgram(_ settings: AppSettings) {
+        settings.setDeepgramKey("dg-key")
+        settings.acceptCloudAudio()
+    }
+
+    /// Plays macOS 14-15, where SFSpeechRecognizer (which may use Apple's servers) is the engine.
+    private func useTheOlderSpeechEngine() {
+        let original = TranscriberFactory.analyzerAvailable
+        TranscriberFactory.analyzerAvailable = false
+        addTeardownBlock { @MainActor in TranscriberFactory.analyzerAvailable = original }
     }
 
     private func startListening(_ h: Harness, file: StaticString = #filePath, line: UInt = #line) async {
