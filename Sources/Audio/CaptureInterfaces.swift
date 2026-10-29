@@ -41,6 +41,11 @@ protocol MicrophoneCapturing: AnyObject {
     func requestAuthorization(_ completion: @escaping (Bool) -> Void)
     func start() throws
     func stop()
+    /// Tears the capture down and builds it again, as if the input device had
+    /// changed: for a microphone that is armed but delivers nothing. A failed
+    /// attempt retries with the same backoff and reports through `onError` and
+    /// `onRecovered`. Does nothing unless the microphone is running.
+    @MainActor func reconnect()
 }
 
 enum SystemAudioError: LocalizedError, Equatable {

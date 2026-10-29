@@ -109,8 +109,11 @@ final class FakeMicrophone: MicrophoneCapturing {
     var startError: Error?
     private(set) var starts = 0
     private(set) var isRunning = false
+    @MainActor private(set) var reconnects = 0
 
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) { completion(authorized) }
+
+    @MainActor func reconnect() { reconnects += 1 }
 
     func start() throws {
         if let startError { throw startError }

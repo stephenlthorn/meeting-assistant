@@ -186,6 +186,49 @@ final class MicCaptureTests: XCTestCase {
         await eventually { h.scheduler.delays == [2] }
     }
 
+    // MARK: - Reconnecting on request (M1)
+
+    func testReconnectingRebuildsTheTapLikeADeviceChange() throws {
+        let engine = FakeAudioInputEngine()
+        let mic = MicCapture(engine: engine)
+        try mic.start()
+
+        mic.reconnect()
+
+        XCTAssertEqual(engine.tapInstalls, 2)
+        XCTAssertEqual(engine.starts, 2)
+        XCTAssertEqual(engine.overlappingTapInstalls, 0)
+        XCTAssertTrue(engine.hasTap)
+    }
+
+    func testAReconnectThatFailsRetriesWithTheSameBackoff() async throws {
+        let engine = FakeAudioInputEngine()
+        let h = MicHarness(engine: engine)
+        try h.mic.start()
+        engine.startError = TestFailure(message: "Device busy")
+
+        h.mic.reconnect()
+
+        XCTAssertEqual(h.scheduler.delays, [1])
+        engine.startError = nil
+        h.scheduler.fireAll()
+        await eventually { engine.starts == 2 && engine.hasTap }
+        XCTAssertTrue(h.errors.isEmpty)
+    }
+
+    func testReconnectingAMicrophoneThatIsNotRunningDoesNothing() throws {
+        let engine = FakeAudioInputEngine()
+        let mic = MicCapture(engine: engine)
+
+        mic.reconnect()
+        XCTAssertEqual(engine.tapInstalls, 0)
+
+        try mic.start()
+        mic.stop()
+        mic.reconnect()
+        XCTAssertEqual(engine.tapInstalls, 1)
+    }
+
     func testStoppingCancelsAPendingRetry() async throws {
         let engine = FakeAudioInputEngine()
         let h = MicHarness(engine: engine)
