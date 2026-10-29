@@ -43,9 +43,12 @@ final class AssistantController {
     static let promptCharacters = 4_000
     static let autoAnswerInterval: TimeInterval = 6
     static let defaultDrainWindow: TimeInterval = 2
+    /// How often the transcript is written to disk while saving is on.
+    static let archiveInterval: TimeInterval = 30
     /// Waits before each attempt to restart system audio; when they run out, it gives up.
     static let systemAudioRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15, 15]
     private static let maxProblems = 3
+    private static let trimmedAndSavedNote = "[earlier lines trimmed - they are in your saved transcript file]"
 
     private(set) var listening: ListeningState = .idle
     private(set) var status = "Idle"
@@ -56,7 +59,11 @@ final class AssistantController {
     private(set) var isAnswering = false
 
     var isListening: Bool { listening != .idle }
-    var transcriptText: String { transcript.text }
+    /// The transcript for Copy Transcript. Once a long call trimmed its early
+    /// lines it starts with a marker, which says where they are if they were saved.
+    var transcriptText: String {
+        transcript.text(trimmedNote: archive == nil ? Transcript.trimmedMarker : Self.trimmedAndSavedNote)
+    }
 
     /// Asked to show the privacy terms; call the closure once they are accepted.
     @ObservationIgnored var onTermsNeeded: ((@escaping () -> Void) -> Void)?
@@ -72,6 +79,7 @@ final class AssistantController {
     @ObservationIgnored private let schedule: (TimeInterval, @escaping () -> Void) -> Void
     @ObservationIgnored private let sampleWordDelay: TimeInterval
     @ObservationIgnored private let drainWindow: TimeInterval
+    @ObservationIgnored private let transcriptFiles: TranscriptFileStoring
 
     @ObservationIgnored private let themSlot = TranscriberSlot()
     @ObservationIgnored private let youSlot = TranscriberSlot()
@@ -91,6 +99,10 @@ final class AssistantController {
     @ObservationIgnored private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
 
     @ObservationIgnored private var transcript = Transcript()
+    @ObservationIgnored private var archive: TranscriptArchive?
+    @ObservationIgnored private var archiveProblem: Problem?
+    @ObservationIgnored private var sessionStartedAt: Date?
+    @ObservationIgnored private let markdown = TranscriptMarkdown()
     @ObservationIgnored private var clearedThrough: [Speaker: Int] = [:]
     @ObservationIgnored private var answerTask: Task<Void, Never>?
     @ObservationIgnored private var answerRequest = 0
@@ -106,6 +118,7 @@ final class AssistantController {
          schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
          sampleWordDelay: TimeInterval = 0.04,
          drainWindow: TimeInterval = AssistantController.defaultDrainWindow,
+         transcriptFiles: TranscriptFileStoring = DiskTranscriptFiles(),
          workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
          notifications: NotificationCenter = .default) {
         self.settings = settings
@@ -117,6 +130,7 @@ final class AssistantController {
         self.schedule = schedule
         self.sampleWordDelay = sampleWordDelay
         self.drainWindow = drainWindow
+        self.transcriptFiles = transcriptFiles
         systemAudio.onBuffer = { [themSlot] buffer in themSlot.append(buffer) }
         microphone.onBuffer = { [youSlot] buffer in youSlot.append(buffer) }
         observeEnvironment(workspace: workspaceNotifications, screens: notifications)
@@ -157,6 +171,7 @@ final class AssistantController {
         themRecovery += 1
         clearNotices()
         resetTranscriptAndAnswer()
+        beginArchive()
         beginPrivacySession()
         watchCapture(session: current)
 
@@ -184,6 +199,7 @@ final class AssistantController {
         listening = .idle
         status = "Stopped"
         clearNotices()
+        flushArchive()
         if hadTranscribers { drain(stopped) }
     }
 
@@ -193,7 +209,11 @@ final class AssistantController {
     private func drain(_ stopped: Int) {
         drainingSession = stopped
         schedule(drainWindow) { [weak self] in
-            deliverOnMain { if self?.drainingSession == stopped { self?.drainingSession = nil } }
+            deliverOnMain {
+                guard self?.drainingSession == stopped else { return }
+                self?.drainingSession = nil
+                self?.flushArchive()
+            }
         }
     }
 
@@ -530,12 +550,14 @@ final class AssistantController {
         let seen = Dictionary(uniqueKeysWithValues: [Speaker.them, .you].compactMap { speaker in
             transcript.highestUtterance(of: speaker).map { (speaker, $0) }
         })
+        keepWhatWasSaved()
         resetTranscriptAndAnswer()
         clearedThrough = seen
     }
 
     private func resetTranscriptAndAnswer() {
         transcript = Transcript()
+        transcript.collectsCommitted = archive != nil
         clearedThrough = [:]
         transcriptDisplay = ""
         answerTask?.cancel()
@@ -548,9 +570,102 @@ final class AssistantController {
         guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
+        archive?.append(transcript.collectCommitted())
         guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
         autoAnswerIfDue()
+    }
+
+    // MARK: - Saved transcript
+
+    /// Decided once per Start: with saving on, this call gets a file. Turning
+    /// saving on in the middle of a call waits for the next Start.
+    private func beginArchive() {
+        sessionStartedAt = now()
+        archive = nil
+        guard settings.saveTranscripts else {
+            transcript.collectsCommitted = false
+            return
+        }
+        archive = TranscriptArchive(folder: settings.transcriptFolder, started: now(), files: transcriptFiles,
+                                    format: markdown)
+        transcript.collectsCommitted = true
+        scheduleArchiveFlush(session: session)
+    }
+
+    private func endArchive() {
+        archive = nil
+        transcript.collectsCommitted = false
+    }
+
+    private func scheduleArchiveFlush(session current: Int) {
+        schedule(Self.archiveInterval) { [weak self] in
+            deliverOnMain { self?.archiveFlushDue(session: current) }
+        }
+    }
+
+    private func archiveFlushDue(session current: Int) {
+        guard session == current, isListening else { return }
+        flushArchive()
+        scheduleArchiveFlush(session: current)
+    }
+
+    /// Writes the transcript so far. Turning saving off stops writing at once.
+    private func flushArchive() {
+        guard let archive else { return }
+        guard settings.saveTranscripts else {
+            endArchive()
+            return
+        }
+        archive.append(transcript.collectCommitted())
+        archive.flush(snapshot: transcript.uncommittedTurns)
+        showSaveProblem(archive.lastError)
+    }
+
+    /// Clearing the overlay's transcript must not lose lines from the saved one.
+    private func keepWhatWasSaved() {
+        guard let archive, settings.saveTranscripts else { return }
+        archive.append(transcript.collectCommitted() + transcript.uncommittedTurns)
+        archive.flush(snapshot: [])
+        showSaveProblem(archive.lastError)
+    }
+
+    private func showSaveProblem(_ error: Error?) {
+        if let archiveProblem {
+            problems.removeAll { $0 == archiveProblem }
+            self.archiveProblem = nil
+        }
+        guard let error else { return }
+        let problem = Problem(message: "Couldn't save the transcript: \(error.localizedDescription)")
+        archiveProblem = problem
+        report(problem)
+    }
+
+    /// The file name Save Transcript... starts with.
+    var suggestedTranscriptFileName: String {
+        markdown.fileStem(started: sessionStartedAt ?? now()) + ".md"
+    }
+
+    /// Save Transcript...: writes this call's transcript to `url`, whether or not
+    /// saving is on. When early lines were trimmed and a saved file has them, the
+    /// whole file is copied; otherwise what is in memory is written, with a note
+    /// if it is not the whole call.
+    func saveTranscript(to url: URL) {
+        guard let started = sessionStartedAt, !transcript.isEmpty else { return }
+        let document = savedSessionDocument() ?? Data(markdown.document(
+            started: started, turns: transcript.visibleTurns,
+            trimmedNote: transcript.hasTrimmedText ? Transcript.trimmedMarker : nil).utf8)
+        do {
+            try transcriptFiles.replace(url, with: document)
+        } catch {
+            report(Problem(message: "Couldn't save the transcript: \(error.localizedDescription)"))
+        }
+    }
+
+    private func savedSessionDocument() -> Data? {
+        guard transcript.hasTrimmedText, let archive, settings.saveTranscripts else { return nil }
+        flushArchive()
+        return archive.contents()
     }
 
     // MARK: - Answers
@@ -625,7 +740,9 @@ final class AssistantController {
         status = "Sample meeting (nothing is recorded)"
         problems = []
         clearNotices()
+        endArchive()
         resetTranscriptAndAnswer()
+        sessionStartedAt = now()
         sampleAnswersShown = 0
         scheduleSampleLine(0, session: session)
     }

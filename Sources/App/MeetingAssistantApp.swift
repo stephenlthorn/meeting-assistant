@@ -10,7 +10,8 @@ struct MeetingAssistantApp: App {
         MenuBarExtra {
             MenuContent(controller: appDelegate.controller, settings: appDelegate.settings,
                         hotKeys: appDelegate.hotKeys, toggleOverlay: appDelegate.toggleOverlay,
-                        trySample: appDelegate.trySample, showWelcome: { appDelegate.showWelcome() })
+                        trySample: appDelegate.trySample, showWelcome: { appDelegate.showWelcome() },
+                        saveTranscript: appDelegate.saveTranscript)
         } label: {
             MenuBarIcon(controller: appDelegate.controller)
         }
@@ -62,6 +63,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         welcomeWindow?.close()
         if !settings.showsOverlay { toggleOverlay() }
         controller.startSample()
+    }
+
+    /// Save Transcript...: asks where, then writes this call's transcript there.
+    func saveTranscript() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = controller.suggestedTranscriptFileName
+        panel.directoryURL = settings.transcriptFolder
+        panel.canCreateDirectories = true
+        NSApp.activate()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        controller.saveTranscript(to: url)
     }
 
     /// Shows the welcome screen; `resume` runs once the terms are accepted.
@@ -129,6 +141,7 @@ struct MenuContent: View {
     let toggleOverlay: () -> Void
     let trySample: () -> Void
     let showWelcome: () -> Void
+    let saveTranscript: () -> Void
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
@@ -152,6 +165,8 @@ struct MenuContent: View {
         Button("Copy Answer") { Clipboard.copy(controller.answer) }
             .disabled(controller.answer.isEmpty)
         Button("Copy Transcript") { Clipboard.copy(controller.transcriptText) }
+            .disabled(controller.transcriptDisplay.isEmpty)
+        Button("Save Transcript…") { saveTranscript() }
             .disabled(controller.transcriptDisplay.isEmpty)
         Button("Clear Transcript") { controller.clearTranscript() }
 

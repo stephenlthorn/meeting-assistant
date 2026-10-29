@@ -103,6 +103,22 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section("Transcripts") {
+                Toggle("Save transcripts to a folder on this Mac", isOn: $settings.saveTranscripts)
+                HStack {
+                    Text((settings.transcriptFolder.path as NSString).abbreviatingWithTildeInPath)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Choose Folder…", action: chooseTranscriptFolder)
+                }
+                Text("Off by default. When on, each call is saved as a Markdown file every 30 seconds and when you stop, readable only by you. The files stay on this Mac. Turning it on applies from the next Start Listening; turning it off stops saving right away.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Privacy") {
                 Text(settings.hasAcceptedTerms
                      ? "You agreed to the privacy terms on the welcome screen."
@@ -172,6 +188,18 @@ struct SettingsView: View {
                     settings.revokeServerSpeech()
                 }
             })
+    }
+
+    private func chooseTranscriptFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose where Meeting Assistant saves transcripts."
+        panel.directoryURL = settings.transcriptFolder
+        if panel.runModal() == .OK, let url = panel.url { settings.transcriptFolder = url }
     }
 
     private func save(_ write: () -> Bool, clear: () -> Void) {

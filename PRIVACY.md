@@ -23,7 +23,8 @@ Capture only happens while you are listening; the menu bar icon shows a record s
 
 - Your API keys, in the macOS Keychain.
 - Preferences such as model, profile, extra instructions, shortcuts and the overlay's position, and whether you agreed to the privacy terms, to Deepgram and to Apple's speech servers.
-- Transcripts and answers stay in memory while the app runs and are gone when you quit, unless you copy them.
+- Transcripts and answers stay in memory while the app runs and are gone when you quit, unless you copy them, save them with "Save Transcript..." in the menu, or turn on saving (below). A very long call keeps only its most recent turns in memory; Copy Transcript then starts with a note that earlier lines were trimmed.
+- **Saved transcripts, only if you turn them on.** "Save transcripts" in Settings is off by default. When on, each call is written as a Markdown file with timestamps, every 30 seconds and when you stop, into `~/Documents/Meeting Assistant` or the folder you choose. The files are readable only by your macOS account, are never sent anywhere by Meeting Assistant, and are yours to move or delete. Turning it off stops saving immediately.
 
 ## The people you talk to
 

@@ -34,6 +34,7 @@ struct Transcript {
     struct Turn: Equatable {
         let speaker: Speaker
         let utterance: Int
+        let startedAt: Date
         var text: String
         var isFinal: Bool
         var isEcho: Bool
@@ -61,6 +62,13 @@ struct Transcript {
     private var committed = RenderedLines()
     private var highestUtterances: [Speaker: Int] = [:]
     private(set) var hasTrimmedText = false
+    private var uncollected: [Turn] = []
+
+    /// When on, every visible turn is also queued as it is committed (in
+    /// transcript order, echo decision frozen), for `collectCommitted`. Whoever
+    /// turns it on must collect regularly, or the queue grows; this is what lets
+    /// a trim drop lines that are already safely on disk.
+    var collectsCommitted = false
 
     init(limits: Limits = Limits()) {
         self.limits = limits
@@ -85,6 +93,18 @@ struct Transcript {
     var uncommittedTurnCount: Int { turns.count - committedCount }
 
     var retainedCharacterCount: Int { committed.count + pending.count }
+
+    /// Visible turns that were committed since the last call, oldest first.
+    mutating func collectCommitted() -> [Turn] {
+        defer { uncollected = [] }
+        return uncollected
+    }
+
+    /// Visible turns still waiting behind an open one, or open themselves.
+    var uncommittedTurns: [Turn] { turns[committedCount...].filter(\.isVisible) }
+
+    /// Every visible turn still in memory, oldest first.
+    var visibleTurns: [Turn] { turns.filter(\.isVisible) }
 
     /// The highest utterance number `speaker` has reported so far, if any.
     func highestUtterance(of speaker: Speaker) -> Int? {
@@ -122,7 +142,7 @@ struct Transcript {
             turns[index].updatedAt = time
         } else {
             guard !text.isEmpty else { return nil }
-            turns.append(Turn(speaker: speaker, utterance: segment.utterance, text: text,
+            turns.append(Turn(speaker: speaker, utterance: segment.utterance, startedAt: time, text: text,
                               isFinal: segment.isFinal, isEcho: false, updatedAt: time))
             index = turns.count - 1
             highestUtterances[speaker] = max(highestUtterances[speaker] ?? segment.utterance, segment.utterance)
@@ -149,7 +169,9 @@ struct Transcript {
     private mutating func commitFinishedTurns() {
         while true {
             while committedCount < turns.count, turns[committedCount].isFinal {
-                committed.append(turns[committedCount])
+                let turn = turns[committedCount]
+                committed.append(turn)
+                if collectsCommitted, turn.isVisible { uncollected.append(turn) }
                 committedCount += 1
             }
             guard uncommittedTurnCount > limits.maxUncommitted else { return }
