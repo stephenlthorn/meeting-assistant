@@ -420,12 +420,6 @@ final class AssistantController {
     }
 
     private static func userPrompt(_ context: String) -> String {
-        """
-        Live conversation transcript so far (You = me, Them = the other participants):
-
-        \(context)
-
-        Based on the latest exchange, give me help right now. Be concise.
-        """
+        AnswerPrompt.user(transcript: context)
     }
 }
