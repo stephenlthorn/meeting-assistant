@@ -493,6 +493,53 @@ final class CloudTranscriberTests: XCTestCase {
         XCTAssertEqual(h.notices.last, .some(nil))
     }
 
+    // MARK: - Fatal failures (M1)
+
+    func testAMissingKeyIsFatalAsWellAsReported() async {
+        let h = makeHarness(apiKey: "")
+
+        h.transcriber.start()
+        h.flush()
+
+        await eventually { !h.fatals.isEmpty }
+        XCTAssertEqual(h.fatals, ["Missing Deepgram API key."])
+    }
+
+    func testARejectedKeyIsFatalAsWellAsReported() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        h.sockets.latest?.handshakeStatusCode = 401
+        h.sockets.latest?.serverDrops()
+        h.flush()
+
+        await eventually { !h.fatals.isEmpty }
+        XCTAssertEqual(h.fatals, ["Deepgram rejected the API key (401). Check it in Settings."])
+        XCTAssertEqual(h.errors, h.fatals, "the same words are shown to the user")
+    }
+
+    func testReconnectingTroubleIsOnlyFatalOnceItGivesUp() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        for _ in 0..<(CloudTranscriber.failuresBeforeGivingUp - 1) {
+            h.sockets.latest?.serverDrops(TestFailure(message: "Socket is not connected"))
+            h.flush()
+            h.scheduler.fireAll()
+            h.flush()
+        }
+        await eventually { h.errors.count == 1 }
+        XCTAssertEqual(h.fatals, [], "keeps disconnecting is a warning: it is still retrying")
+
+        h.sockets.latest?.serverDrops(TestFailure(message: "Socket is not connected"))
+        h.flush()
+
+        await eventually { h.fatals.count == 1 }
+        XCTAssertTrue(h.fatals.first?.hasPrefix("Deepgram couldn't be reached after") ?? false)
+    }
+
     // MARK: - Harness
 
     private final class Harness {
@@ -503,6 +550,7 @@ final class CloudTranscriberTests: XCTestCase {
         let queue = DispatchQueue(label: "CloudTranscriberTests")
         var segments: [TranscriptSegment] = []
         var errors: [String] = []
+        var fatals: [String] = []
         var notices: [String?] = []
 
         init(apiKey: String) {
@@ -518,6 +566,7 @@ final class CloudTranscriberTests: XCTestCase {
         let h = Harness(apiKey: apiKey)
         h.transcriber.onSegment = { [weak h] in h?.segments.append($0) }
         h.transcriber.onError = { [weak h] in h?.errors.append($0) }
+        h.transcriber.onFatal = { [weak h] in h?.fatals.append($0) }
         h.transcriber.onNotice = { [weak h] in h?.notices.append($0) }
         return h
     }

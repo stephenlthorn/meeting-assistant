@@ -208,6 +208,33 @@ final class AnalyzerTranscriberTests: XCTestCase {
         XCTAssertEqual(h.gate.makes, 1)
     }
 
+    // MARK: - Fatal failures (M1)
+
+    func testALanguageWithNoModelIsFatal() async {
+        let h = makeHarness()
+        h.gate.error = AnalyzerSetupError.unsupportedLocale
+
+        h.transcriber.start()
+
+        await eventually { !h.fatals.isEmpty }
+        XCTAssertEqual(h.fatals, ["SpeechAnalyzer setup failed: SpeechAnalyzer has no model for this language."])
+    }
+
+    func testSetupTroubleThatIsStillBeingRetriedIsNotFatal() async {
+        let h = makeHarness()
+        h.gate.error = TestFailure(message: "Offline")
+
+        h.transcriber.start()
+        let attempts = AnalyzerTranscriber.failuresBeforeReporting
+        for attempt in 1...attempts {
+            await eventually { h.gate.makes == attempt && !h.scheduler.delays.isEmpty }
+            if attempt < attempts { h.scheduler.fireAll() }
+        }
+
+        await eventually { !h.errors.isEmpty }
+        XCTAssertEqual(h.fatals, [], "it keeps retrying, so the side is not dead")
+    }
+
     func testASetupFailureAfterStopIsNotReportedOrRetried() async {
         let h = makeHarness()
         h.gate.holds = true
@@ -368,6 +395,7 @@ final class AnalyzerTranscriberTests: XCTestCase {
         let transcriber: AnalyzerTranscriber
         var segments: [TranscriptSegment] = []
         var errors: [String] = []
+        var fatals: [String] = []
         var notices: [String?] = []
 
         let scheduler = ThreadSafeScheduler()
@@ -381,6 +409,7 @@ final class AnalyzerTranscriberTests: XCTestCase {
         let h = Harness()
         h.transcriber.onSegment = { [weak h] in h?.segments.append($0) }
         h.transcriber.onError = { [weak h] in h?.errors.append($0) }
+        h.transcriber.onFatal = { [weak h] in h?.fatals.append($0) }
         h.transcriber.onNotice = { [weak h] in h?.notices.append($0) }
         return h
     }

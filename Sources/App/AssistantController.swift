@@ -224,7 +224,9 @@ final class AssistantController {
                     await systemAudio.stop()
                     return
                 }
-                self.themSide = .up
+                // Their transcriber may have given up while this was starting; the
+                // stop it queued is next in the chain, so the side stays failed.
+                if self.themSide == .pending { self.themSide = .up }
                 self.resolveStartup()
             } catch {
                 guard let self, self.session == current else { return }
@@ -489,10 +491,39 @@ final class AssistantController {
             guard let self, self.session == current else { return }
             self.report(Problem(message: "\(speaker.rawValue): \(message)"))
         }
+        transcriber.onFatal = { [weak self, weak transcriber] message in
+            guard let self, let transcriber, self.session == current else { return }
+            self.transcriberGaveUp(transcriber, as: speaker, message: message)
+        }
         transcriber.onNotice = { [weak self] message in
             guard let self, self.session == current else { return }
             self.setNotice(message, from: speaker)
         }
+    }
+
+    /// A transcriber that gave up will not come back by itself, so its side is
+    /// marked failed and its capture released: the status says which side is
+    /// left (or the session ends if both are), and a wake cannot revive it. A
+    /// transcriber that has since been replaced no longer speaks for its side.
+    private func transcriberGaveUp(_ transcriber: LiveTranscriber, as speaker: Speaker, message: String) {
+        switch speaker {
+        case .them:
+            guard themTranscriber === transcriber,
+                  themSide == .pending || themSide == .up || themSide == .reconnecting else { return }
+            themSide = .failed
+            themCanRevive = false
+            themRecovery += 1
+            themSlot.set(nil)
+            stopSystemAudio()
+        case .you:
+            guard youTranscriber === transcriber, youSide == .pending || youSide == .up else { return }
+            youSide = .failed
+            youSlot.set(nil)
+            microphone.stop()
+        }
+        transcriber.stop()
+        reportCaptureProblem(Problem(message: "\(speaker.rawValue): \(message)"), for: speaker)
+        resolveStartup()
     }
 
     /// Each side has its own notice, so one finishing (or failing) a model

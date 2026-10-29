@@ -47,6 +47,7 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     var backendName: String { usesAppleServers ? "Apple servers" : "on-device" }
     var onSegment: (@MainActor (TranscriptSegment) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
     private let engine: SpeechRecognitionEngine
@@ -91,12 +92,12 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     func start() {
         queue.async { [self] in
             guard engine.isAvailable else {
-                report("Speech recognition isn't available for this language right now.")
+                fatal("Speech recognition isn't available for this language right now.")
                 return
             }
             if !engine.supportsOnDeviceRecognition {
                 guard allowServerRecognition else {
-                    report("On-device speech recognition isn't available for this language. "
+                    fatal("On-device speech recognition isn't available for this language. "
                            + "Download its Dictation language in System Settings (Keyboard, Dictation), "
                            + "or turn on Deepgram in Settings.")
                     return
@@ -208,6 +209,17 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     private func report(_ message: String) {
         let onError = self.onError
         deliverOnMain { onError?(message) }
+    }
+
+    /// Reported like any problem, and also announced as the end of this
+    /// transcriber, so the owner can show the side as failed.
+    private func fatal(_ message: String) {
+        let onError = self.onError
+        let onFatal = self.onFatal
+        deliverOnMain {
+            onError?(message)
+            onFatal?(message)
+        }
     }
 
     private func notify(_ message: String) {

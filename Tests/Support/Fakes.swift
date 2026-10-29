@@ -5,6 +5,7 @@ final class FakeTranscriber: LiveTranscriber {
     let backendName: String
     var onSegment: (@MainActor (TranscriptSegment) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
     var grantsAuthorization: Bool
     private(set) var starts = 0
@@ -29,6 +30,12 @@ final class FakeTranscriber: LiveTranscriber {
     }
 
     @MainActor func fail(_ message: String) { onError?(message) }
+
+    /// What a real backend does when it gives up: the reason is reported, then the side is declared dead.
+    @MainActor func die(_ message: String) {
+        onError?(message)
+        onFatal?(message)
+    }
     @MainActor func notice(_ message: String?) { onNotice?(message) }
 }
 
