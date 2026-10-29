@@ -14,8 +14,9 @@ final class AppSettings: ObservableObject {
 
     /// Bump when the privacy terms shown on the welcome screen change, so
     /// everyone is asked to agree again. 2: Apple's speech servers are named,
-    /// and used only after their own opt-in.
-    static let termsVersion = 2
+    /// and used only after their own opt-in. 3: Summarize Meeting sends the
+    /// whole transcript to Claude, and saved transcripts are mentioned.
+    static let termsVersion = 3
     static let bundleID = "com.stephenthorn.meetingassistant"
     static let legacyBundleID = "com.example.meetingassistant"
 

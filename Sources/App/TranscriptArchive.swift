@@ -13,6 +13,9 @@ import Foundation
 final class TranscriptArchive {
     private(set) var url: URL
     private(set) var lastError: Error?
+    /// Why the last summary could not be saved, kept apart from `lastError` so
+    /// one does not hide the other.
+    private(set) var lastSummaryError: Error?
 
     private let files: TranscriptFileStoring
     private let format: TranscriptMarkdown
@@ -79,10 +82,10 @@ final class TranscriptArchive {
         let document = format.summaryDocument(summary: summary, transcriptName: url.lastPathComponent)
         do {
             try files.replace(target, with: Data(document.utf8))
-            lastError = nil
+            lastSummaryError = nil
             return true
         } catch {
-            lastError = error
+            lastSummaryError = error
             return false
         }
     }

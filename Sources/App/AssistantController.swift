@@ -59,6 +59,10 @@ final class AssistantController {
     private(set) var isAnswering = false
     /// A quiet one-line note under the answer, e.g. a question that waited too long and was skipped.
     private(set) var answerNote: String?
+    private(set) var summary = ""
+    /// Shown with the summary when it does not cover the whole call.
+    private(set) var summaryNote: String?
+    private(set) var isSummarizing = false
 
     var isListening: Bool { listening != .idle }
     /// The transcript for Copy Transcript. Once a long call trimmed its early
@@ -110,6 +114,9 @@ final class AssistantController {
     @ObservationIgnored private var answerRequest = 0
     @ObservationIgnored private var lastAutoAnswer = Date.distantPast
     @ObservationIgnored private var questions = QuestionQueue()
+    @ObservationIgnored private var summaryTask: Task<Void, Never>?
+    @ObservationIgnored private var summaryRequest = 0
+    @ObservationIgnored private var summaryProblem: Problem?
     @ObservationIgnored private var questionWakeScheduled = false
     @ObservationIgnored private var sampleAnswersShown = 0
 
@@ -175,6 +182,7 @@ final class AssistantController {
         themRecovery += 1
         clearNotices()
         resetTranscriptAndAnswer()
+        resetSummary()
         beginArchive()
         beginPrivacySession()
         watchCapture(session: current)
@@ -638,13 +646,18 @@ final class AssistantController {
     }
 
     private func showSaveProblem(_ error: Error?) {
-        if let archiveProblem {
-            problems.removeAll { $0 == archiveProblem }
-            self.archiveProblem = nil
+        showProblem(error, saving: "transcript", in: &archiveProblem)
+    }
+
+    /// Shows why a save failed, replacing the last such problem; no error clears it.
+    private func showProblem(_ error: Error?, saving noun: String, in slot: inout Problem?) {
+        if let old = slot {
+            problems.removeAll { $0 == old }
+            slot = nil
         }
         guard let error else { return }
-        let problem = Problem(message: "Couldn't save the transcript: \(error.localizedDescription)")
-        archiveProblem = problem
+        let problem = Problem(message: "Couldn't save the \(noun): \(error.localizedDescription)")
+        slot = problem
         report(problem)
     }
 
@@ -702,9 +715,7 @@ final class AssistantController {
         } else if inSample {
             stream = nextSampleAnswer()
         } else {
-            answer = settings.apiKeySource == .unreadable
-                ? "Can't read your API key from the Keychain. Allow access when macOS asks, or save the key again in Settings."
-                : "No API key. Add one in Settings (menu bar icon, then Settings…)."
+            answer = missingKeyMessage
             isAnswering = false
             return
         }
@@ -776,6 +787,103 @@ final class AssistantController {
         }
     }
 
+    private var missingKeyMessage: String {
+        settings.apiKeySource == .unreadable
+            ? "Can't read your API key from the Keychain. Allow access when macOS asks, or save the key again in Settings."
+            : "No API key. Add one in Settings (menu bar icon, then Settings…)."
+    }
+
+    // MARK: - Summary
+
+    /// Sends the whole transcript (not the recent excerpt an answer gets) and
+    /// streams back a summary with decisions and action items. With saving on, a
+    /// finished summary is also saved next to the transcript.
+    func summarizeMeeting() {
+        let inSample = listening == .sample
+        guard inSample || settings.hasAcceptedTerms else {
+            onTermsNeeded?({ [weak self] in self?.summarizeMeeting() })
+            return
+        }
+        summaryTask?.cancel()
+        summaryRequest += 1
+        let current = summaryRequest
+        summaryNote = nil
+        guard !transcript.isEmpty else {
+            summary = "No transcript yet. Start listening first."
+            isSummarizing = false
+            return
+        }
+        guard let apiKey = settings.resolveAPIKey() else {
+            summary = missingKeyMessage
+            isSummarizing = false
+            return
+        }
+        let source = summarySource()
+        let input = SummaryInput(transcript: source.text, isPartial: source.isPartial)
+        summaryNote = input.isPartial ? partialSummaryNote(trimmed: source.isPartial) : nil
+        summary = ""
+        isSummarizing = true
+        let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
+                                                   system: SummaryPrompt.system(extraInstructions: settings.extraInstructions),
+                                                   user: SummaryPrompt.user(input)))
+        summaryTask = Task { [weak self] in
+            do {
+                for try await chunk in stream {
+                    guard let self, self.summaryRequest == current else { return }
+                    self.summary += chunk
+                }
+                self?.finishSummary(current, error: nil)
+            } catch {
+                self?.finishSummary(current, error: error)
+            }
+        }
+    }
+
+    /// The call's text for a summary. Once early lines were trimmed from memory,
+    /// the saved file (if there is one) still has them all.
+    private func summarySource() -> (text: String, isPartial: Bool) {
+        guard transcript.hasTrimmedText else { return (transcript.text, false) }
+        if let archive, settings.saveTranscripts {
+            flushArchive()
+            if archive.lastError == nil, let saved = archive.body() { return (saved, false) }
+        }
+        return (transcript.text, true)
+    }
+
+    private func partialSummaryNote(trimmed: Bool) -> String {
+        guard trimmed else { return "Covers only the most recent part of the call; it was too long to send in full." }
+        let note = "Covers only the most recent part of the call; earlier lines were trimmed."
+        return settings.saveTranscripts ? note : note + " Turn on Save transcripts in Settings to summarize a long call in full."
+    }
+
+    private func finishSummary(_ request: Int, error: Error?) {
+        guard request == summaryRequest else { return }
+        isSummarizing = false
+        if let error {
+            guard !(error is CancellationError) else { return }
+            let message = "Error: \(error.localizedDescription)"
+            summary = summary.isEmpty ? message : summary + "\n\n" + message
+            return
+        }
+        saveSummaryNextToTranscript()
+    }
+
+    private func saveSummaryNextToTranscript() {
+        guard let archive, settings.saveTranscripts, !summary.isEmpty else { return }
+        flushArchive()
+        archive.saveSummary(summary)
+        showProblem(archive.lastSummaryError, saving: "summary", in: &summaryProblem)
+    }
+
+    private func resetSummary() {
+        summaryTask?.cancel()
+        summaryRequest += 1
+        summary = ""
+        summaryNote = nil
+        isSummarizing = false
+        showProblem(nil, saving: "summary", in: &summaryProblem)
+    }
+
     // MARK: - Sample meeting
 
     /// Plays the scripted call from `SampleMeeting`, answering its questions as
@@ -789,6 +897,7 @@ final class AssistantController {
         clearNotices()
         endArchive()
         resetTranscriptAndAnswer()
+        resetSummary()
         sessionStartedAt = now()
         sampleAnswersShown = 0
         scheduleSampleLine(0, session: session)

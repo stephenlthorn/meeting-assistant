@@ -114,7 +114,7 @@ struct SettingsView: View {
                     Spacer()
                     Button("Choose Folder…", action: chooseTranscriptFolder)
                 }
-                Text("Off by default. When on, each call is saved as a Markdown file every 30 seconds and when you stop, readable only by you. The files stay on this Mac. Turning it on applies from the next Start Listening; turning it off stops saving right away.")
+                Text("Off by default. When on, each call is saved as a Markdown file every 30 seconds and when you stop, readable only by you. The files stay on this Mac. Turning it on applies from the next Start Listening; turning it off stops saving right away. Saving also lets Summarize Meeting cover a very long call in full, and saves each summary next to its transcript.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

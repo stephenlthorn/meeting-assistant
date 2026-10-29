@@ -150,7 +150,8 @@ final class TranscriptArchiveTests: XCTestCase {
         h.files.failure = TestFailure(message: "No permission")
 
         XCTAssertFalse(h.archive.saveSummary("- Decided to ship."))
-        XCTAssertEqual(h.archive.lastError?.localizedDescription, "No permission")
+        XCTAssertEqual(h.archive.lastSummaryError?.localizedDescription, "No permission")
+        XCTAssertNil(h.archive.lastError, "the transcript itself was fine")
     }
 
     // MARK: - Harness

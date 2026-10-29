@@ -42,6 +42,24 @@ final class AppSettingsTranscriptTests: XCTestCase {
         XCTAssertTrue(settings.saveTranscripts)
     }
 
+    func testThePrivacyTermsAreAtVersionThreeBecauseSummariesSendTheWholeTranscript() {
+        XCTAssertEqual(AppSettings.termsVersion, 3)
+    }
+
+    func testAgreementToTheEarlierTermsMustBeGivenAgain() {
+        let defaults = freshDefaults()
+        defaults.set(2, forKey: "acceptedTermsVersion")
+
+        XCTAssertFalse(makeSettings(defaults: defaults).hasAcceptedTerms)
+    }
+
+    func testAgreeingToTheCurrentTermsIsRemembered() {
+        let defaults = freshDefaults()
+        makeSettings(defaults: defaults).acceptTerms()
+
+        XCTAssertTrue(makeSettings(defaults: defaults).hasAcceptedTerms)
+    }
+
     // MARK: - Helpers
 
     private func freshDefaults() -> UserDefaults {
