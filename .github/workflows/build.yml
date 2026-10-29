@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: macos-26
@@ -13,6 +16,8 @@ jobs:
       APP: build/Build/Products/Release/MeetingAssistant.app
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Show Xcode
         run: xcodebuild -version

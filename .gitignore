@@ -12,3 +12,6 @@ xcuserdata/
 # Secrets
 anthropic_key
 *.key
+*.p12
+*.cer
+*.p8
