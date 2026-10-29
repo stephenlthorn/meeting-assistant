@@ -45,7 +45,7 @@ talk to that you use an AI assistant (see [Consent](#consent)).
 system audio (ScreenCaptureKit)  -> "Them" transcriber -\
 microphone (AVAudioEngine)       -> "You"  transcriber -/
       -> merged, speaker-labeled transcript
-      -> [⌘⇧Space or auto-answer] -> Claude Messages API (streaming)
+      -> [⌃⌥Space or auto-answer] -> Claude Messages API (streaming)
       -> floating overlay (local, non-activating)
 ```
 
