@@ -31,6 +31,10 @@ protocol SpeechRecognitionEngine {
 /// the conversation interleaved and gives auto-answer a final result per
 /// sentence. Requests that fail straight away are retried with backoff, and
 /// the failure is reported if it keeps happening.
+///
+/// Audio goes to Apple's servers only when the device cannot recognize the
+/// language itself AND `allowServerRecognition` was set; the welcome screen
+/// promises speech is transcribed on this Mac, so the default is to refuse.
 final class LegacySpeechTranscriber: LiveTranscriber {
     static let speechLevel: Float = 0.008 // about -42 dBFS
     static let pauseToEndRequest: TimeInterval = 0.8
@@ -40,12 +44,13 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     private static let quickFailure: TimeInterval = 2
     private static let maximumBackoff: TimeInterval = 30
 
-    let backendName = "on-device"
+    var backendName: String { usesAppleServers ? "Apple servers" : "on-device" }
     var onSegment: (@MainActor (TranscriptSegment) -> Void)?
     var onError: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
     private let engine: SpeechRecognitionEngine
+    private let allowServerRecognition: Bool
     private let queue: DispatchQueue
     private let now: () -> Date
     private let schedule: (TimeInterval, @escaping () -> Void) -> Void
@@ -58,19 +63,25 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     private var sessionHasResults = false
     private var lastSpeech: Date?
     private var consecutiveFailures = 0
+    private var openText: [Int: String] = [:]
+
+    private var usesAppleServers: Bool { allowServerRecognition && !engine.supportsOnDeviceRecognition }
 
     init(engine: SpeechRecognitionEngine,
          queue: DispatchQueue = DispatchQueue(label: "meetingassistant.speech"),
          now: @escaping () -> Date = Date.init,
-         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
+         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
+         allowServerRecognition: Bool = false) {
+        self.allowServerRecognition = allowServerRecognition
         self.engine = engine
         self.queue = queue
         self.now = now
         self.schedule = schedule
     }
 
-    convenience init(localeIdentifier: String = "en-US") {
-        self.init(engine: AppleSpeechEngine(localeIdentifier: localeIdentifier))
+    convenience init(localeIdentifier: String = "en-US", allowServerRecognition: Bool = false) {
+        self.init(engine: AppleSpeechEngine(localeIdentifier: localeIdentifier),
+                  allowServerRecognition: allowServerRecognition)
     }
 
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) {
@@ -84,6 +95,12 @@ final class LegacySpeechTranscriber: LiveTranscriber {
                 return
             }
             if !engine.supportsOnDeviceRecognition {
+                guard allowServerRecognition else {
+                    report("On-device speech recognition isn't available for this language. "
+                           + "Download its Dictation language in System Settings (Keyboard, Dictation), "
+                           + "or turn on Deepgram in Settings.")
+                    return
+                }
                 notify("On-device speech isn't available for this language, so audio goes to Apple's servers.")
             }
             running = true
@@ -145,14 +162,27 @@ final class LegacySpeechTranscriber: LiveTranscriber {
             sessionHasResults = true
             consecutiveFailures = 0
         }
-        let segment = TranscriptSegment(utterance: id, text: text, isFinal: isFinal)
+        openText[id] = isFinal ? nil : text
+        emit(TranscriptSegment(utterance: id, text: text, isFinal: isFinal))
+    }
+
+    private func emit(_ segment: TranscriptSegment) {
         let onSegment = self.onSegment
         deliverOnMain { onSegment?(segment) }
+    }
+
+    /// A request that dies after partial results would otherwise leave its turn
+    /// open for good, stalling the transcript's finished-turn rendering. Its last
+    /// words are the best text there is, so they become its final.
+    private func finishOpenText(of id: Int) {
+        guard let text = openText.removeValue(forKey: id), !text.isEmpty else { return }
+        emit(TranscriptSegment(utterance: id, text: text, isFinal: true))
     }
 
     /// Errors only matter for the current request; an earlier request ending
     /// with an error must not restart the one that replaced it.
     private func failed(_ error: Error, session id: Int) {
+        finishOpenText(of: id)
         guard running, id == generation else { return }
         session = nil
         let failedQuickly = !sessionHasResults && now().timeIntervalSince(sessionStart) < Self.quickFailure
