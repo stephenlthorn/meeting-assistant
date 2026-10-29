@@ -45,6 +45,48 @@ final class AssistantControllerLifecycleTests: XCTestCase {
         XCTAssertEqual(h.controller.transcriptText, "Them: Hi again")
     }
 
+    // MARK: - Notices (AUD-11)
+
+    func testOneSpeakersNoticeClearingDoesNotWipeTheOthers() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        let them = h.transcribers.latest(.them)
+        let you = h.transcribers.latest(.you)
+
+        them?.notice("Downloading the on-device speech model…")
+        you?.notice("Downloading the on-device speech model…")
+        XCTAssertEqual(h.controller.notice, "Downloading the on-device speech model…")
+
+        you?.notice(nil)
+        XCTAssertEqual(h.controller.notice, "Downloading the on-device speech model…")
+
+        them?.notice(nil)
+        XCTAssertNil(h.controller.notice)
+    }
+
+    func testDifferentNoticesFromBothSidesAreBothShown() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+
+        h.transcribers.latest(.you)?.notice("Reconnecting to Deepgram…")
+        h.transcribers.latest(.them)?.notice("Downloading the on-device speech model…")
+
+        XCTAssertEqual(h.controller.notice,
+                       "Downloading the on-device speech model…\nReconnecting to Deepgram…")
+    }
+
+    func testNoticesDoNotSurviveStopping() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        h.transcribers.latest(.them)?.notice("Downloading the on-device speech model…")
+
+        h.controller.stop()
+        await h.startListening()
+        h.transcribers.latest(.you)?.notice(nil)
+
+        XCTAssertNil(h.controller.notice)
+    }
+
     // MARK: - Stopping (AUD-7)
 
     func testTheLastWordsOfACallStillArriveJustAfterStopping() async {

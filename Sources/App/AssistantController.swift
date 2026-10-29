@@ -68,6 +68,7 @@ final class AssistantController {
     @ObservationIgnored private var youTranscriber: LiveTranscriber?
     @ObservationIgnored private var themSide = SideState.off
     @ObservationIgnored private var youSide = SideState.off
+    @ObservationIgnored private var speakerNotices: [Speaker: String] = [:]
     @ObservationIgnored private var backendName = ""
     @ObservationIgnored private var session = 0
     @ObservationIgnored private var drainingSession: Int?
@@ -134,7 +135,7 @@ final class AssistantController {
         listening = .starting
         status = "Starting…"
         problems = []
-        notice = nil
+        clearNotices()
         resetTranscriptAndAnswer()
 
         let them = makeTranscriber(.them)
@@ -160,7 +161,7 @@ final class AssistantController {
         tearDown()
         listening = .idle
         status = "Stopped"
-        notice = nil
+        clearNotices()
         if hadTranscribers { drain(stopped) }
     }
 
@@ -296,8 +297,22 @@ final class AssistantController {
         }
         transcriber.onNotice = { [weak self] message in
             guard let self, self.session == current else { return }
-            self.notice = message
+            self.setNotice(message, from: speaker)
         }
+    }
+
+    /// Each side has its own notice, so one finishing (or failing) a model
+    /// download does not wipe the other's, and the same text is shown once.
+    private func setNotice(_ message: String?, from speaker: Speaker) {
+        speakerNotices[speaker] = message
+        let shown = [Speaker.them, .you].compactMap { speakerNotices[$0] }
+        notice = shown.isEmpty ? nil : shown.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+            .joined(separator: "\n")
+    }
+
+    private func clearNotices() {
+        speakerNotices = [:]
+        notice = nil
     }
 
     private func report(_ problem: Problem) {
@@ -413,7 +428,7 @@ final class AssistantController {
         listening = .sample
         status = "Sample meeting (nothing is recorded)"
         problems = []
-        notice = nil
+        clearNotices()
         resetTranscriptAndAnswer()
         sampleAnswersShown = 0
         scheduleSampleLine(0, session: session)
