@@ -36,7 +36,7 @@ private struct OverlayHeader: View {
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 1) {
-                Text(controller.status)
+                Text(StatusLine.text(status: controller.status, listening: controller.listening, model: settings.model))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let notice = controller.notice {
@@ -109,7 +109,13 @@ private struct TranscriptSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            SectionTitle(text: "Transcript (You + Them)")
+            HStack {
+                SectionTitle(text: "Transcript (You + Them)")
+                Spacer()
+                if controller.listening == .listening {
+                    LevelMeter(levels: controller.levels)
+                }
+            }
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
@@ -134,6 +140,46 @@ private struct TranscriptSection: View {
         controller.transcriptDisplay.isEmpty
             ? OverlayText.transcriptPlaceholder(for: controller.listening)
             : controller.transcriptDisplay
+    }
+}
+
+/// Two thin bars that move with each side's loudness, so a glance says both
+/// are being heard. Only this view reads the levels, so ten updates a second
+/// redraw it and nothing else.
+private struct LevelMeter: View {
+    let levels: CaptureLevels
+
+    var body: some View {
+        HStack(spacing: 8) {
+            LevelBar(label: "You", level: levels.you)
+            LevelBar(label: "Them", level: levels.them)
+        }
+    }
+}
+
+private struct LevelBar: View {
+    let label: String
+    let level: Float
+    private let width: CGFloat = 30
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(label)
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+            Capsule()
+                .fill(.quaternary)
+                .frame(width: width, height: 4)
+                .overlay(alignment: .leading) {
+                    Capsule()
+                        .fill(.green)
+                        .frame(width: max(level > 0 ? 2 : 0, width * CGFloat(level)), height: 4)
+                }
+        }
+        .animation(.linear(duration: 0.1), value: level)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label) audio level")
+        .accessibilityValue("\(Int((level * 100).rounded())) percent")
     }
 }
 
@@ -162,9 +208,17 @@ private struct AnswerSection: View {
                     .help("Copy the answer")
                 }
             }
+            if let note = controller.answerNote {
+                Text(note)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
             ScrollView {
                 Text(OverlayText.answer(controller.answer, isAnswering: controller.isAnswering,
-                                        hasKey: settings.apiKeyPresent, shortcut: settings.answerHotKey.label))
+                                        hasKey: settings.apiKeyPresent,
+                                        keyUnreadable: settings.apiKeySource == .unreadable,
+                                        shortcut: settings.answerHotKey.label))
                     .font(.system(size: 13, weight: .medium))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)

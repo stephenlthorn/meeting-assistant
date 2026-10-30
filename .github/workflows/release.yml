@@ -1,8 +1,14 @@
 name: release
 
-# Publishes a release when VERSION changes on main (or on demand). It never
-# re-publishes an existing tag. With Developer ID secrets configured the app is
-# signed and notarized; otherwise it is ad-hoc signed.
+# Publishes a release when VERSION changes on main (or on demand from main). It never
+# re-publishes an existing tag. VERSION is the single source of truth: the tag, the
+# app's MARKETING_VERSION and its build number all derive from it, and the build fails
+# if they would disagree.
+#
+# Signing is all or nothing. With every Developer ID and notarization secret set the
+# app is signed and notarized; with none it is ad-hoc signed; any other combination
+# fails before the build. The secrets live in the "release" environment and reach only
+# the steps that sign and notarize, never the tests, the build or third-party actions.
 on:
   push:
     branches: [main]
@@ -11,52 +17,70 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create (defaults to the VERSION file)"
+        description: "Release tag to create; must equal the VERSION file (leave empty to use it)"
         required: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
+    # A dispatch from another branch could ship unreviewed code under the signing identity.
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    # Releases queue instead of racing, and a run is never cancelled halfway: that could
+    # leave a tag with no asset, or a notarization submitted and abandoned.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    # Bounds the whole job; notarization has its own limit below.
+    timeout-minutes: 75
+    permissions:
+      contents: write
     runs-on: macos-26
     env:
       APP: build/Build/Products/Release/MeetingAssistant.app
-      GH_TOKEN: ${{ github.token }}
-      INPUT_TAG: ${{ inputs.tag }}
-      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - name: Resolve tag
+      - name: Resolve version
         id: ver
-        run: |
-          TAG="${INPUT_TAG:-$(cat VERSION)}"
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Tag must look like v1.2.3"
-            exit 1
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Release $TAG already exists. Bump VERSION to publish a new one."
-          fi
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: scripts/release-resolve-version.sh
+
+      - name: Check whether the release exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: scripts/release-exists.sh "$TAG"
+
+      - name: Check signing secrets
+        id: signing
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          HAVE_MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+          HAVE_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD != '' }}
+          HAVE_MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY != '' }}
+          HAVE_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+          HAVE_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
+          HAVE_APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD != '' }}
+        run: scripts/release-check-signing.sh
 
       - name: Install XcodeGen
-        if: steps.ver.outputs.exists != 'true'
-        run: brew install xcodegen
+        if: steps.existing.outputs.exists != 'true'
+        run: scripts/install-xcodegen.sh
 
       - name: Generate Xcode project
-        if: steps.ver.outputs.exists != 'true'
+        if: steps.existing.outputs.exists != 'true'
         run: xcodegen generate
 
       - name: Test
-        if: steps.ver.outputs.exists != 'true'
+        if: steps.existing.outputs.exists != 'true'
         run: |
           set -o pipefail
           xcodebuild test \
@@ -67,7 +91,10 @@ jobs:
             CODE_SIGNING_ALLOWED=NO
 
       - name: Build (Release)
-        if: steps.ver.outputs.exists != 'true'
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.marketing }}
+          APP_BUILD: ${{ steps.ver.outputs.build }}
         run: |
           set -o pipefail
           xcodebuild \
@@ -77,17 +104,40 @@ jobs:
             -destination 'generic/platform=macOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="$APP_BUILD" \
             build
 
+      - name: Verify bundle version
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          EXPECTED_VERSION: ${{ steps.ver.outputs.marketing }}
+          EXPECTED_BUILD: ${{ steps.ver.outputs.build }}
+        run: |
+          PLIST="$APP/Contents/Info.plist"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")"
+          if [ "$VERSION" != "$EXPECTED_VERSION" ] || [ "$BUILD" != "$EXPECTED_BUILD" ]; then
+            echo "::error::The built app reports $VERSION ($BUILD) but the release is $EXPECTED_VERSION ($EXPECTED_BUILD)"
+            exit 1
+          fi
+
       - name: Sign with Developer ID
-        if: steps.ver.outputs.exists != 'true' && env.MACOS_CERTIFICATE_P12 != ''
+        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode == 'developer-id'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          CERTIFICATE="$RUNNER_TEMP/certificate.p12"
+          # Later steps, including third-party actions, must not find the key on this runner.
+          trap 'rm -f "$CERTIFICATE"; security delete-keychain "$KEYCHAIN" || true' EXIT
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERTIFICATE"
           security create-keychain -p "" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "" "$KEYCHAIN"
-          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security import "$CERTIFICATE" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           codesign --force --options runtime --timestamp \
@@ -95,54 +145,42 @@ jobs:
             --sign "$MACOS_SIGNING_IDENTITY" "$APP"
 
       - name: Ad-hoc sign
-        if: steps.ver.outputs.exists != 'true' && env.MACOS_CERTIFICATE_P12 == ''
+        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode == 'ad-hoc'
         run: codesign --force --options runtime --entitlements Config/MeetingAssistant.entitlements --sign - "$APP"
 
       - name: Verify signature
-        if: steps.ver.outputs.exists != 'true'
+        if: steps.existing.outputs.exists != 'true'
         run: codesign --verify --strict --verbose=2 "$APP"
 
       - name: Package .app
-        if: steps.ver.outputs.exists != 'true'
+        if: steps.existing.outputs.exists != 'true'
         run: ditto -c -k --sequesterRsrc --keepParent "$APP" MeetingAssistant.app.zip
 
       - name: Notarize
         id: notarize
-        if: steps.ver.outputs.exists != 'true' && env.MACOS_CERTIFICATE_P12 != '' && env.APPLE_ID != ''
+        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode == 'developer-id'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
           xcrun notarytool submit MeetingAssistant.app.zip \
-            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait --timeout 30m
           xcrun stapler staple "$APP"
           rm MeetingAssistant.app.zip
           ditto -c -k --sequesterRsrc --keepParent "$APP" MeetingAssistant.app.zip
           echo "done=true" >> "$GITHUB_OUTPUT"
 
       - name: Write release notes
-        if: steps.ver.outputs.exists != 'true'
+        if: steps.existing.outputs.exists != 'true'
         env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
           NOTARIZED: ${{ steps.notarize.outputs.done }}
-        run: |
-          if [ "$NOTARIZED" = "true" ]; then
-            echo 'Signed and notarized macOS build of Meeting Assistant. Unzip `MeetingAssistant.app.zip` and open the app.' > release-notes.md
-          else
-            {
-              echo 'Ad-hoc signed macOS build of Meeting Assistant (not notarized).'
-              echo
-              echo 'Download `MeetingAssistant.app.zip`, then before first launch:'
-              echo
-              echo '```bash'
-              echo 'unzip MeetingAssistant.app.zip'
-              echo 'xattr -dr com.apple.quarantine MeetingAssistant.app'
-              echo 'open MeetingAssistant.app'
-              echo '```'
-              echo
-              echo 'macOS asks for Screen Recording and Microphone again after each ad-hoc update. Building from source in Xcode is the smoother path; see the README.'
-            } > release-notes.md
-          fi
+        run: scripts/release-notes.sh "$SIGNING_MODE" "$NOTARIZED" > release-notes.md
 
       - name: Publish release
-        if: steps.ver.outputs.exists != 'true'
-        uses: softprops/action-gh-release@v2
+        if: steps.existing.outputs.exists != 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           target_commitish: ${{ github.sha }}

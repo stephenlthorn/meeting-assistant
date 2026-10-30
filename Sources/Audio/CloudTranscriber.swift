@@ -6,6 +6,8 @@ protocol WebSocketConnection: AnyObject {
     func send(_ message: URLSessionWebSocketTask.Message, completion: @escaping (Error?) -> Void)
     func receive(_ completion: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void)
     func close()
+    /// The HTTP status of a refused upgrade request (401 for a bad key), once the server has answered.
+    var handshakeStatusCode: Int? { get }
 }
 
 /// Optional cloud streaming STT via Deepgram. Sends 16 kHz mono linear16 PCM
@@ -16,9 +18,19 @@ protocol WebSocketConnection: AnyObject {
 /// goes out whenever no audio has been sent for a few seconds. A dropped
 /// connection is re-established with backoff; audio is dropped while
 /// disconnected, and the problem is reported once if reconnecting keeps failing.
+///
+/// Stopping asks Deepgram to finish (CloseStream) and keeps listening for a
+/// moment, since it answers with the words it was still working on and then
+/// closes the connection; the connection is closed at once if it does not.
+///
+/// Withdrawing consent is not a stop: `cancel()` closes an audio gate before it
+/// returns, so buffers still queued are never sent, and closes the connection
+/// without a drain. Nothing, not even a handshake, leaves after that.
 final class CloudTranscriber: LiveTranscriber {
+    static let defaultDrainTimeout: TimeInterval = 1.5
     static let keepAliveInterval: TimeInterval = 4
     static let failuresBeforeReporting = 3
+    static let failuresBeforeGivingUp = 10
     private static let maximumBackoff: TimeInterval = 15
     private static let keepAliveMessage = #"{"type":"KeepAlive"}"#
     private static let closeMessage = #"{"type":"CloseStream"}"#
@@ -26,10 +38,12 @@ final class CloudTranscriber: LiveTranscriber {
     let backendName = "Deepgram"
     var onSegment: (@MainActor (TranscriptSegment) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
     private let apiKey: String
     private let localeIdentifier: String
+    private let drainTimeout: TimeInterval
     private let connect: (URLRequest) -> WebSocketConnection
     private let queue: DispatchQueue
     private let now: () -> Date
@@ -37,15 +51,23 @@ final class CloudTranscriber: LiveTranscriber {
     private let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
                                              channels: 1, interleaved: false)!
 
+    private let gate = AudioGate()
+    private let preparingLock = NSLock()
+    private var preparing = false // guarded by `preparingLock`
+
     // Only touched on `queue`.
-    private var running = false
+    private var running = false { didSet { updatePreparing() } }
+    private var draining = false
     private var connection: WebSocketConnection?
     private var generation = 0
     private var heardFromServer = false
-    private var reconnecting = false
+    private var reconnecting = false { didSet { updatePreparing() } }
+    private var sessionEpoch = 0
     private var failures = 0
     private var lastSent = Date.distantPast
     private var utterance = 0
+    private var confirmedText = ""
+    private var shownText = ""
     private var converter: AVAudioConverter?
 
     init(apiKey: String,
@@ -53,9 +75,11 @@ final class CloudTranscriber: LiveTranscriber {
          connect: @escaping (URLRequest) -> WebSocketConnection = URLSessionWebSocketConnection.connect,
          queue: DispatchQueue = DispatchQueue(label: "meetingassistant.deepgram"),
          now: @escaping () -> Date = Date.init,
-         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
+         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
+         drainTimeout: TimeInterval = CloudTranscriber.defaultDrainTimeout) {
         self.apiKey = apiKey
         self.localeIdentifier = localeIdentifier
+        self.drainTimeout = drainTimeout
         self.connect = connect
         self.queue = queue
         self.now = now
@@ -65,12 +89,19 @@ final class CloudTranscriber: LiveTranscriber {
     /// Cloud service, no OS permission needed.
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) { completion(true) }
 
+    /// Reconnecting after a drop, and the server has not answered since.
+    var isPreparing: Bool { preparingLock.withLock { preparing } }
+
     func start() {
+        let epoch = gate.open()
         queue.async { [self] in
+            guard gate.allows(epoch) else { return }
             guard !apiKey.isEmpty else {
-                report("Missing Deepgram API key.")
+                fatal("Missing Deepgram API key.")
                 return
             }
+            if draining { endDrain() }
+            sessionEpoch = epoch
             running = true
             failures = 0
             openConnection()
@@ -81,19 +112,52 @@ final class CloudTranscriber: LiveTranscriber {
     func stop() {
         queue.async { [self] in
             running = false
-            connection?.send(.string(Self.closeMessage)) { _ in }
+            guard let connection, !draining else { return }
+            draining = true
+            connection.send(.string(Self.closeMessage)) { _ in }
+            let drainingGeneration = generation
+            schedule(drainTimeout) { [weak self] in
+                self?.queue.async {
+                    guard let self, self.draining, self.generation == drainingGeneration else { return }
+                    self.endDrain()
+                }
+            }
+        }
+    }
+
+    /// Closes the connection and sends nothing more, for a stop the user did not
+    /// ask for: consent was withdrawn. Not a drain, since a drain would send a
+    /// CloseStream and keep the connection open for the server's last words.
+    func cancel() {
+        gate.close()
+        queue.async { [self] in
+            running = false
+            draining = false
+            if reconnecting {
+                reconnecting = false
+                notify(nil)
+            }
+            finishOpenUtterance()
             connection?.close()
             connection = nil
+            generation += 1
         }
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
+        guard let epoch = gate.admit() else { return }
         let time = now()
         queue.async { [self] in
-            guard running, let connection, let data = pcm16Data(from: buffer), !data.isEmpty else { return }
+            guard gate.allows(epoch), running, let connection, let data = pcm16Data(from: buffer),
+                  !data.isEmpty else { return }
             connection.send(.data(data)) { _ in }
             lastSent = time
         }
+    }
+
+    private func updatePreparing() {
+        let value = running && reconnecting
+        preparingLock.withLock { preparing = value }
     }
 
     // MARK: - Connection (on `queue`)
@@ -115,7 +179,7 @@ final class CloudTranscriber: LiveTranscriber {
 
     private func received(_ result: Result<URLSessionWebSocketTask.Message, Error>,
                           on connection: WebSocketConnection, generation id: Int) {
-        guard running, id == generation else { return }
+        guard running || draining, id == generation else { return }
         switch result {
         case .success(let message):
             if !heardFromServer {
@@ -129,14 +193,38 @@ final class CloudTranscriber: LiveTranscriber {
             handle(message)
             receiveNext(on: connection, generation: id)
         case .failure(let error):
-            dropped(error)
+            if draining {
+                endDrain()
+            } else {
+                dropped(error)
+            }
         }
     }
 
-    private func dropped(_ error: Error) {
+    /// The server has said everything it will after CloseStream (or took too
+    /// long): close the connection and finish whatever utterance was open.
+    private func endDrain() {
+        draining = false
+        finishOpenUtterance()
         connection?.close()
         connection = nil
+    }
+
+    private func dropped(_ error: Error) {
+        let status = connection?.handshakeStatusCode
+        connection?.close()
+        connection = nil
+        finishOpenUtterance()
+        if let message = Self.refusalMessage(forStatus: status) {
+            giveUp(message)
+            return
+        }
         failures += 1
+        guard failures < Self.failuresBeforeGivingUp else {
+            giveUp("Deepgram couldn't be reached after \(failures) tries: \(error.localizedDescription). "
+                   + "Stop listening and start again to retry.")
+            return
+        }
         if !reconnecting {
             reconnecting = true
             notify("Reconnecting to Deepgram…")
@@ -151,8 +239,28 @@ final class CloudTranscriber: LiveTranscriber {
         }
     }
 
+    /// A rejected key or an unpaid account will not fix itself, so retrying
+    /// only hides the real problem behind "reconnecting".
+    private static func refusalMessage(forStatus status: Int?) -> String? {
+        guard let status else { return nil }
+        switch status {
+        case 401, 403: return "Deepgram rejected the API key (\(status)). Check it in Settings."
+        case 402: return "Deepgram says this account needs payment or credit (402). Check your Deepgram billing."
+        default: return nil
+        }
+    }
+
+    private func giveUp(_ message: String) {
+        running = false
+        if reconnecting {
+            reconnecting = false
+            notify(nil)
+        }
+        fatal(message)
+    }
+
     private func reconnect(after droppedGeneration: Int) {
-        guard running, connection == nil, generation == droppedGeneration else { return }
+        guard running, gate.allows(sessionEpoch), connection == nil, generation == droppedGeneration else { return }
         openConnection()
     }
 
@@ -163,7 +271,7 @@ final class CloudTranscriber: LiveTranscriber {
     }
 
     private func keepAlive() {
-        guard running else { return }
+        guard running, gate.allows(sessionEpoch) else { return }
         if let connection, now().timeIntervalSince(lastSent) >= Self.keepAliveInterval {
             connection.send(.string(Self.keepAliveMessage)) { _ in }
             lastSent = now()
@@ -181,6 +289,7 @@ final class CloudTranscriber: LiveTranscriber {
             URLQueryItem(name: "interim_results", value: "true"),
             URLQueryItem(name: "smart_format", value: "true"),
             URLQueryItem(name: "punctuate", value: "true"),
+            URLQueryItem(name: "utterance_end_ms", value: "1000"),
             URLQueryItem(name: "language", value: localeIdentifier),
         ]
         var request = URLRequest(url: components.url!)
@@ -197,15 +306,47 @@ final class CloudTranscriber: LiveTranscriber {
         case .string(let value): data = value.data(using: .utf8)
         @unknown default: data = nil
         }
-        guard let data,
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let channel = object["channel"] as? [String: Any],
+        guard let data, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if object["type"] as? String == "UtteranceEnd" {
+            finishOpenUtterance()
+        } else {
+            handleResults(object)
+        }
+    }
+
+    /// Deepgram's `is_final` only means this chunk of words will not change; the
+    /// speaker may be mid-sentence. The utterance ends at `speech_final` (or an
+    /// UtteranceEnd message), so confirmed chunks accumulate until then and are
+    /// shown as one growing, not yet final, utterance.
+    private func handleResults(_ object: [String: Any]) {
+        guard let channel = object["channel"] as? [String: Any],
               let alternatives = channel["alternatives"] as? [[String: Any]],
               let transcript = alternatives.first?["transcript"] as? String else { return }
         let isFinal = (object["is_final"] as? Bool) ?? false
-        guard !transcript.isEmpty || isFinal else { return }
-        let segment = TranscriptSegment(utterance: utterance, text: transcript, isFinal: isFinal)
-        if isFinal { utterance += 1 }
+        let endsUtterance = (object["speech_final"] as? Bool) ?? false
+        let text = [confirmedText, transcript.trimmingCharacters(in: .whitespacesAndNewlines)]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        if isFinal { confirmedText = text }
+        guard !text.isEmpty || (endsUtterance && !shownText.isEmpty) else { return }
+        emit(text, isFinal: endsUtterance)
+    }
+
+    /// Ends whatever utterance is open with the words confirmed so far.
+    private func finishOpenUtterance() {
+        guard !shownText.isEmpty else { return }
+        emit(confirmedText.isEmpty ? shownText : confirmedText, isFinal: true)
+    }
+
+    private func emit(_ text: String, isFinal: Bool) {
+        let segment = TranscriptSegment(utterance: utterance, text: text, isFinal: isFinal)
+        if isFinal {
+            utterance += 1
+            confirmedText = ""
+            shownText = ""
+        } else {
+            shownText = text
+        }
         let onSegment = self.onSegment
         deliverOnMain { onSegment?(segment) }
     }
@@ -213,6 +354,17 @@ final class CloudTranscriber: LiveTranscriber {
     private func report(_ message: String) {
         let onError = self.onError
         deliverOnMain { onError?(message) }
+    }
+
+    /// Reported like any problem, and also announced as the end of this
+    /// transcriber, so the owner can show the side as failed.
+    private func fatal(_ message: String) {
+        let onError = self.onError
+        let onFatal = self.onFatal
+        deliverOnMain {
+            onError?(message)
+            onFatal?(message)
+        }
     }
 
     private func notify(_ message: String?) {
@@ -274,5 +426,9 @@ final class URLSessionWebSocketConnection: WebSocketConnection {
 
     func close() {
         task.cancel(with: .goingAway, reason: nil)
+    }
+
+    var handshakeStatusCode: Int? {
+        (task.response as? HTTPURLResponse)?.statusCode
     }
 }

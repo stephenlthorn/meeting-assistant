@@ -1,0 +1,1035 @@
+import XCTest
+
+// Lints the release plumbing (workflows, scripts, .gitignore) through the real files.
+// The scripts the workflows delegate to are run for real; the only fake is the GitHub CLI,
+// the system boundary that must never be reached from a test.
+
+// MARK: - Workflow lint
+
+final class ReleaseWorkflowTests: XCTestCase {
+    private let signingSecrets = ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"]
+    private let notarizationSecrets = ["APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"]
+
+    func testSecretsAreNotInTheJobOrWorkflowEnvironment() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertNil(release.header.range(of: #"\$\{\{[^}]*\bsecrets\."#, options: .regularExpression),
+                     "A secret in job-level env is visible to every step, third-party actions included")
+    }
+
+    func testEachSecretReachesOnlyTheStepThatNeedsIt() throws {
+        let release = try Workflow("release.yml")
+
+        let sign = try release.step("Sign with Developer ID")
+        let notarize = try release.step("Notarize")
+        XCTAssertEqual(Set(sign.secretValues), Set(signingSecrets))
+        XCTAssertEqual(Set(notarize.secretValues), Set(notarizationSecrets))
+        for step in release.steps where step.name != sign.name && step.name != notarize.name {
+            XCTAssertTrue(step.secretValues.isEmpty, "\(step.name) must not receive secret values: \(step.secretValues)")
+        }
+    }
+
+    func testTheGitHubTokenIsNotHandedToEveryStep() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertNil(release.header.range(of: #"\$\{\{[^}]*\bgithub\.token"#, options: .regularExpression),
+                     "The job token can write releases; only the steps that call GitHub should get it")
+    }
+
+    func testEveryActionIsPinnedToACommitWithAVersionComment() throws {
+        for file in ["build.yml", "release.yml"] {
+            let workflow = try Workflow(file)
+            let actions = workflow.steps.compactMap(\.uses)
+            XCTAssertFalse(actions.isEmpty, file)
+            for step in workflow.steps {
+                guard let uses = step.uses else { continue }
+                XCTAssertNotNil(uses.range(of: #"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$"#, options: .regularExpression),
+                                "\(file): \(uses) must be pinned to a full commit SHA; a tag such as v4 can be moved, GitHub's own actions included")
+                XCTAssertNotNil(step.text.range(of: #"uses:\s*\S+@[0-9a-f]{40}\s+# v\d+\.\d+\.\d+"#, options: .regularExpression),
+                                "\(file): \(uses) needs an exact version comment (# v1.2.3) so the pin can be reviewed")
+            }
+        }
+    }
+
+    func testTheReleaseJobRunsOneAtATimeAndNeverCancelsARunHalfwayThroughPublishing() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertTrue(release.header.contains("\n    concurrency:\n      group: release\n      cancel-in-progress: false\n"),
+                      "two releases must queue, and cancelling mid-notarization could leave a tag without its asset")
+    }
+
+    func testEveryJobHasATimeoutSoAStuckStepCannotRunForSixHours() throws {
+        for file in ["build.yml", "release.yml"] {
+            let header = try Workflow(file).header
+            let minutes = captures(#"\n    timeout-minutes: (\d+)\n"#, in: header).first?.first.flatMap(Int.init)
+            XCTAssertNotNil(minutes, "\(file) needs a job-level timeout-minutes")
+            XCTAssertLessThanOrEqual(minutes ?? .max, 120, file)
+        }
+    }
+
+    func testNotarizationIsBoundedSoTheStepCannotWaitForeverOnApple() throws {
+        let notarize = try Workflow("release.yml").step("Notarize")
+
+        XCTAssertTrue(notarize.text.contains("--wait --timeout 30m"), notarize.text)
+    }
+
+    func testXcodeGenIsInstalledAtAPinnedVersionNotWhateverHomebrewHasToday() throws {
+        for file in ["build.yml", "release.yml"] {
+            let workflow = try Workflow(file)
+            let install = try workflow.step("Install XcodeGen")
+
+            XCTAssertTrue(install.text.contains("scripts/install-xcodegen.sh"), file)
+            XCTAssertFalse(workflow.text.contains("brew install xcodegen"), "\(file): an unpinned install can change what ships")
+        }
+    }
+
+    func testTheReleaseJobUsesTheProtectedReleaseEnvironment() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertTrue(release.header.contains("\n    environment: release\n"))
+    }
+
+    func testManualReleasesCanOnlyRunFromMain() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertTrue(release.header.contains("\n    if: github.ref == 'refs/heads/main'\n"))
+    }
+
+    func testWorkflowsDefaultToReadOnlyPermissions() throws {
+        for file in ["build.yml", "release.yml"] {
+            let workflow = try Workflow(file)
+            XCTAssertTrue(workflow.text.contains("\npermissions:\n  contents: read\n"),
+                          "\(file) needs a workflow-level read-only permissions block")
+        }
+        let build = try Workflow("build.yml")
+        XCTAssertFalse(build.text.contains(": write"), "The build workflow never needs write access")
+    }
+
+    func testOnlyTheReleaseJobCanWriteContents() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertTrue(release.header.contains("\n    permissions:\n      contents: write\n"))
+    }
+
+    func testCheckoutDoesNotLeaveCredentialsOnDisk() throws {
+        for file in ["build.yml", "release.yml"] {
+            let checkout = try XCTUnwrap(try Workflow(file).steps.first { $0.uses?.hasPrefix("actions/checkout@") == true })
+            XCTAssertTrue(checkout.text.contains("persist-credentials: false"), file)
+        }
+    }
+
+    func testReleaseBuildIsStampedWithTheVersionFromTheTag() throws {
+        let release = try Workflow("release.yml")
+
+        let resolve = try release.step("Resolve version")
+        XCTAssertTrue(resolve.text.contains("scripts/release-resolve-version.sh"))
+        let build = try release.step("Build (Release)")
+        XCTAssertTrue(build.text.contains(#"MARKETING_VERSION="$APP_VERSION""#))
+        XCTAssertTrue(build.text.contains(#"CURRENT_PROJECT_VERSION="$APP_BUILD""#))
+        XCTAssertTrue(build.text.contains("steps.ver.outputs.marketing"))
+        XCTAssertTrue(build.text.contains("steps.ver.outputs.build"))
+    }
+
+    func testTheBuiltBundleVersionIsCheckedBeforePublishing() throws {
+        let release = try Workflow("release.yml")
+
+        let build = try release.indexOfStep("Build (Release)")
+        let verify = try release.indexOfStep("Verify bundle version")
+        let publish = try release.indexOfStep("Publish release")
+        XCTAssertLessThan(build, verify)
+        XCTAssertLessThan(verify, publish)
+        XCTAssertTrue(release.steps[verify].text.contains("CFBundleShortVersionString"))
+    }
+
+    func testSigningModeIsDecidedBeforeAnythingIsBuilt() throws {
+        let release = try Workflow("release.yml")
+
+        let check = try release.step("Check signing secrets")
+        XCTAssertLessThan(try release.indexOfStep("Check signing secrets"), try release.indexOfStep("Build (Release)"))
+        XCTAssertTrue(check.text.contains("scripts/release-check-signing.sh"))
+        for secret in signingSecrets + notarizationSecrets {
+            XCTAssertTrue(check.text.contains("HAVE_\(secret): ${{ secrets.\(secret) != '' }}"),
+                          "The check should see whether \(secret) is set, never its value")
+        }
+        XCTAssertTrue(check.secretValues.isEmpty)
+    }
+
+    func testSigningAndNotarizationFollowTheCheckedMode() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertTrue(try release.step("Sign with Developer ID").condition?.contains("steps.signing.outputs.mode == 'developer-id'") == true)
+        XCTAssertTrue(try release.step("Notarize").condition?.contains("steps.signing.outputs.mode == 'developer-id'") == true)
+        let adHoc = try release.step("Ad-hoc sign")
+        XCTAssertTrue(adHoc.condition?.contains("steps.signing.outputs.mode == 'ad-hoc'") == true)
+        XCTAssertFalse(adHoc.text.contains("env.MACOS_CERTIFICATE_P12"))
+    }
+
+    func testReleaseNotesDescribeTheSigningModeAndNotarizationOutcomeActuallyUsed() throws {
+        let notes = try Workflow("release.yml").step("Write release notes")
+
+        XCTAssertTrue(notes.text.contains("steps.signing.outputs.mode"))
+        XCTAssertTrue(notes.text.contains("steps.notarize.outputs.done"))
+        XCTAssertTrue(notes.text.contains("scripts/release-notes.sh"))
+    }
+
+    func testReleaseNeverRebuildsAnExistingTag() throws {
+        let release = try Workflow("release.yml")
+
+        for name in ["Check signing secrets", "Build (Release)", "Sign with Developer ID", "Notarize", "Publish release"] {
+            XCTAssertTrue(try release.step(name).condition?.contains("steps.existing.outputs.exists != 'true'") == true, name)
+        }
+    }
+
+    func testTheExistingReleaseCheckLeavesTheDecisionToTheScriptSoNoFailureReadsAsNoRelease() throws {
+        let check = try Workflow("release.yml").step("Check whether the release exists")
+
+        XCTAssertTrue(check.text.contains("scripts/release-exists.sh"))
+        XCTAssertFalse(check.text.contains("gh release view"), "any failure of that call used to count as 'no release'")
+        XCTAssertTrue(check.text.contains("id: existing"))
+        XCTAssertTrue(check.text.contains("TAG: ${{ steps.ver.outputs.tag }}"))
+        XCTAssertTrue(check.text.contains("GH_REPO: ${{ github.repository }}"))
+    }
+
+    func testWorkflowsParseAsYAML() throws {
+        for file in ["build.yml", "release.yml"] {
+            let result = try Shell.run("/usr/bin/env", ["ruby", "-ryaml", "-e", "YAML.load_file(ARGV[0])", Repo.url(".github/workflows/\(file)").path],
+                                       path: "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
+            try XCTSkipIf(result.status == 127, "ruby is not available")
+            XCTAssertEqual(result.status, 0, "\(file) does not parse: \(result.output)")
+        }
+    }
+
+    func testActionlintAcceptsTheWorkflowsWhenInstalled() throws {
+        let files = ["build.yml", "release.yml"].map { Repo.url(".github/workflows/\($0)").path }
+
+        let result = try Shell.run("/usr/bin/env", ["actionlint"] + files, path: "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
+
+        try XCTSkipIf(result.status == 127, "actionlint is not installed")
+        XCTAssertEqual(result.status, 0, result.output)
+    }
+}
+
+// MARK: - Version and signing scripts
+
+final class ReleaseScriptTests: XCTestCase {
+    private func resolve(versionFile: String = "v0.2.1\n", inputTag: String? = nil) throws -> Shell.Outcome {
+        let file = try Shell.makeTempDirectory(for: self).appendingPathComponent("VERSION")
+        try versionFile.write(to: file, atomically: true, encoding: .utf8)
+        var env: [String: String] = [:]
+        if let inputTag { env["INPUT_TAG"] = inputTag }
+        return try Shell.runScript("release-resolve-version.sh", args: [file.path], env: env)
+    }
+
+    func testTheTagComesFromTheVERSIONFile() throws {
+        let result = try resolve(versionFile: "v1.4.2\n")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["tag"], "v1.4.2")
+        XCTAssertEqual(result.outputs["marketing"], "1.4.2")
+    }
+
+    func testAnEmptyDispatchInputFallsBackToTheVERSIONFile() throws {
+        let result = try resolve(versionFile: "v0.3.0\n", inputTag: "")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["tag"], "v0.3.0")
+    }
+
+    func testADispatchInputThatMatchesVERSIONIsAccepted() throws {
+        let result = try resolve(versionFile: "v0.3.0\n", inputTag: "v0.3.0")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["tag"], "v0.3.0")
+    }
+
+    func testADispatchInputThatDisagreesWithVERSIONFailsNamingBoth() throws {
+        let result = try resolve(versionFile: "v0.3.0\n", inputTag: "v0.4.0")
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("v0.4.0"), result.output)
+        XCTAssertTrue(result.output.contains("v0.3.0"), result.output)
+        XCTAssertNil(result.outputs["tag"], "A failed check must not leave a tag for later steps")
+    }
+
+    func testMalformedTagsAreRejected() throws {
+        XCTAssertEqual(try resolve(versionFile: "v0.2.1\n").status, 0, "A well-formed tag is the control for the rejections below")
+        for bad in ["0.2.1", "v0.2", "v1.2.3-beta", "v01.2.3", "v1.2.3.4", "release", "v1.1000.0"] {
+            XCTAssertNotEqual(try resolve(versionFile: "\(bad)\n").status, 0, "\(bad) in VERSION should be rejected")
+            XCTAssertNotEqual(try resolve(versionFile: "\(bad)\n", inputTag: bad).status, 0, "\(bad) as the dispatch input should be rejected")
+        }
+    }
+
+    func testTheBuildNumberIncreasesWithEveryRelease() throws {
+        let versions = ["v0.2.1", "v0.2.2", "v0.2.10", "v0.3.0", "v0.10.0", "v1.0.0", "v1.0.1", "v1.2.0", "v2.0.0"]
+
+        let builds = try versions.map { version -> Int in
+            let result = try resolve(versionFile: "\(version)\n")
+            XCTAssertEqual(result.status, 0, result.output)
+            return try XCTUnwrap(Int(try XCTUnwrap(result.outputs["build"])), version)
+        }
+
+        XCTAssertEqual(builds, builds.sorted())
+        XCTAssertEqual(Set(builds).count, builds.count, "Two releases must never share a build number")
+    }
+
+    // MARK: Signing mode
+
+    private let allSecrets = ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY",
+                              "APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"]
+
+    private func checkSigning(present: [String]) throws -> Shell.Outcome {
+        let env = Dictionary(uniqueKeysWithValues: allSecrets.map { ("HAVE_\($0)", present.contains($0) ? "true" : "false") })
+        return try Shell.runScript("release-check-signing.sh", env: env)
+    }
+
+    func testEverySigningAndNotarizationSecretMeansSignAndNotarize() throws {
+        let result = try checkSigning(present: allSecrets)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "developer-id")
+    }
+
+    func testNoSecretsMeansAnAdHocBuild() throws {
+        let result = try checkSigning(present: [])
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "ad-hoc")
+    }
+
+    func testCertificateWithoutNotarizationSecretsFailsNamingTheMissingOnes() throws {
+        let result = try checkSigning(present: ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertNil(result.outputs["mode"])
+        for missing in ["APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"] {
+            XCTAssertTrue(result.output.contains(missing), "\(missing) should be named: \(result.output)")
+        }
+        XCTAssertFalse(result.output.contains("MACOS_CERTIFICATE_P12"), "Only the missing secrets should be named")
+    }
+
+    func testNotarizationSecretsWithoutACertificateFailsNamingTheMissingOnes() throws {
+        let result = try checkSigning(present: ["APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"])
+
+        XCTAssertNotEqual(result.status, 0)
+        for missing in ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"] {
+            XCTAssertTrue(result.output.contains(missing), "\(missing) should be named: \(result.output)")
+        }
+    }
+
+    func testAnySingleMissingSecretFailsTheCheck() throws {
+        for missing in allSecrets {
+            let result = try checkSigning(present: allSecrets.filter { $0 != missing })
+
+            XCTAssertNotEqual(result.status, 0, "Without \(missing) the configuration is partial")
+            XCTAssertTrue(result.output.contains(missing), result.output)
+        }
+    }
+
+    // MARK: Release notes
+
+    private func notes(mode: String, notarized: String) throws -> Shell.Outcome {
+        try Shell.runScript("release-notes.sh", args: [mode, notarized])
+    }
+
+    func testNotarizedReleasesAreDescribedAsSignedAndNotarized() throws {
+        let result = try notes(mode: "developer-id", notarized: "true")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertTrue(result.output.contains("Signed and notarized"))
+        XCTAssertFalse(result.output.localizedCaseInsensitiveContains("ad-hoc"))
+        XCTAssertFalse(result.output.contains("xattr"))
+    }
+
+    func testDeveloperIDBuildsThatSkippedNotarizationAreNotCalledAdHoc() throws {
+        let result = try notes(mode: "developer-id", notarized: "")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertTrue(result.output.contains("Developer ID"))
+        XCTAssertTrue(result.output.contains("not notarized"))
+        XCTAssertFalse(result.output.localizedCaseInsensitiveContains("ad-hoc"))
+        XCTAssertTrue(result.output.contains("xattr -dr com.apple.quarantine"), "Users still need the Gatekeeper workaround")
+    }
+
+    func testAdHocReleasesCarryTheLaunchInstructions() throws {
+        let result = try notes(mode: "ad-hoc", notarized: "")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertTrue(result.output.contains("Ad-hoc signed"))
+        XCTAssertTrue(result.output.contains("xattr -dr com.apple.quarantine MeetingAssistant.app"))
+        XCTAssertFalse(result.output.contains("Developer ID"))
+    }
+
+    func testAnAdHocBuildCanNeverBeDescribedAsNotarized() throws {
+        XCTAssertEqual(try notes(mode: "ad-hoc", notarized: "").status, 0, "A valid combination is the control for the rejections below")
+        XCTAssertNotEqual(try notes(mode: "ad-hoc", notarized: "true").status, 0)
+        XCTAssertNotEqual(try notes(mode: "mystery", notarized: "").status, 0)
+    }
+
+    func testTheScriptsTheWorkflowsCallAreExecutable() throws {
+        for name in ["release-resolve-version.sh", "release-check-signing.sh", "release-exists.sh", "release-notes.sh", "setup-release-signing.sh", "install-xcodegen.sh"] {
+            XCTAssertTrue(FileManager.default.isExecutableFile(atPath: Repo.url("scripts/\(name)").path), name)
+        }
+    }
+}
+
+// MARK: - Release existence check
+
+final class ReleaseExistsScriptTests: XCTestCase {
+    private let releaseLookup = "api repos/*/releases/tags/*"
+    private let tagLookup = "api repos/*/git/ref/tags/*"
+
+    private struct Check {
+        let result: Shell.Outcome
+        let calls: [String]
+    }
+
+    private func check(tag: String = "v1.2.3", release: FakeGitHub.Answer, tagRef: FakeGitHub.Answer = .notFound,
+                       repo: String? = "acme/widgets") throws -> Check {
+        let github = try FakeGitHub(for: self, rules: [(releaseLookup, release), (tagLookup, tagRef)])
+        var env = github.environment
+        env["GH_TOKEN"] = "fake-token"
+        if let repo { env["GH_REPO"] = repo }
+        let result = try Shell.runScript("release-exists.sh", args: [tag], env: env)
+        return Check(result: result, calls: github.calls)
+    }
+
+    func testAPublishedReleaseMeansThereIsNothingToDo() throws {
+        let outcome = try check(release: .ok)
+
+        XCTAssertEqual(outcome.result.status, 0, outcome.result.output)
+        XCTAssertEqual(outcome.result.outputs["exists"], "true")
+        XCTAssertTrue(outcome.result.output.contains("v1.2.3"), "the notice names the release: \(outcome.result.output)")
+    }
+
+    func testNoReleaseAndNoTagMeansTheVersionIsFree() throws {
+        let outcome = try check(release: .notFound, tagRef: .notFound)
+
+        XCTAssertEqual(outcome.result.status, 0, outcome.result.output)
+        XCTAssertEqual(outcome.result.outputs["exists"], "false")
+    }
+
+    func testOnlyANotFoundAnswerCountsAsNoRelease() throws {
+        let answers: [FakeGitHub.Answer] = [
+            .failure(code: 502, message: "Bad Gateway"),
+            .failure(code: 503, message: "Service Unavailable"),
+            .failure(code: 500, message: "Server Error"),
+            .failure(code: 403, message: "API rate limit exceeded"),
+            .failure(code: 401, message: "Bad credentials"),
+        ]
+        for answer in answers {
+            let outcome = try check(release: answer)
+
+            XCTAssertNotEqual(outcome.result.status, 0, "\(answer): a failed lookup must not read as 'no release'")
+            XCTAssertNil(outcome.result.outputs["exists"], "\(answer): no verdict may be left for later steps")
+            XCTAssertTrue(outcome.result.output.contains("::error::"), outcome.result.output)
+        }
+    }
+
+    func testTheFailureNamesWhatGitHubSaid() throws {
+        let outcome = try check(release: .failure(code: 502, message: "Bad Gateway"))
+
+        XCTAssertTrue(outcome.result.output.contains("HTTP 502"), outcome.result.output)
+        XCTAssertTrue(outcome.result.output.contains("v1.2.3"), outcome.result.output)
+    }
+
+    func testATagThatAlreadyExistsWithoutAReleaseFailsSoNewCodeIsNeverAttachedToAnOldTag() throws {
+        let outcome = try check(release: .notFound, tagRef: .ok)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertNil(outcome.result.outputs["exists"])
+        XCTAssertTrue(outcome.result.output.contains("::error::"), outcome.result.output)
+        XCTAssertTrue(outcome.result.output.contains("v1.2.3"), outcome.result.output)
+        XCTAssertTrue(outcome.result.output.contains("tag"), outcome.result.output)
+    }
+
+    func testAnErrorLookingUpTheTagFailsToo() throws {
+        let outcome = try check(release: .notFound, tagRef: .failure(code: 502, message: "Bad Gateway"))
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertNil(outcome.result.outputs["exists"])
+    }
+
+    func testTheTagIsOnlyLookedUpWhenThereIsNoRelease() throws {
+        let outcome = try check(release: .ok, tagRef: .ok)
+
+        XCTAssertEqual(outcome.result.status, 0, "a release with its tag is the normal state of a published version")
+        XCTAssertEqual(outcome.calls.count, 1, outcome.calls.joined(separator: "\n"))
+    }
+
+    func testItAsksAboutTheExactTagInTheNamedRepository() throws {
+        let outcome = try check(release: .notFound, tagRef: .notFound, repo: "someone/else")
+
+        XCTAssertEqual(outcome.calls, ["gh api repos/someone/else/releases/tags/v1.2.3",
+                                       "gh api repos/someone/else/git/ref/tags/v1.2.3"])
+    }
+
+    func testItOnlyReadsFromGitHub() throws {
+        let outcome = try check(release: .notFound, tagRef: .notFound)
+
+        XCTAssertFalse(outcome.calls.isEmpty)
+        for call in outcome.calls {
+            XCTAssertTrue(call.hasPrefix("gh api repos/"), call)
+            XCTAssertFalse(call.contains("--method") || call.contains("-X"), "a check must never write: \(call)")
+        }
+    }
+
+    func testAMalformedTagIsRefusedBeforeGitHubIsAsked() throws {
+        for bad in ["", "1.2.3", "v1.2", "v1.2.3/../x", "v1.2.3 v1.2.4", "$(id)"] {
+            let outcome = try check(tag: bad, release: .notFound)
+
+            XCTAssertNotEqual(outcome.result.status, 0, "'\(bad)' should be refused")
+            XCTAssertTrue(outcome.calls.isEmpty, "'\(bad)' must not reach the API path: \(outcome.calls)")
+        }
+    }
+
+    func testTheRepositoryMustBeNamed() throws {
+        let outcome = try check(release: .notFound, repo: nil)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertTrue(outcome.calls.isEmpty)
+    }
+}
+
+// MARK: - Pinned XcodeGen
+
+final class InstallXcodeGenScriptTests: XCTestCase {
+    private struct Install {
+        let result: Shell.Outcome
+        let destination: URL
+        let pathAdditions: [String]
+        let curlCalls: [String]
+    }
+
+    /// A release zip with the layout XcodeGen publishes (xcodegen/bin/xcodegen), whose binary reports `reports`.
+    private func makeArchive(reports version: String) throws -> (zip: URL, sha256: String) {
+        let work = try Shell.makeTempDirectory(for: self)
+        let bin = work.appendingPathComponent("xcodegen/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let binary = bin.appendingPathComponent("xcodegen")
+        try "#!/bin/sh\necho 'Version: \(version)'\n".write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        let zip = work.appendingPathComponent("xcodegen.zip")
+        let made = try Shell.run("/usr/bin/ditto", ["-c", "-k", "--keepParent", work.appendingPathComponent("xcodegen").path, zip.path])
+        XCTAssertEqual(made.status, 0, made.output)
+        let digest = try Shell.run("/usr/bin/shasum", ["-a", "256", zip.path])
+        return (zip, String(try XCTUnwrap(digest.output.split(separator: " ").first)))
+    }
+
+    /// Runs a copy of the script. `pin` rewrites its checksum to the fixture's, which is the only way to
+    /// exercise the success path without the real release zip; nil keeps the real pin.
+    private func install(serving archive: URL?, pin: String? = nil, curlFails: Bool = false) throws -> Install {
+        let checkout = try Shell.makeTempDirectory(for: self)
+        let bin = try Shell.makeTempDirectory(for: self)
+        let destination = try Shell.makeTempDirectory(for: self).appendingPathComponent("xcodegen-install")
+        let log = bin.appendingPathComponent("curl.log")
+        let pathFile = bin.appendingPathComponent("github_path")
+        FileManager.default.createFile(atPath: pathFile.path, contents: nil)
+
+        var script = try Repo.text("scripts/install-xcodegen.sh")
+        if let pin {
+            script = script.replacingOccurrences(of: #"SHA256="[0-9a-f]{64}""#, with: "SHA256=\"\(pin)\"", options: .regularExpression)
+        }
+        let copy = checkout.appendingPathComponent("install-xcodegen.sh")
+        try script.write(to: copy, atomically: true, encoding: .utf8)
+
+        let curl = bin.appendingPathComponent("curl")
+        try """
+        #!/bin/bash
+        echo "curl $*" >> "$CURL_LOG"
+        [ -z "${CURL_FAILS:-}" ] || exit 22
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "--output" ]; then cp "$FAKE_ARCHIVE" "$2"; fi
+          shift
+        done
+        """.write(to: curl, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: curl.path)
+
+        var env = ["PATH": "\(bin.path):/usr/bin:/bin", "CURL_LOG": log.path, "GITHUB_PATH": pathFile.path]
+        if let archive { env["FAKE_ARCHIVE"] = archive.path }
+        if curlFails { env["CURL_FAILS"] = "1" }
+        let result = try Shell.runBash(copy, args: [destination.path], env: env)
+        func lines(_ url: URL) -> [String] {
+            ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+        }
+        return Install(result: result, destination: destination, pathAdditions: lines(pathFile), curlCalls: lines(log))
+    }
+
+    func testTheScriptPinsAnExactVersionAndItsChecksum() throws {
+        let script = try Repo.text("scripts/install-xcodegen.sh")
+
+        XCTAssertNotNil(script.range(of: #"(?m)^VERSION="\d+\.\d+\.\d+"$"#, options: .regularExpression))
+        XCTAssertNotNil(script.range(of: #"(?m)^SHA256="[0-9a-f]{64}"$"#, options: .regularExpression))
+        XCTAssertTrue(script.contains("https://github.com/yonaskolb/XcodeGen/releases/download/$VERSION/xcodegen.zip"))
+    }
+
+    func testAVerifiedDownloadIsUnpackedAndItsBinDirectoryPutOnThePath() throws {
+        let archive = try makeArchive(reports: "2.45.3")
+
+        let outcome = try install(serving: archive.zip, pin: archive.sha256)
+
+        XCTAssertEqual(outcome.result.status, 0, outcome.result.output)
+        let bin = outcome.destination.appendingPathComponent("xcodegen/bin").path
+        XCTAssertEqual(outcome.pathAdditions, [bin])
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: bin + "/xcodegen"))
+    }
+
+    func testItDownloadsOverHTTPSAndFailsOnHTTPErrors() throws {
+        let archive = try makeArchive(reports: "2.45.3")
+
+        let outcome = try install(serving: archive.zip, pin: archive.sha256)
+
+        XCTAssertEqual(outcome.curlCalls.count, 1, outcome.curlCalls.joined(separator: "\n"))
+        XCTAssertTrue(outcome.curlCalls[0].contains("--fail"), "an HTML error page must not be saved as the zip")
+        XCTAssertTrue(outcome.curlCalls[0].contains(" https://github.com/yonaskolb/XcodeGen/releases/download/"), outcome.curlCalls[0])
+    }
+
+    func testADownloadThatDoesNotMatchThePinnedChecksumIsRejectedAndNeverReachesThePath() throws {
+        let archive = try makeArchive(reports: "2.45.3")
+
+        let outcome = try install(serving: archive.zip)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertTrue(outcome.result.output.contains("checksum"), outcome.result.output)
+        XCTAssertEqual(outcome.pathAdditions, [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outcome.destination.appendingPathComponent("xcodegen").path),
+                       "an archive that failed its check must not be unpacked")
+    }
+
+    func testABinaryThatIsNotThePinnedVersionIsRejected() throws {
+        let archive = try makeArchive(reports: "9.9.9")
+
+        let outcome = try install(serving: archive.zip, pin: archive.sha256)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertTrue(outcome.result.output.contains("9.9.9"), outcome.result.output)
+        XCTAssertEqual(outcome.pathAdditions, [])
+    }
+
+    func testAFailedDownloadFailsTheStep() throws {
+        let outcome = try install(serving: nil, curlFails: true)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertEqual(outcome.pathAdditions, [])
+    }
+}
+
+// MARK: - Signing setup script
+
+final class SigningSetupScriptTests: XCTestCase {
+    private let answers = ["p12-password", "Developer ID Application: Test (TEAMID)", "dev@example.com", "TEAMID", "app-password"]
+
+    /// What the GitHub API says when the script looks for the "release" environment.
+    private enum Environment {
+        case missing
+        case exists
+        case unavailable
+    }
+
+    private struct Setup {
+        let checkout: URL
+        let elsewhere: URL
+        let github: FakeGitHub
+        var script: URL { checkout.appendingPathComponent("scripts/setup-release-signing.sh") }
+        var p12: URL { elsewhere.appendingPathComponent("key.p12") }
+
+        var ghCalls: [String] { github.calls }
+        var secretWrites: [String] { ghCalls.filter { $0.hasPrefix("gh secret set") } }
+        var environmentWrites: [String] { ghCalls.filter { $0.contains("--method") } }
+    }
+
+    private func makeSetup(origin: String?, environment: Environment = .missing) throws -> Setup {
+        let checkout = try Shell.makeTempDirectory(for: self)
+        let elsewhere = try Shell.makeTempDirectory(for: self)
+
+        try FileManager.default.createDirectory(at: checkout.appendingPathComponent("scripts"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: Repo.url("scripts/setup-release-signing.sh"),
+                                         to: checkout.appendingPathComponent("scripts/setup-release-signing.sh"))
+        _ = try Shell.run("/usr/bin/git", ["init", "-q", checkout.path])
+        if let origin {
+            _ = try Shell.run("/usr/bin/git", ["-C", checkout.path, "remote", "add", "origin", origin])
+        }
+        try "certificate".write(to: elsewhere.appendingPathComponent("key.p12"), atomically: true, encoding: .utf8)
+
+        let lookup = "api repos/*/environments/release"
+        let rules: [(arguments: String, answer: FakeGitHub.Answer)] = switch environment {
+        case .missing: [(lookup, .notFound)]
+        case .exists: []
+        case .unavailable: [(lookup, .failure(code: 502, message: "Bad Gateway"))]
+        }
+        return Setup(checkout: checkout, elsewhere: elsewhere, github: try FakeGitHub(for: self, rules: rules))
+    }
+
+    private func run(_ setup: Setup, args: [String]? = nil, typing lines: [String]) throws -> Shell.Outcome {
+        try Shell.runBash(setup.script,
+                          args: args ?? ["key.p12"],
+                          env: setup.github.environment,
+                          cwd: setup.elsewhere,
+                          stdin: lines.joined(separator: "\n") + "\n")
+    }
+
+    func testItWritesToTheRepoOfItsOwnCheckoutNoMatterWhereItIsRun() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertTrue(result.output.contains("acme/widgets"), "The target repo must be shown: \(result.output)")
+        XCTAssertEqual(setup.secretWrites.count, 6)
+        for write in setup.secretWrites {
+            XCTAssertTrue(write.contains("--repo acme/widgets"), write)
+        }
+        XCTAssertEqual(Set(setup.secretWrites.compactMap { $0.split(separator: " ").dropFirst(3).first.map(String.init) }),
+                       ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY",
+                        "APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"])
+    }
+
+    func testItUnderstandsHTTPSOriginsWithCredentialsAndTrailingSlashes() throws {
+        for origin in ["https://github.com/acme/widgets", "https://github.com/acme/widgets/", "https://github.com/acme/widgets.git",
+                       "https://x-access-token:abc@github.com/acme/widgets.git", "ssh://git@github.com/acme/widgets.git"] {
+            let setup = try makeSetup(origin: origin)
+
+            let result = try run(setup, typing: ["y"] + answers)
+
+            XCTAssertEqual(result.status, 0, "\(origin): \(result.output)")
+            XCTAssertTrue(setup.secretWrites.allSatisfy { $0.contains("--repo acme/widgets") }, origin)
+        }
+    }
+
+    func testSecretsAreStoredInTheReleaseEnvironment() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+
+        _ = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertEqual(setup.secretWrites.count, 6)
+        XCTAssertTrue(setup.secretWrites.allSatisfy { $0.contains("--env release") }, setup.secretWrites.joined(separator: "\n"))
+    }
+
+    func testAMissingEnvironmentIsCreatedAndLimitedToTheMainBranchBeforeAnySecretIsWritten() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .missing)
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        let put = try XCTUnwrap(setup.ghCalls.firstIndex { $0.hasPrefix("gh api --method PUT repos/acme/widgets/environments/release") },
+                                setup.ghCalls.joined(separator: "\n"))
+        XCTAssertTrue(setup.ghCalls[put].contains("deployment_branch_policy[custom_branch_policies]=true"), setup.ghCalls[put])
+        XCTAssertTrue(setup.ghCalls[put].contains("deployment_branch_policy[protected_branches]=false"), setup.ghCalls[put])
+        let policy = try XCTUnwrap(setup.ghCalls.firstIndex {
+            $0.hasPrefix("gh api --method POST repos/acme/widgets/environments/release/deployment-branch-policies")
+        }, setup.ghCalls.joined(separator: "\n"))
+        XCTAssertTrue(setup.ghCalls[policy].contains("name=main"), setup.ghCalls[policy])
+        XCTAssertTrue(setup.ghCalls[policy].contains("type=branch"), setup.ghCalls[policy])
+        let firstSecret = try XCTUnwrap(setup.ghCalls.firstIndex { $0.hasPrefix("gh secret set") })
+        XCTAssertLessThan(put, policy, "the policy needs the environment to exist")
+        XCTAssertLessThan(policy, firstSecret, "no secret may exist in an environment any branch can use")
+    }
+
+    func testAnExistingEnvironmentIsLeftAloneSoItsProtectionRulesSurvive() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .exists)
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(setup.environmentWrites, [], "a bare PUT would reset its reviewers and branch policy")
+        XCTAssertEqual(setup.secretWrites.count, 6)
+        XCTAssertTrue(result.output.contains("already existed"), "it says it did not touch the rules: \(result.output)")
+    }
+
+    func testAnErrorLookingUpTheEnvironmentIsNotTakenForAMissingOne() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .unavailable)
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertEqual(setup.environmentWrites, [], "a 502 says nothing about the environment: \(setup.ghCalls)")
+        XCTAssertEqual(setup.secretWrites, [])
+        XCTAssertTrue(result.output.contains("502"), result.output)
+    }
+
+    func testTheEnvironmentIsCheckedBeforeAnySecretIsTypedSoAFailureWastesNoTyping() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .unavailable)
+
+        let result = try run(setup, typing: ["y"])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("502"), "it fails on the lookup, not on a missing answer: \(result.output)")
+    }
+
+    func testNothingIsWrittenUntilTheTargetIsConfirmed() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+
+        let result = try run(setup, typing: ["n"] + answers)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(setup.ghCalls.isEmpty, "gh must not be called without confirmation: \(setup.ghCalls)")
+        XCTAssertTrue(result.output.contains("acme/widgets"))
+    }
+
+    func testAnEmptyAnswerDoesNotConfirm() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+
+        let result = try run(setup, typing: [""] + answers)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(setup.ghCalls.isEmpty)
+    }
+
+    func testTheRepoFlagOverridesTheOriginRemote() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+
+        let result = try run(setup, args: ["--repo", "someone/else", "key.p12"], typing: ["y"] + answers)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(setup.secretWrites.count, 6)
+        XCTAssertTrue(setup.secretWrites.allSatisfy { $0.contains("--repo someone/else") })
+    }
+
+    func testAMalformedRepoFlagIsRejected() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+
+        let result = try run(setup, args: ["--repo", "not-a-repo", "key.p12"], typing: ["y"] + answers)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("OWNER/NAME"), result.output)
+        XCTAssertTrue(setup.ghCalls.isEmpty)
+    }
+
+    func testANonGitHubOriginRequiresAnExplicitRepo() throws {
+        let setup = try makeSetup(origin: "https://gitlab.example.com/acme/widgets.git")
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("--repo"), result.output)
+        XCTAssertTrue(setup.ghCalls.isEmpty)
+    }
+
+    func testMissingOriginRequiresAnExplicitRepo() throws {
+        let setup = try makeSetup(origin: nil)
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("--repo"), result.output)
+        XCTAssertTrue(setup.ghCalls.isEmpty)
+    }
+
+    func testEverySecretWriteInTheScriptNamesTheRepo() throws {
+        let script = try Repo.text("scripts/setup-release-signing.sh")
+
+        let writes = script.split(separator: "\n").filter { $0.contains("gh secret set") && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+        XCTAssertFalse(writes.isEmpty)
+        for write in writes {
+            XCTAssertTrue(write.contains("--repo"), "\(write)")
+        }
+    }
+}
+
+// MARK: - Repository hygiene
+
+final class RepositoryHygieneTests: XCTestCase {
+    func testSigningMaterialIsGitignored() throws {
+        let ignored = Set(try Repo.text(".gitignore").split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) })
+
+        for pattern in ["*.p12", "*.cer", "*.p8"] {
+            XCTAssertTrue(ignored.contains(pattern), "\(pattern) must be ignored so a certificate export cannot be committed")
+        }
+    }
+
+    func testProjectDefaultsMatchTheVERSIONFile() throws {
+        let version = try Repo.text("VERSION").trimmingCharacters(in: .whitespacesAndNewlines)
+        let project = try Repo.text("project.yml")
+
+        let marketing = try XCTUnwrap(captures(#"MARKETING_VERSION:\s*"([^"]+)""#, in: project).first?.first)
+
+        XCTAssertEqual("v\(marketing)", version, "Bump VERSION and project.yml together so local builds report the release version")
+    }
+}
+
+// MARK: - Support
+
+private enum Repo {
+    static let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+
+    static func url(_ path: String) -> URL { root.appendingPathComponent(path) }
+
+    static func text(_ path: String) throws -> String {
+        try String(contentsOf: url(path), encoding: .utf8)
+    }
+}
+
+private func captures(_ pattern: String, in text: String) -> [[String]] {
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) else { return [] }
+    return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).map { match in
+        (1..<match.numberOfRanges).compactMap { index in
+            Range(match.range(at: index), in: text).map { String(text[$0]) }
+        }
+    }
+}
+
+private struct Step {
+    let text: String
+
+    var name: String { first(#"^(?:      - |        )name:\s*(.+?)\s*$"#) ?? "" }
+    var uses: String? { first(#"^(?:      - |        )uses:\s*(\S+)"#) }
+    var condition: String? { first(#"^        if:\s*(.+?)\s*$"#) }
+
+    /// Secrets passed through as values (`${{ secrets.X }}`); presence checks such as `secrets.X != ''` are not values.
+    var secretValues: [String] { captures(#"\$\{\{\s*secrets\.([A-Z0-9_]+)\s*\}\}"#, in: text).compactMap(\.first) }
+
+    private func first(_ pattern: String) -> String? { captures(pattern, in: text).first?.first }
+}
+
+private struct Workflow {
+    let text: String
+    /// Everything above the job's steps: triggers, permissions, environment, conditions and job-level env.
+    let header: String
+    let steps: [Step]
+
+    init(_ file: String) throws {
+        text = try Repo.text(".github/workflows/\(file)")
+        let parts = text.components(separatedBy: "\n    steps:\n")
+        guard parts.count == 2 else { throw WorkflowError.noSteps(file) }
+        header = parts[0]
+        var blocks: [[String]] = []
+        for line in parts[1].components(separatedBy: "\n") {
+            if line.hasPrefix("      - ") { blocks.append([line]) } else if !blocks.isEmpty { blocks[blocks.count - 1].append(line) }
+        }
+        steps = blocks.map { Step(text: $0.joined(separator: "\n")) }
+    }
+
+    func indexOfStep(_ name: String) throws -> Int {
+        try XCTUnwrap(steps.firstIndex { $0.name == name }, "No step named \(name)")
+    }
+
+    func step(_ name: String) throws -> Step {
+        steps[try indexOfStep(name)]
+    }
+
+    enum WorkflowError: Error { case noSteps(String) }
+}
+
+/// The GitHub CLI, the one boundary the release scripts talk to and the one that must never be reached from a
+/// test. Every call is logged. Answers come from rules, first match wins: a glob over the arguments and what
+/// the real `gh` does on failure (a message on stderr, status 1). A call no rule covers succeeds silently.
+private struct FakeGitHub {
+    enum Answer {
+        case ok
+        case notFound
+        case failure(code: Int, message: String)
+
+        fileprivate var line: String {
+            switch self {
+            case .ok: return "0|"
+            case .notFound: return "1|gh: Not Found (HTTP 404)"
+            case let .failure(code, message): return "1|gh: \(message) (HTTP \(code))"
+            }
+        }
+    }
+
+    let bin: URL
+    private let log: URL
+    private let rules: URL
+
+    init(for test: XCTestCase, rules answers: [(arguments: String, answer: Answer)] = []) throws {
+        bin = try Shell.makeTempDirectory(for: test)
+        log = bin.appendingPathComponent("gh.log")
+        rules = bin.appendingPathComponent("gh.rules")
+        try answers.map { "\($0.arguments)|\($0.answer.line)\n" }.joined()
+            .write(to: rules, atomically: true, encoding: .utf8)
+        let gh = bin.appendingPathComponent("gh")
+        try """
+        #!/bin/bash
+        echo "gh $*" >> "$GH_LOG"
+        if [ "$1 $2" = "secret set" ]; then cat >/dev/null; fi
+        while IFS='|' read -r pattern status message || [ -n "$pattern" ]; do
+          [ -n "$pattern" ] || continue
+          case "$*" in
+            $pattern)
+              [ -z "$message" ] || echo "$message" >&2
+              exit "$status" ;;
+          esac
+        done < "$GH_RULES"
+        exit 0
+        """.write(to: gh, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: gh.path)
+    }
+
+    /// The environment that puts this fake first on the PATH.
+    var environment: [String: String] {
+        ["PATH": "\(bin.path):/usr/bin:/bin", "GH_LOG": log.path, "GH_RULES": rules.path]
+    }
+
+    var calls: [String] {
+        ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+}
+
+private enum Shell {
+    struct Outcome {
+        let status: Int32
+        let output: String
+        /// Lines the script wrote to $GITHUB_OUTPUT, as key/value pairs.
+        let outputs: [String: String]
+    }
+
+    static func makeTempDirectory(for test: XCTestCase) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ReleaseConfigTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        test.addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    static func runScript(_ name: String, args: [String] = [], env: [String: String] = [:]) throws -> Outcome {
+        try runBash(Repo.url("scripts/\(name)"), args: args, env: env)
+    }
+
+    static func run(_ executable: String, _ args: [String], path: String = "/usr/bin:/bin") throws -> Outcome {
+        try launch(executable, args, env: ["PATH": path], cwd: nil, stdin: "")
+    }
+
+    static func runBash(_ script: URL, args: [String] = [], env: [String: String] = [:], cwd: URL? = nil, stdin: String = "") throws -> Outcome {
+        try launch("/bin/bash", [script.path] + args, env: env, cwd: cwd, stdin: stdin)
+    }
+
+    /// Runs with a clean environment: the runner's own GITHUB_OUTPUT, tokens and git config must never leak into a test.
+    private static func launch(_ executable: String, _ args: [String], env: [String: String], cwd: URL?, stdin: String) throws -> Outcome {
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("ReleaseConfigTests-run-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+
+        let outputFile = scratch.appendingPathComponent("github_output")
+        let stdinFile = scratch.appendingPathComponent("stdin")
+        FileManager.default.createFile(atPath: outputFile.path, contents: nil)
+        try stdin.write(to: stdinFile, atomically: true, encoding: .utf8)
+
+        var environment = [
+            "PATH": "/usr/bin:/bin",
+            "HOME": scratch.path,
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GITHUB_OUTPUT": outputFile.path,
+        ]
+        environment.merge(env) { _, new in new }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = args
+        process.environment = environment
+        process.currentDirectoryURL = cwd
+        process.standardInput = try FileHandle(forReadingFrom: stdinFile)
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        let written = (try? String(contentsOf: outputFile, encoding: .utf8)) ?? ""
+        let outputs = Dictionary(written.split(separator: "\n").compactMap { line -> (String, String)? in
+            guard let separator = line.firstIndex(of: "=") else { return nil }
+            return (String(line[..<separator]), String(line[line.index(after: separator)...]))
+        }, uniquingKeysWith: { _, last in last })
+        return Outcome(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self), outputs: outputs)
+    }
+}

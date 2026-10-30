@@ -5,10 +5,18 @@ final class FakeTranscriber: LiveTranscriber {
     let backendName: String
     var onSegment: (@MainActor (TranscriptSegment) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
     var grantsAuthorization: Bool
+    /// Leaves the authorization question unanswered until `resolveAuthorization`.
+    var holdsAuthorization = false
+    private var heldAuthorization: ((Bool) -> Void)?
     private(set) var starts = 0
+    /// Counts `stop()` and `cancel()` alike, so "was stopped" reads the same either way.
     private(set) var stops = 0
+    /// Only the privacy stops: audio is cut off and nothing is drained.
+    private(set) var cancels = 0
+    var isPreparing = false
     private let lock = NSLock()
     private var appendedCount = 0
 
@@ -19,9 +27,25 @@ final class FakeTranscriber: LiveTranscriber {
 
     var appended: Int { lock.withLock { appendedCount } }
 
-    func requestAuthorization(_ completion: @escaping (Bool) -> Void) { completion(grantsAuthorization) }
+    func requestAuthorization(_ completion: @escaping (Bool) -> Void) {
+        guard holdsAuthorization else {
+            completion(grantsAuthorization)
+            return
+        }
+        heldAuthorization = completion
+    }
+
+    @MainActor func resolveAuthorization() {
+        heldAuthorization?(grantsAuthorization)
+        heldAuthorization = nil
+    }
+
     func start() { starts += 1 }
     func stop() { stops += 1 }
+    func cancel() {
+        cancels += 1
+        stops += 1
+    }
     func append(_ buffer: AVAudioPCMBuffer) { lock.withLock { appendedCount += 1 } }
 
     @MainActor func emit(_ text: String, utterance: Int = 0, isFinal: Bool = true) {
@@ -29,16 +53,24 @@ final class FakeTranscriber: LiveTranscriber {
     }
 
     @MainActor func fail(_ message: String) { onError?(message) }
+
+    /// What a real backend does when it gives up: the reason is reported, then the side is declared dead.
+    @MainActor func die(_ message: String) {
+        onError?(message)
+        onFatal?(message)
+    }
     @MainActor func notice(_ message: String?) { onNotice?(message) }
 }
 
 final class FakeTranscriberFactory {
     var backendName = "on-device"
     var grantsAuthorization = true
+    var holdsAuthorization = false
     private(set) var made: [(speaker: Speaker, transcriber: FakeTranscriber)] = []
 
     func make(_ speaker: Speaker) -> LiveTranscriber {
         let transcriber = FakeTranscriber(backendName: backendName, grantsAuthorization: grantsAuthorization)
+        transcriber.holdsAuthorization = holdsAuthorization
         made.append((speaker, transcriber))
         return transcriber
     }
@@ -52,11 +84,14 @@ final class FakeTranscriberFactory {
 /// open to reproduce overlapping lifecycles.
 final class FakeSystemAudio: SystemAudioCapturing {
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
-    var onError: (@MainActor (String) -> Void)?
+    var onError: (@MainActor (CaptureFailure) -> Void)?
+    var onNotice: (@MainActor (String?) -> Void)?
     @MainActor var startError: Error?
     @MainActor var holdsStart = false
     @MainActor var holdsStop = false
     @MainActor private(set) var events: [String] = []
+    /// The app each start asked for, in order; nil is every app.
+    @MainActor private(set) var applications: [String?] = []
     @MainActor private var heldStart: CheckedContinuation<Void, Never>?
     @MainActor private var heldStop: CheckedContinuation<Void, Never>?
 
@@ -64,8 +99,11 @@ final class FakeSystemAudio: SystemAudioCapturing {
         events.last(where: { $0 == "started" || $0 == "stopped" }) == "started"
     }
 
-    func start() async throws { try await startOnMain() }
+    func start(application bundleID: String?) async throws { try await startOnMain(application: bundleID) }
+
     func stop() async { await stopOnMain() }
+
+    @MainActor func notice(_ message: String?) { onNotice?(message) }
 
     @MainActor func releaseStart() {
         heldStart?.resume()
@@ -77,7 +115,8 @@ final class FakeSystemAudio: SystemAudioCapturing {
         heldStop = nil
     }
 
-    @MainActor private func startOnMain() async throws {
+    @MainActor private func startOnMain(application bundleID: String?) async throws {
+        applications.append(bundleID)
         events.append("start")
         if holdsStart { await withCheckedContinuation { heldStart = $0 } }
         if let startError {
@@ -97,12 +136,16 @@ final class FakeSystemAudio: SystemAudioCapturing {
 final class FakeMicrophone: MicrophoneCapturing {
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onRecovered: (@MainActor () -> Void)?
     var authorized = true
     var startError: Error?
     private(set) var starts = 0
     private(set) var isRunning = false
+    @MainActor private(set) var reconnects = 0
 
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) { completion(authorized) }
+
+    @MainActor func reconnect() { reconnects += 1 }
 
     func start() throws {
         if let startError { throw startError }
@@ -151,6 +194,16 @@ final class ManualScheduler {
 
 final class TestClock {
     var now = Date(timeIntervalSince1970: 1_000)
+}
+
+/// The monotonic clock capture threads read, moved by hand.
+final class MeterClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: TimeInterval = 100
+
+    var seconds: TimeInterval { lock.withLock { current } }
+
+    func advance(_ seconds: TimeInterval) { lock.withLock { current += seconds } }
 }
 
 struct TestFailure: LocalizedError {

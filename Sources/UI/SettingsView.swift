@@ -1,17 +1,33 @@
 import SwiftUI
 
-/// Preferences window: API key (Keychain), model, behavior, shortcuts, extra
-/// prompt instructions, optional Deepgram cloud STT (only after agreeing to send
-/// it audio), privacy terms, and links to the permissions the app needs.
+/// Settings wording that carries a promise, kept apart from the layout so a test can
+/// check it, like `WelcomeText`.
+enum SettingsText {
+    /// A browser is one app to ScreenCaptureKit, so choosing it cannot leave a tab out.
+    static let meetingAudioHelp = "Pick the app your calls happen in to keep music and notification sounds out of the transcript. A browser is captured whole: if you pick one, audio from all of its tabs is heard, not only the call. If the app isn't running when you start listening, every app is heard and the overlay says so. Takes effect the next time you start listening."
+
+    static let transcriptsHelp = "Off by default. When on, each call is saved as a Markdown file every 30 seconds and when you stop, readable only by you. The files stay on this Mac unless you choose a folder that syncs to iCloud. Turning it on applies from the next Start Listening; turning it off stops saving right away. Saving also lets Summarize Meeting cover a very long call in full, and saves each summary next to its transcript."
+
+    static let iCloudFolderWarning = "This folder syncs to iCloud, so saved transcripts are uploaded to Apple's servers and appear on your other devices. Choose a folder that isn't synced to keep them on this Mac."
+}
+
+/// Preferences window: API key (Keychain), model, behavior, shortcuts, which
+/// app's audio to listen to, extra prompt instructions, optional Deepgram cloud
+/// STT and Apple's speech servers (each only after agreeing to send audio
+/// there), privacy terms, and links to the permissions the app needs.
 struct SettingsView: View {
     @ObservedObject var settings: AppSettings
     @ObservedObject var hotKeys: HotKeyBinder
     let showWelcome: () -> Void
     let withdrawTerms: () -> Void
+    let chooseTranscriptFolder: () -> Void
+    let showTranscriptsFolder: () -> Void
     @State private var apiKeyField = ""
     @State private var deepgramField = ""
     @State private var saveFailed = false
     @State private var confirmingCloudAudio = false
+    @State private var confirmingServerSpeech = false
+    @State private var runningApps = SettingsView.runningBundleIDs()
 
     var body: some View {
         Form {
@@ -24,7 +40,12 @@ struct SettingsView: View {
                               file: "~/.config/meeting-assistant/anthropic_key")
                     Spacer()
                     Button("Remove") { settings.removeAPIKey() }
-                        .disabled(settings.apiKeySource != .keychain)
+                        .disabled(!canRemove(settings.apiKeySource))
+                }
+                if settings.apiKeySource == .unreadable {
+                    Text("macOS wouldn't let Meeting Assistant read the saved key. Allow access when it asks, or save the key again.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
                 if saveFailed {
                     Text("Couldn't save the key to the Keychain.")
@@ -59,6 +80,18 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Meeting audio") {
+                Picker("Listen to", selection: $settings.captureAppBundleID) {
+                    Text("All apps").tag(String?.none)
+                    ForEach(MeetingApps.choices(running: runningApps, saved: settings.captureAppBundleID)) { app in
+                        Text(MeetingApps.label(for: app, running: runningApps)).tag(String?.some(app.bundleID))
+                    }
+                }
+                Text(SettingsText.meetingAudioHelp)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Speech-to-text") {
                 Toggle("Use Deepgram cloud STT instead of on-device", isOn: cloudSTTBinding)
                 SecureField("Deepgram API key", text: $deepgramField)
@@ -68,11 +101,23 @@ struct SettingsView: View {
                     keyStatus(settings.deepgramKeySource, environmentName: "DEEPGRAM_API_KEY", file: nil)
                     Spacer()
                     Button("Remove") { settings.removeDeepgramKey() }
-                        .disabled(settings.deepgramKeySource != .keychain)
+                        .disabled(!canRemove(settings.deepgramKeySource))
                 }
-                Text("On-device is the default (private). Cloud STT sends call audio to Deepgram and applies the next time you Start Listening.")
+                Text("On-device is the default (private). Turning cloud STT on sends call audio to Deepgram from the next time you Start Listening. Turning it off, or removing the key, stops that right away.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if !TranscriberFactory.analyzerAvailable {
+                    Toggle("Allow Apple's speech servers if on-device isn't available", isOn: serverSpeechBinding)
+                        .alert("Send call audio to Apple?", isPresented: $confirmingServerSpeech) {
+                            Button("Allow Apple's Servers") { settings.acceptServerSpeech() }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("If your Mac can't transcribe your language on-device, audio from both sides of your calls will stream to Apple's speech servers instead of staying on your Mac. Apple's privacy terms apply. You can turn this off any time, even mid-call.")
+                        }
+                    Text("Off by default. Without it, nothing is transcribed when on-device speech is unavailable. Downloading the language in System Settings, Keyboard, Dictation avoids needing it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Extra instructions") {
@@ -80,6 +125,28 @@ struct SettingsView: View {
                     .frame(minHeight: 70)
                     .font(.system(size: 12))
                 Text("Appended to the selected profile's prompt on every answer.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Transcripts") {
+                Toggle("Save transcripts to a folder on this Mac", isOn: $settings.saveTranscripts)
+                HStack {
+                    Text((settings.transcriptFolder.path as NSString).abbreviatingWithTildeInPath)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Show in Finder", action: showTranscriptsFolder)
+                    Button("Choose Folder…", action: chooseTranscriptFolder)
+                }
+                if settings.transcriptFolderSyncsToICloud {
+                    Label(SettingsText.iCloudFolderWarning, systemImage: "exclamationmark.icloud.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Text(SettingsText.transcriptsHelp)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -121,6 +188,12 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 720)
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in
+            runningApps = Self.runningBundleIDs()
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { _ in
+            runningApps = Self.runningBundleIDs()
+        }
         .alert("Send call audio to Deepgram?", isPresented: $confirmingCloudAudio) {
             Button("Send Audio to Deepgram") { settings.acceptCloudAudio() }
             Button("Cancel", role: .cancel) {}
@@ -142,6 +215,23 @@ struct SettingsView: View {
             })
     }
 
+    /// Turning Apple's servers on always asks; turning them off applies at once.
+    private var serverSpeechBinding: Binding<Bool> {
+        Binding(
+            get: { settings.serverSpeechAccepted },
+            set: { turnOn in
+                if turnOn {
+                    confirmingServerSpeech = true
+                } else {
+                    settings.revokeServerSpeech()
+                }
+            })
+    }
+
+    private static func runningBundleIDs() -> Set<String> {
+        Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+    }
+
     private func save(_ write: () -> Bool, clear: () -> Void) {
         saveFailed = !write()
         if !saveFailed { clear() }
@@ -153,10 +243,17 @@ struct SettingsView: View {
         case .keychain: text = "Saved in Keychain"
         case .environment: text = "Using \(environmentName)"
         case .file: text = "Using \(file ?? "key file")"
+        case .unreadable: text = "Allow Keychain access"
         case nil: text = "No key set"
         }
-        return Label(text, systemImage: source == nil ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
-            .foregroundStyle(source == nil ? .orange : .green)
+        let usable = source != nil && source != .unreadable
+        return Label(text, systemImage: usable ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+            .foregroundStyle(usable ? .green : .orange)
+    }
+
+    /// Only a Keychain item can be removed here, readable or not.
+    private func canRemove(_ source: AppSettings.KeySource?) -> Bool {
+        source == .keychain || source == .unreadable
     }
 
     private func modelLabel(_ id: String) -> String {

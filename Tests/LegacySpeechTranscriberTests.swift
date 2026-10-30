@@ -159,6 +159,38 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         XCTAssertEqual(h.engine.sessions[0].appended, 0)
     }
 
+    func testTheLastRequestsFinalResultStillArrivesAfterStopping() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].result("We should ship in", isFinal: false)
+
+        h.transcriber.stop()
+        h.flush()
+        h.engine.sessions[0].result("We should ship in May.", isFinal: true)
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last?.text, "We should ship in May.")
+        XCTAssertEqual(h.segments.last?.isFinal, true)
+    }
+
+    func testARequestThatFailsWhileFinishingAfterStopStillFinishesItsWords() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].result("We should ship in", isFinal: false)
+
+        h.transcriber.stop()
+        h.flush()
+        h.engine.sessions[0].fail()
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: h.segments[0].utterance, text: "We should ship in", isFinal: true))
+        XCTAssertEqual(h.engine.sessions.count, 1, "a stopped transcriber does not start another request")
+    }
+
     func testAnUnavailableRecognizerReportsAnError() async {
         let h = makeHarness()
         h.engine.isAvailable = false
@@ -171,15 +203,154 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         XCTAssertTrue(h.engine.sessions.isEmpty)
     }
 
-    func testServerRecognitionIsAnnounced() async {
+    // MARK: - Fatal failures (M1)
+
+    func testAnUnavailableRecognizerIsFatal() async {
+        let h = makeHarness()
+        h.engine.isAvailable = false
+
+        h.transcriber.start()
+        h.flush()
+
+        await eventually { !h.fatals.isEmpty }
+        XCTAssertEqual(h.fatals, ["Speech recognition isn't available for this language right now."])
+    }
+
+    func testRefusingServerRecognitionIsFatal() async {
         let h = makeHarness()
         h.engine.supportsOnDeviceRecognition = false
 
         h.transcriber.start()
         h.flush()
 
+        await eventually { !h.fatals.isEmpty }
+        XCTAssertEqual(h.fatals, h.errors, "the same words are shown to the user")
+        XCTAssertTrue(h.fatals.first?.hasPrefix("On-device speech recognition isn't available") ?? false)
+    }
+
+    func testRecognitionThatKeepsFailingIsAWarningNotFatal() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        for _ in 0..<LegacySpeechTranscriber.failuresBeforeReporting {
+            h.engine.sessions.last?.fail()
+            h.flush()
+            h.scheduler.fireAll()
+            h.flush()
+        }
+
+        await eventually { !h.errors.isEmpty }
+        XCTAssertEqual(h.fatals, [], "it keeps retrying, so the side is not dead")
+    }
+
+    // MARK: - Apple's servers (APP-1)
+
+    func testWithoutOnDeviceRecognitionNoSessionStartsAndTheUserIsToldHowToFixIt() async {
+        let h = makeHarness()
+        h.engine.supportsOnDeviceRecognition = false
+
+        h.transcriber.start()
+        h.flush()
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.flush()
+
+        await eventually { !h.errors.isEmpty }
+        XCTAssertTrue(h.engine.sessions.isEmpty)
+        XCTAssertEqual(h.errors, ["On-device speech recognition isn't available for this language. "
+                                  + "Download its Dictation language in System Settings (Keyboard, Dictation), "
+                                  + "or turn on Deepgram in Settings."])
+        XCTAssertEqual(h.transcriber.backendName, "on-device")
+    }
+
+    func testServerRecognitionStartsOnlyWhenItWasAllowedAndIsAnnounced() async {
+        let h = makeHarness(allowServerRecognition: true)
+        h.engine.supportsOnDeviceRecognition = false
+
+        h.transcriber.start()
+        h.flush()
+
         await eventually { !h.notices.isEmpty }
+        XCTAssertEqual(h.engine.sessions.count, 1)
+        XCTAssertEqual(h.transcriber.backendName, "Apple servers")
         XCTAssertEqual(h.notices, ["On-device speech isn't available for this language, so audio goes to Apple's servers."])
+        XCTAssertTrue(h.errors.isEmpty)
+    }
+
+    func testAllowingServerRecognitionStillPrefersTheDevice() async {
+        let h = makeHarness(allowServerRecognition: true)
+
+        h.transcriber.start()
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions.count, 1)
+        XCTAssertEqual(h.transcriber.backendName, "on-device")
+        await settle()
+        XCTAssertTrue(h.notices.isEmpty)
+    }
+
+    func testRequestsStayOnDeviceUnlessTheDeviceCannotDoIt() {
+        XCTAssertTrue(AppleSpeechEngine.makeRequest(onDevice: true).requiresOnDeviceRecognition)
+        XCTAssertFalse(AppleSpeechEngine.makeRequest(onDevice: false).requiresOnDeviceRecognition)
+    }
+
+    // MARK: - Failed requests (AUD-9)
+
+    func testARequestThatFailsAfterSpeechFinishesItsLastWords() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        h.engine.sessions[0].result("hello wor", isFinal: false)
+        h.engine.sessions[0].fail()
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: h.segments[0].utterance, text: "hello wor", isFinal: true))
+    }
+
+    func testAnEarlierRequestThatFailsInsteadOfFinishingStillFinishesItsWords() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].result("hello", isFinal: false)
+        h.clock.now += 46
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.flush()
+
+        h.engine.sessions[0].fail()
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: h.segments[0].utterance, text: "hello", isFinal: true))
+        XCTAssertEqual(h.engine.sessions.count, 2)
+    }
+
+    func testARequestThatAlreadyFinishedIsNotFinishedTwice() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].result("hello", isFinal: false)
+        h.engine.sessions[0].result("hello there", isFinal: true)
+
+        h.engine.sessions[0].fail()
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        await settle()
+        XCTAssertEqual(h.segments.map(\.isFinal), [false, true])
+    }
+
+    func testARequestThatHeardNothingLeavesNothingToFinish() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        h.engine.sessions[0].fail()
+        h.flush()
+
+        await settle()
+        XCTAssertTrue(h.segments.isEmpty)
     }
 
     func testRecognitionRequestsReportPartialsWithPunctuation() {
@@ -189,6 +360,81 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         XCTAssertTrue(onDevice.requiresOnDeviceRecognition)
 
         XCTAssertFalse(AppleSpeechEngine.makeRequest(onDevice: false).requiresOnDeviceRecognition)
+    }
+
+    // MARK: - Withdrawing consent (codex round 2 P1 #1)
+
+    func testAudioQueuedBeforeACancelNeverReachesTheRecognizer() {
+        let h = makeHarness(allowServerRecognition: true)
+        h.engine.supportsOnDeviceRecognition = false
+        h.transcriber.start()
+        h.flush()
+        let release = h.holdTheQueue()
+
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions[0].appended, 0, "audio queued before the withdrawal must not go to Apple")
+        XCTAssertTrue(h.engine.sessions[0].cancelled)
+        XCTAssertFalse(h.engine.sessions[0].finished, "finishing would let the recognizer carry on with the server")
+    }
+
+    func testAudioQueuedBeforeAUserStopStillReachesTheRecognizer() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        let release = h.holdTheQueue()
+
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.stop()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions[0].appended, 1)
+        XCTAssertTrue(h.engine.sessions[0].finished)
+    }
+
+    func testAudioHandedOverAfterACancelReturnedIsDropped() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        h.transcriber.cancel()
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions[0].appended, 0)
+    }
+
+    func testARetryQueuedBeforeACancelDoesNotStartANewRequest() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].fail()
+        h.flush()
+        let release = h.holdTheQueue()
+
+        h.scheduler.fireAll()
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions.count, 1)
+    }
+
+    func testAStartQueuedBeforeACancelNeverStartsARequest() {
+        let h = makeHarness()
+        let release = h.holdTheQueue()
+
+        h.transcriber.start()
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertTrue(h.engine.sessions.isEmpty)
     }
 
     // MARK: - Harness
@@ -202,26 +448,37 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         let startTime: Date
         var segments: [TranscriptSegment] = []
         var errors: [String] = []
+        var fatals: [String] = []
         var notices: [String] = []
 
-        init() {
+        init(allowServerRecognition: Bool) {
             engine = FakeSpeechEngine()
             scheduler = ManualScheduler()
             clock = TestClock()
             startTime = clock.now
             queue = DispatchQueue(label: "LegacySpeechTranscriberTests")
             transcriber = LegacySpeechTranscriber(engine: engine, queue: queue, now: { [clock] in clock.now },
-                                                  schedule: scheduler.schedule)
+                                                  schedule: scheduler.schedule,
+                                                  allowServerRecognition: allowServerRecognition)
         }
 
         func flush() { queue.sync {} }
+
+        /// Blocks the transcriber's queue, so what is handed over next waits behind
+        /// it. Call the result to let the queue go.
+        func holdTheQueue() -> () -> Void {
+            let gate = DispatchSemaphore(value: 0)
+            queue.async { gate.wait() }
+            return { gate.signal() }
+        }
     }
 
-    private func makeHarness() -> Harness {
-        let h = Harness()
-        h.transcriber.onSegment = { [unowned h] in h.segments.append($0) }
-        h.transcriber.onError = { [unowned h] in h.errors.append($0) }
-        h.transcriber.onNotice = { [unowned h] in if let notice = $0 { h.notices.append(notice) } }
+    private func makeHarness(allowServerRecognition: Bool = false) -> Harness {
+        let h = Harness(allowServerRecognition: allowServerRecognition)
+        h.transcriber.onSegment = { [weak h] in h?.segments.append($0) }
+        h.transcriber.onError = { [weak h] in h?.errors.append($0) }
+        h.transcriber.onFatal = { [weak h] in h?.fatals.append($0) }
+        h.transcriber.onNotice = { [weak h] in if let notice = $0 { h?.notices.append(notice) } }
         return h
     }
 }

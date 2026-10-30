@@ -86,6 +86,36 @@ final class TranscriptTests: XCTestCase {
         XCTAssertEqual(transcript.text, "Them: We should ship the beta next Tuesday.\nYou: ship the beta next Tuesday")
     }
 
+    func testAGenuineYouLineIsNotHiddenByWordsThemSaysAfterwards() {
+        var transcript = Transcript()
+        transcript.apply(partial(0, "okay"), from: .them, at: start)
+        transcript.apply(final(0, "ship the beta next Tuesday"), from: .you, at: start + 5)
+
+        transcript.apply(partial(0, "okay so you want to ship the beta next Tuesday"), from: .them, at: start + 6)
+
+        XCTAssertEqual(transcript.text,
+                       "Them: okay so you want to ship the beta next Tuesday\nYou: ship the beta next Tuesday")
+    }
+
+    func testAnEchoStaysHiddenWhenThemSpeaksAgainMuchLater() {
+        var transcript = Transcript()
+        transcript.apply(final(0, "We should ship the beta next Tuesday."), from: .them, at: start)
+        transcript.apply(partial(0, "ship the beta next Tuesday"), from: .you, at: start + 1)
+
+        transcript.apply(partial(1, "unrelated"), from: .them, at: start + 100)
+
+        XCTAssertEqual(transcript.text, "Them: We should ship the beta next Tuesday. unrelated")
+    }
+
+    func testAnEchoIsCaughtWhenThemReportsItAfterTheMicrophoneStartedHearingIt() {
+        var transcript = Transcript()
+        transcript.apply(partial(0, "ship the beta next Tuesday"), from: .you, at: start)
+
+        transcript.apply(partial(0, "We should ship the beta next Tuesday"), from: .them, at: start + 1)
+
+        XCTAssertEqual(transcript.text, "Them: We should ship the beta next Tuesday")
+    }
+
     func testShortRepliesAreNeverTreatedAsEcho() {
         var transcript = Transcript()
         transcript.apply(final(0, "Next Tuesday works."), from: .them, at: start)

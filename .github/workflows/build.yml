@@ -6,19 +6,25 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: macos-26
+    timeout-minutes: 30
     env:
       APP: build/Build/Products/Release/MeetingAssistant.app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Show Xcode
         run: xcodebuild -version
 
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: scripts/install-xcodegen.sh
 
       - name: Generate Xcode project
         run: xcodegen generate
@@ -56,7 +62,7 @@ jobs:
           ls -lh MeetingAssistant.app.zip
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: MeetingAssistant-app
           path: MeetingAssistant.app.zip

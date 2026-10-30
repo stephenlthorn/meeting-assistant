@@ -8,7 +8,9 @@ protocol AudioInputEngine: AnyObject {
     /// Called on any thread when the input device or its format changes; the
     /// engine has stopped itself by then.
     var onConfigurationChange: (() -> Void)? { get set }
-    func installTap(format: AVAudioFormat, block: @escaping (AVAudioPCMBuffer) -> Void)
+    /// A nil format taps the input in whatever format it has at that moment;
+    /// naming one that has since changed raises an exception that cannot be caught.
+    func installTap(format: AVAudioFormat?, block: @escaping (AVAudioPCMBuffer) -> Void)
     func removeTap()
     func start() throws
     func stop()
@@ -27,17 +29,35 @@ enum MicrophoneError: LocalizedError {
 /// AVAudioEngine), and a change of input device, such as connecting AirPods
 /// mid-call, restarts capture with the new device's format.
 ///
+/// A restart that fails (a Bluetooth headset can briefly have no input at all)
+/// does not end capture: the microphone stays armed, retries with backoff, and
+/// tries again on the next device change. The failure is reported through
+/// `onError` only once the retries run out, so a blip is not worth interrupting
+/// a call for, and `onRecovered` says when it works again.
+///
 /// Permission: needs microphone access (NSMicrophoneUsageDescription in
 /// Info.plist; the system prompt is triggered by `requestAuthorization`).
 final class MicCapture: MicrophoneCapturing {
+    /// Waits before each retry of a failed restart, about half a minute in all.
+    static let retryDelays: [TimeInterval] = [1, 2, 4, 8, 15]
+
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
     var onError: (@MainActor (String) -> Void)?
+    var onRecovered: (@MainActor () -> Void)?
 
     private let engine: AudioInputEngine
+    private let schedule: (TimeInterval, @escaping () -> Void) -> Void
+    // Touched on the main thread only. `running` means armed: the caller wants
+    // the microphone, whether or not a tap is installed right now.
     private var running = false
+    private var failedRestarts = 0
+    private var pendingRetry = 0
+    private var reportedFailure = false
 
-    init(engine: AudioInputEngine = AVAudioInputEngine()) {
+    init(engine: AudioInputEngine = AVAudioInputEngine(),
+         schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
         self.engine = engine
+        self.schedule = schedule
         engine.onConfigurationChange = { [weak self] in
             deliverOnMain { self?.restartAfterConfigurationChange() }
         }
@@ -65,13 +85,24 @@ final class MicCapture: MicrophoneCapturing {
     func stop() {
         guard running else { return }
         running = false
+        pendingRetry += 1
+        failedRestarts = 0
+        reportedFailure = false
         engine.removeTap()
         engine.stop()
     }
 
+    @MainActor
+    func reconnect() {
+        restartAfterConfigurationChange()
+    }
+
+    /// Checks there is an input, then taps it in whatever format it has now. The
+    /// format is not read first and passed in: if the device changes in between,
+    /// AVAudioEngine raises an Objective-C exception that Swift cannot catch.
     private func startTap() throws {
-        guard let format = engine.inputFormat else { throw MicrophoneError.noInputDevice }
-        engine.installTap(format: format) { [weak self] buffer in
+        guard engine.inputFormat != nil else { throw MicrophoneError.noInputDevice }
+        engine.installTap(format: nil) { [weak self] buffer in
             guard let onBuffer = self?.onBuffer else { return }
             onBuffer(AudioMath.monoMix(buffer) ?? buffer)
         }
@@ -86,13 +117,42 @@ final class MicCapture: MicrophoneCapturing {
     @MainActor
     private func restartAfterConfigurationChange() {
         guard running else { return }
+        failedRestarts = 0
+        restart()
+    }
+
+    @MainActor
+    private func restart() {
+        pendingRetry += 1
         engine.removeTap()
         engine.stop()
         do {
             try startTap()
+            failedRestarts = 0
+            if reportedFailure {
+                reportedFailure = false
+                onRecovered?()
+            }
         } catch {
-            running = false
-            onError?("Couldn't restart after the input device changed: \(error.localizedDescription)")
+            failedRestarts += 1
+            guard failedRestarts <= Self.retryDelays.count else {
+                guard !reportedFailure else { return }
+                reportedFailure = true
+                onError?("Couldn't restart after the input device changed: \(error.localizedDescription)")
+                return
+            }
+            retry(after: Self.retryDelays[failedRestarts - 1])
+        }
+    }
+
+    @MainActor
+    private func retry(after delay: TimeInterval) {
+        let attempt = pendingRetry
+        schedule(delay) { [weak self] in
+            deliverOnMain {
+                guard let self, self.running, self.pendingRetry == attempt else { return }
+                self.restart()
+            }
         }
     }
 }
@@ -119,7 +179,7 @@ final class AVAudioInputEngine: AudioInputEngine {
         return format.sampleRate > 0 && format.channelCount > 0 ? format : nil
     }
 
-    func installTap(format: AVAudioFormat, block: @escaping (AVAudioPCMBuffer) -> Void) {
+    func installTap(format: AVAudioFormat?, block: @escaping (AVAudioPCMBuffer) -> Void) {
         engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in block(buffer) }
     }
 

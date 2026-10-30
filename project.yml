@@ -19,8 +19,9 @@ targets:
         CFBundleDisplayName: Meeting Assistant
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        NSSpeechRecognitionUsageDescription: "Transcribes meeting audio on this device to provide live assistance."
-        NSMicrophoneUsageDescription: "Captures your microphone so your side of the call is transcribed on-device."
+        NSSpeechRecognitionUsageDescription: "Transcribes call audio into text, on this Mac. If your Mac cannot do that for your language, audio goes to Apple's speech servers only after you allow it in Settings."
+        NSMicrophoneUsageDescription: "Captures your microphone so your side of the call can be transcribed. It is transcribed on this Mac unless you turn on Deepgram or Apple's speech servers in Settings."
+        NSDocumentsFolderUsageDescription: "Saves your meeting transcripts and summaries as files in a folder you chose inside your Documents folder, only when you turn on Save transcripts in Settings or choose Save Transcript. Without a chosen folder they go to Application Support/Meeting Assistant/Transcripts instead. The files stay on this Mac unless you choose a folder that syncs to iCloud, as Documents can."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stephenthorn.meetingassistant

@@ -1,12 +1,36 @@
 import AVFoundation
 
+/// Why capture stopped by itself. `isRetryable` is false when starting again
+/// cannot help: the user chose to stop sharing, or permission was withdrawn.
+struct CaptureFailure: Equatable, Sendable, ExpressibleByStringLiteral {
+    let message: String
+    var isRetryable = true
+
+    init(message: String, isRetryable: Bool = true) {
+        self.message = message
+        self.isRetryable = isRetryable
+    }
+
+    init(stringLiteral message: String) {
+        self.init(message: message)
+    }
+}
+
 /// The Mac's system audio output: the other people on the call.
 protocol SystemAudioCapturing: AnyObject {
     /// Called on a capture thread with each chunk of audio.
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)? { get set }
-    /// Called on the main actor when capture stops unexpectedly.
-    var onError: (@MainActor (String) -> Void)? { get set }
-    func start() async throws
+    /// Called on the main actor when the running stream stops unexpectedly. Only
+    /// the stream that is current reports: a late error from one that was
+    /// already stopped or replaced is dropped.
+    var onError: (@MainActor (CaptureFailure) -> Void)? { get set }
+    /// Called on the main actor after each start with what the user should know
+    /// about it, or nil when there is nothing: capture works, but not exactly as
+    /// asked (the chosen app was not running, so every app is heard).
+    var onNotice: (@MainActor (String?) -> Void)? { get set }
+    /// Listens to the app with this bundle identifier when it is running, and to
+    /// every app when it is nil or the app is not running.
+    func start(application bundleID: String?) async throws
     func stop() async
 }
 
@@ -16,20 +40,31 @@ protocol MicrophoneCapturing: AnyObject {
     var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)? { get set }
     /// Called on the main actor when capture stops unexpectedly.
     var onError: (@MainActor (String) -> Void)? { get set }
+    /// Called on the main actor when capture that stopped by itself and was
+    /// reported through `onError` is working again.
+    var onRecovered: (@MainActor () -> Void)? { get set }
     /// Calls back on the main thread.
     func requestAuthorization(_ completion: @escaping (Bool) -> Void)
     func start() throws
     func stop()
+    /// Tears the capture down and builds it again, as if the input device had
+    /// changed: for a microphone that is armed but delivers nothing. A failed
+    /// attempt retries with the same backoff and reports through `onError` and
+    /// `onRecovered`. Does nothing unless the microphone is running.
+    @MainActor func reconnect()
 }
 
 enum SystemAudioError: LocalizedError, Equatable {
     case permissionDenied
     case noDisplay
+    /// Starting capture did not come back in time, so it was given up on.
+    case timedOut
 
     var errorDescription: String? {
         switch self {
         case .permissionDenied: "Screen Recording permission is off."
         case .noDisplay: "No display available for capture."
+        case .timedOut: "Starting meeting audio capture took too long."
         }
     }
 }

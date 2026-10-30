@@ -29,6 +29,12 @@ final class OverlayTextTests: XCTestCase {
                        "Add your Anthropic API key: menu bar icon, then Settings…")
     }
 
+    func testTheAnswerAreaAsksForKeychainAccessWhenTheSavedKeyCannotBeRead() {
+        XCTAssertEqual(OverlayText.answer("", isAnswering: false, hasKey: false, keyUnreadable: true,
+                                          shortcut: "⌃⌥Space"),
+                       "Allow Keychain access to your API key: menu bar icon, then Settings…")
+    }
+
     func testTheAnswerAreaNamesTheCurrentShortcut() {
         XCTAssertEqual(OverlayText.answer("", isAnswering: false, hasKey: true, shortcut: "⌃⌥Space"),
                        "Press ⌃⌥Space for help")
