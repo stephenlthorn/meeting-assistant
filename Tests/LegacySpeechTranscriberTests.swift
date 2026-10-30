@@ -362,6 +362,81 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         XCTAssertFalse(AppleSpeechEngine.makeRequest(onDevice: false).requiresOnDeviceRecognition)
     }
 
+    // MARK: - Withdrawing consent (codex round 2 P1 #1)
+
+    func testAudioQueuedBeforeACancelNeverReachesTheRecognizer() {
+        let h = makeHarness(allowServerRecognition: true)
+        h.engine.supportsOnDeviceRecognition = false
+        h.transcriber.start()
+        h.flush()
+        let release = h.holdTheQueue()
+
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions[0].appended, 0, "audio queued before the withdrawal must not go to Apple")
+        XCTAssertTrue(h.engine.sessions[0].cancelled)
+        XCTAssertFalse(h.engine.sessions[0].finished, "finishing would let the recognizer carry on with the server")
+    }
+
+    func testAudioQueuedBeforeAUserStopStillReachesTheRecognizer() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        let release = h.holdTheQueue()
+
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.stop()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions[0].appended, 1)
+        XCTAssertTrue(h.engine.sessions[0].finished)
+    }
+
+    func testAudioHandedOverAfterACancelReturnedIsDropped() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        h.transcriber.cancel()
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions[0].appended, 0)
+    }
+
+    func testARetryQueuedBeforeACancelDoesNotStartANewRequest() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.engine.sessions[0].fail()
+        h.flush()
+        let release = h.holdTheQueue()
+
+        h.scheduler.fireAll()
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.engine.sessions.count, 1)
+    }
+
+    func testAStartQueuedBeforeACancelNeverStartsARequest() {
+        let h = makeHarness()
+        let release = h.holdTheQueue()
+
+        h.transcriber.start()
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertTrue(h.engine.sessions.isEmpty)
+    }
+
     // MARK: - Harness
 
     private final class Harness {
@@ -388,6 +463,14 @@ final class LegacySpeechTranscriberTests: XCTestCase {
         }
 
         func flush() { queue.sync {} }
+
+        /// Blocks the transcriber's queue, so what is handed over next waits behind
+        /// it. Call the result to let the queue go.
+        func holdTheQueue() -> () -> Void {
+            let gate = DispatchSemaphore(value: 0)
+            queue.async { gate.wait() }
+            return { gate.signal() }
+        }
     }
 
     private func makeHarness(allowServerRecognition: Bool = false) -> Harness {

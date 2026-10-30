@@ -415,6 +415,29 @@ final class AssistantController {
         }
     }
 
+    private func transcriber(for speaker: Speaker) -> LiveTranscriber? {
+        speaker == .them ? themTranscriber : youTranscriber
+    }
+
+    private func slot(for speaker: Speaker) -> TranscriberSlot {
+        speaker == .them ? themSlot : youSlot
+    }
+
+    private func side(of speaker: Speaker) -> SideState {
+        speaker == .them ? themSide : youSide
+    }
+
+    /// Brings a side's own transcriber back with its capture: a side that was
+    /// down is revived with the transcriber it has, which is always one built
+    /// for the plan in force (a privacy switch replaces every side's, down or
+    /// not). A replacement still waiting for its permission answer is started
+    /// when the answer comes, not twice.
+    private func reviveTranscriber(for speaker: Speaker) {
+        guard !awaitingSpeechPermission.contains(speaker), let revived = transcriber(for: speaker) else { return }
+        revived.start()
+        slot(for: speaker).set(revived)
+    }
+
     // MARK: - Capture that stops mid-call
 
     /// Each session listens for its own capture callbacks, so an error that was
@@ -526,11 +549,10 @@ final class AssistantController {
     }
 
     private func microphoneRecovered(session current: Int) {
-        guard session == current, youSide == .failed, let you = youTranscriber else { return }
+        guard session == current, youSide == .failed, youTranscriber != nil else { return }
         youSide = .up
         clearCaptureProblem(for: .you)
-        you.start()
-        youSlot.set(you)
+        reviveTranscriber(for: .you)
         status = listeningStatus()
     }
 
@@ -549,8 +571,7 @@ final class AssistantController {
             themCanRevive = false
             themAttempts = 0
             clearCaptureProblem(for: .them)
-            themTranscriber?.start()
-            themSlot.set(themTranscriber)
+            reviveTranscriber(for: .them)
             status = listeningStatus()
             themRecovery += 1
             restartSystemAudio(session: session, recovery: themRecovery)
@@ -616,7 +637,8 @@ final class AssistantController {
             watchdogs[speaker] = watch
             return
         }
-        let verdict = watch.check(reading, at: time)
+        let preparing = transcriber(for: speaker)?.isPreparing == true
+        let verdict = watch.check(reading, at: time, judgesText: !preparing)
         watchdogs[speaker] = watch
         if !watch.isHearingAudio { levels.silence(speaker) }
         guard let verdict else { return }
@@ -635,9 +657,10 @@ final class AssistantController {
         case .captureResumed:
             clearCaptureProblem(for: speaker)
         case .restartTranscriber:
-            guard let transcriber = speaker == .them ? themTranscriber : youTranscriber else { return }
-            transcriber.stop()
-            transcriber.start()
+            guard let stalled = transcriber(for: speaker) else { return }
+            stalled.stop()
+            stalled.start()
+            slot(for: speaker).set(stalled)
         case .transcriberStillSilent:
             let side = speaker == .them ? "Their" : "Your"
             reportCaptureProblem(Problem(message: "\(side) side is being heard but nothing is being transcribed. Stop and start listening to try again."),
@@ -675,18 +698,26 @@ final class AssistantController {
             if self.session == current { self.heardText(segment, from: speaker) }
             self.receive(segment, from: speaker, isLive: self.session == current)
         }
-        transcriber.onError = { [weak self] message in
-            guard let self, self.session == current else { return }
+        transcriber.onError = { [weak self, weak transcriber] message in
+            guard let self, self.session == current, self.isCurrent(transcriber, for: speaker) else { return }
             self.report(Problem(message: "\(speaker.rawValue): \(message)"))
         }
         transcriber.onFatal = { [weak self, weak transcriber] message in
             guard let self, let transcriber, self.session == current else { return }
             self.transcriberGaveUp(transcriber, as: speaker, message: message)
         }
-        transcriber.onNotice = { [weak self] message in
-            guard let self, self.session == current else { return }
+        transcriber.onNotice = { [weak self, weak transcriber] message in
+            guard let self, self.session == current, self.isCurrent(transcriber, for: speaker) else { return }
             self.setNotice(message, from: speaker)
         }
+    }
+
+    /// A replaced transcriber keeps its words (they are still accepted) but no
+    /// longer speaks for its side: its notices and errors are about a backend
+    /// that is gone.
+    private func isCurrent(_ transcriber: LiveTranscriber?, for speaker: Speaker) -> Bool {
+        guard let transcriber else { return false }
+        return self.transcriber(for: speaker) === transcriber
     }
 
     /// Words arriving prove the transcriber works, and take down a report that it did not.
@@ -1197,9 +1228,11 @@ final class AssistantController {
         restartTranscribers(to: plan)
     }
 
-    /// Replaces the transcriber on every side that is capturing with one built
-    /// from the current settings. Audio is cut off from the old one first, so
-    /// nothing more reaches a backend the user switched off.
+    /// Replaces the transcriber on every side with one built from the current
+    /// settings, whatever state the side is in, so no side can ever start (or
+    /// restart, when it comes back) one built for the backend the user switched
+    /// off. The old ones are cancelled, not drained: audio still queued for them
+    /// is dropped and nothing more reaches a backend the user withdrew from.
     private func restartTranscribers(to plan: SpeechPlan) {
         let current = session
         activePlan = plan
@@ -1207,17 +1240,19 @@ final class AssistantController {
         let offset = restartGeneration * Self.restartUtteranceStride
         var replaced: [Replacement] = []
         for speaker in [Speaker.them, .you] {
+            guard let old = transcriber(for: speaker) else { continue }
             let started: Bool
-            switch speaker == .them ? themSide : youSide {
+            switch side(of: speaker) {
             // A reconnecting side keeps its transcriber running while capture
             // comes back, so it is replaced exactly like a side that is up.
             case .up, .reconnecting: started = true
             case .pending: started = speaker == .them
-            case .off, .failed: continue
+            // Replaced, but only started if the side comes back.
+            case .failed, .off: started = false
             }
-            guard let old = speaker == .them ? themTranscriber : youTranscriber else { continue }
-            (speaker == .them ? themSlot : youSlot).set(nil)
-            if started { old.stop() }
+            slot(for: speaker).set(nil)
+            old.cancel()
+            speakerNotices[speaker] = nil
             let fresh = makeTranscriber(speaker)
             wire(fresh, as: speaker, session: current)
             let forward = fresh.onSegment
@@ -1229,6 +1264,7 @@ final class AssistantController {
             if started { awaitingSpeechPermission.insert(speaker) }
             replaced.append(Replacement(speaker: speaker, transcriber: fresh, started: started))
         }
+        refreshNotice()
         guard let first = replaced.first else { return }
         backendName = first.transcriber.backendName
         if listening == .listening { status = listeningStatus() }
@@ -1247,11 +1283,10 @@ final class AssistantController {
             return
         }
         for item in replaced where item.started {
-            let side = item.speaker == .them ? themSide : youSide
-            let still = item.speaker == .them ? themTranscriber : youTranscriber
-            guard side == .up || side == .pending, still === item.transcriber else { continue }
+            guard [.up, .pending, .reconnecting].contains(side(of: item.speaker)),
+                  transcriber(for: item.speaker) === item.transcriber else { continue }
             item.transcriber.start()
-            (item.speaker == .them ? themSlot : youSlot).set(item.transcriber)
+            slot(for: item.speaker).set(item.transcriber)
         }
     }
 }

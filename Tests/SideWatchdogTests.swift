@@ -134,6 +134,28 @@ final class SideWatchdogTests: XCTestCase {
         XCTAssertEqual(h.verdicts(during: 55, buffers: 40, voice: 4), [])
         XCTAssertEqual(h.verdicts(during: 5, buffers: 40, voice: 4), [.restartTranscriber])
     }
+
+    // MARK: - A transcriber that is still getting ready (CAP2-3)
+
+    func testTextIsNotJudgedWhileTheTranscriberIsPreparing() {
+        var h = Scenario(start: start)
+
+        XCTAssertEqual(h.verdicts(during: 600, buffers: 40, voice: 4, judgesText: false), [])
+    }
+
+    func testCaptureIsStillJudgedWhileTheTranscriberIsPreparing() {
+        var h = Scenario(start: start)
+
+        XCTAssertEqual(h.verdicts(during: 30, judgesText: false), [.restartCapture])
+    }
+
+    func testTheTextWindowStartsFreshOnceThePreparingIsOver() {
+        var h = Scenario(start: start)
+        _ = h.verdicts(during: 600, buffers: 40, voice: 4, judgesText: false)
+
+        XCTAssertEqual(h.verdicts(during: 55, buffers: 40, voice: 4), [], "the minutes spent preparing do not count")
+        XCTAssertEqual(h.verdicts(during: 5, buffers: 40, voice: 4), [.restartTranscriber])
+    }
 }
 
 /// A watchdog fed readings at fixed steps, like the controller's timer does.
@@ -151,22 +173,22 @@ private struct Scenario {
     /// One check, `seconds` later, with that much new audio.
     @discardableResult
     mutating func step(_ seconds: TimeInterval, buffers: Int = 0, voice: TimeInterval = 0,
-                       text: Bool = false) -> SideWatchdog.Verdict? {
+                       text: Bool = false, judgesText: Bool = true) -> SideWatchdog.Verdict? {
         now = now.addingTimeInterval(seconds)
         reading = AudioMeter.Reading(buffers: reading.buffers + buffers,
                                      voicedSeconds: reading.voicedSeconds + voice)
         if text { _ = watchdog.noteText() }
-        let verdict = watchdog.check(reading, at: now)
+        let verdict = watchdog.check(reading, at: now, judgesText: judgesText)
         if let verdict { collected.append(verdict) }
         return verdict
     }
 
     /// Checks every five seconds, returning only what the watchdog said.
-    mutating func verdicts(during seconds: TimeInterval, buffers: Int = 0, voice: TimeInterval = 0)
-        -> [SideWatchdog.Verdict] {
+    mutating func verdicts(during seconds: TimeInterval, buffers: Int = 0, voice: TimeInterval = 0,
+                           judgesText: Bool = true) -> [SideWatchdog.Verdict] {
         var said: [SideWatchdog.Verdict] = []
         for _ in 0..<Int(seconds / 5) {
-            if let verdict = step(5, buffers: buffers, voice: voice) { said.append(verdict) }
+            if let verdict = step(5, buffers: buffers, voice: voice, judgesText: judgesText) { said.append(verdict) }
         }
         return said
     }

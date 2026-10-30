@@ -70,8 +70,18 @@ struct SideWatchdog {
         return reportedNoText
     }
 
-    mutating func check(_ reading: AudioMeter.Reading, at now: Date) -> Verdict? {
-        checkCapture(reading, at: now) ?? checkText(reading, at: now)
+    /// `judgesText` is false while the transcriber is getting ready (downloading
+    /// its model, reconnecting): nothing can be written down yet, so that says
+    /// nothing about it. Capture is still judged, and the text window starts
+    /// again each time, so the time spent preparing is never held against it.
+    mutating func check(_ reading: AudioMeter.Reading, at now: Date, judgesText: Bool = true) -> Verdict? {
+        guard judgesText else {
+            windowStart = now
+            voicedAtWindowStart = reading.voicedSeconds
+            textInWindow = false
+            return checkCapture(reading, at: now)
+        }
+        return checkCapture(reading, at: now) ?? checkText(reading, at: now)
     }
 
     private mutating func checkCapture(_ reading: AudioMeter.Reading, at now: Date) -> Verdict? {

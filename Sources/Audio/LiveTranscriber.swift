@@ -21,8 +21,26 @@ protocol LiveTranscriber: AnyObject {
     /// Calls back on the main thread.
     func requestAuthorization(_ completion: @escaping (Bool) -> Void)
     func start()
+    /// The user's Stop: audio already handed over is still processed and the
+    /// last words are allowed to arrive.
     func stop()
+    /// A stop for a privacy reason (consent was withdrawn): audio handed over
+    /// but not yet processed is dropped, nothing more is sent anywhere, and a
+    /// remote session is torn down instead of drained. The audio gate closes
+    /// before this returns, so a buffer handed over afterwards is never used.
+    func cancel()
+    /// Getting ready: downloading a model, or reconnecting to a service. Nothing
+    /// is being transcribed yet, and that is not the side's fault, so the health
+    /// checks leave it alone until this is false.
+    var isPreparing: Bool { get }
     func append(_ buffer: AVAudioPCMBuffer)
+}
+
+extension LiveTranscriber {
+    /// An on-device backend sends nothing anywhere, so stopping it the ordinary
+    /// way is already private.
+    func cancel() { stop() }
+    var isPreparing: Bool { false }
 }
 
 /// Which backend a listening session uses, decided from the settings alone

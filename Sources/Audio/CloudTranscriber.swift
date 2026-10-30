@@ -22,6 +22,10 @@ protocol WebSocketConnection: AnyObject {
 /// Stopping asks Deepgram to finish (CloseStream) and keeps listening for a
 /// moment, since it answers with the words it was still working on and then
 /// closes the connection; the connection is closed at once if it does not.
+///
+/// Withdrawing consent is not a stop: `cancel()` closes an audio gate before it
+/// returns, so buffers still queued are never sent, and closes the connection
+/// without a drain. Nothing, not even a handshake, leaves after that.
 final class CloudTranscriber: LiveTranscriber {
     static let defaultDrainTimeout: TimeInterval = 1.5
     static let keepAliveInterval: TimeInterval = 4
@@ -47,13 +51,18 @@ final class CloudTranscriber: LiveTranscriber {
     private let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
                                              channels: 1, interleaved: false)!
 
+    private let gate = AudioGate()
+    private let preparingLock = NSLock()
+    private var preparing = false // guarded by `preparingLock`
+
     // Only touched on `queue`.
-    private var running = false
+    private var running = false { didSet { updatePreparing() } }
     private var draining = false
     private var connection: WebSocketConnection?
     private var generation = 0
     private var heardFromServer = false
-    private var reconnecting = false
+    private var reconnecting = false { didSet { updatePreparing() } }
+    private var sessionEpoch = 0
     private var failures = 0
     private var lastSent = Date.distantPast
     private var utterance = 0
@@ -80,13 +89,19 @@ final class CloudTranscriber: LiveTranscriber {
     /// Cloud service, no OS permission needed.
     func requestAuthorization(_ completion: @escaping (Bool) -> Void) { completion(true) }
 
+    /// Reconnecting after a drop, and the server has not answered since.
+    var isPreparing: Bool { preparingLock.withLock { preparing } }
+
     func start() {
+        let epoch = gate.open()
         queue.async { [self] in
+            guard gate.allows(epoch) else { return }
             guard !apiKey.isEmpty else {
                 fatal("Missing Deepgram API key.")
                 return
             }
             if draining { endDrain() }
+            sessionEpoch = epoch
             running = true
             failures = 0
             openConnection()
@@ -110,13 +125,39 @@ final class CloudTranscriber: LiveTranscriber {
         }
     }
 
+    /// Closes the connection and sends nothing more, for a stop the user did not
+    /// ask for: consent was withdrawn. Not a drain, since a drain would send a
+    /// CloseStream and keep the connection open for the server's last words.
+    func cancel() {
+        gate.close()
+        queue.async { [self] in
+            running = false
+            draining = false
+            if reconnecting {
+                reconnecting = false
+                notify(nil)
+            }
+            finishOpenUtterance()
+            connection?.close()
+            connection = nil
+            generation += 1
+        }
+    }
+
     func append(_ buffer: AVAudioPCMBuffer) {
+        guard let epoch = gate.admit() else { return }
         let time = now()
         queue.async { [self] in
-            guard running, let connection, let data = pcm16Data(from: buffer), !data.isEmpty else { return }
+            guard gate.allows(epoch), running, let connection, let data = pcm16Data(from: buffer),
+                  !data.isEmpty else { return }
             connection.send(.data(data)) { _ in }
             lastSent = time
         }
+    }
+
+    private func updatePreparing() {
+        let value = running && reconnecting
+        preparingLock.withLock { preparing = value }
     }
 
     // MARK: - Connection (on `queue`)
@@ -219,7 +260,7 @@ final class CloudTranscriber: LiveTranscriber {
     }
 
     private func reconnect(after droppedGeneration: Int) {
-        guard running, connection == nil, generation == droppedGeneration else { return }
+        guard running, gate.allows(sessionEpoch), connection == nil, generation == droppedGeneration else { return }
         openConnection()
     }
 
@@ -230,7 +271,7 @@ final class CloudTranscriber: LiveTranscriber {
     }
 
     private func keepAlive() {
-        guard running else { return }
+        guard running, gate.allows(sessionEpoch) else { return }
         if let connection, now().timeIntervalSince(lastSent) >= Self.keepAliveInterval {
             connection.send(.string(Self.keepAliveMessage)) { _ in }
             lastSent = now()
