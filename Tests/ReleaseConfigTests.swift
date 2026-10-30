@@ -461,25 +461,28 @@ final class ReleaseExistsScriptTests: XCTestCase {
 final class SigningSetupScriptTests: XCTestCase {
     private let answers = ["p12-password", "Developer ID Application: Test (TEAMID)", "dev@example.com", "TEAMID", "app-password"]
 
+    /// What the GitHub API says when the script looks for the "release" environment.
+    private enum Environment {
+        case missing
+        case exists
+        case unavailable
+    }
+
     private struct Setup {
         let checkout: URL
         let elsewhere: URL
-        let log: URL
-        let bin: URL
+        let github: FakeGitHub
         var script: URL { checkout.appendingPathComponent("scripts/setup-release-signing.sh") }
         var p12: URL { elsewhere.appendingPathComponent("key.p12") }
 
-        var ghCalls: [String] {
-            ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
-        }
+        var ghCalls: [String] { github.calls }
         var secretWrites: [String] { ghCalls.filter { $0.hasPrefix("gh secret set") } }
+        var environmentWrites: [String] { ghCalls.filter { $0.contains("--method") } }
     }
 
-    private func makeSetup(origin: String?) throws -> Setup {
+    private func makeSetup(origin: String?, environment: Environment = .missing) throws -> Setup {
         let checkout = try Shell.makeTempDirectory(for: self)
         let elsewhere = try Shell.makeTempDirectory(for: self)
-        let bin = try Shell.makeTempDirectory(for: self)
-        let log = bin.appendingPathComponent("gh.log")
 
         try FileManager.default.createDirectory(at: checkout.appendingPathComponent("scripts"), withIntermediateDirectories: true)
         try FileManager.default.copyItem(at: Repo.url("scripts/setup-release-signing.sh"),
@@ -490,24 +493,19 @@ final class SigningSetupScriptTests: XCTestCase {
         }
         try "certificate".write(to: elsewhere.appendingPathComponent("key.p12"), atomically: true, encoding: .utf8)
 
-        let gh = bin.appendingPathComponent("gh")
-        try """
-        #!/bin/bash
-        echo "gh $*" >> "$GH_LOG"
-        if [ "$1 $2" = "secret set" ]; then cat >/dev/null; fi
-        if [ "$1" = "api" ] && [ "$2" != "--method" ] && [ -z "${GH_ENV_EXISTS:-}" ]; then exit 1; fi
-        """.write(to: gh, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: gh.path)
-
-        return Setup(checkout: checkout, elsewhere: elsewhere, log: log, bin: bin)
+        let lookup = "api repos/*/environments/release"
+        let rules: [(arguments: String, answer: FakeGitHub.Answer)] = switch environment {
+        case .missing: [(lookup, .notFound)]
+        case .exists: []
+        case .unavailable: [(lookup, .failure(code: 502, message: "Bad Gateway"))]
+        }
+        return Setup(checkout: checkout, elsewhere: elsewhere, github: try FakeGitHub(for: self, rules: rules))
     }
 
-    private func run(_ setup: Setup, args: [String]? = nil, environmentExists: Bool = false, typing lines: [String]) throws -> Shell.Outcome {
-        var env = ["PATH": "\(setup.bin.path):/usr/bin:/bin", "GH_LOG": setup.log.path]
-        if environmentExists { env["GH_ENV_EXISTS"] = "1" }
-        return try Shell.runBash(setup.script,
+    private func run(_ setup: Setup, args: [String]? = nil, typing lines: [String]) throws -> Shell.Outcome {
+        try Shell.runBash(setup.script,
                           args: args ?? ["key.p12"],
-                          env: env,
+                          env: setup.github.environment,
                           cwd: setup.elsewhere,
                           stdin: lines.joined(separator: "\n") + "\n")
     }
@@ -545,19 +543,59 @@ final class SigningSetupScriptTests: XCTestCase {
 
         _ = try run(setup, typing: ["y"] + answers)
 
-        XCTAssertTrue(setup.ghCalls.contains("gh api --method PUT repos/acme/widgets/environments/release"), "A missing environment is created")
         XCTAssertEqual(setup.secretWrites.count, 6)
         XCTAssertTrue(setup.secretWrites.allSatisfy { $0.contains("--env release") }, setup.secretWrites.joined(separator: "\n"))
     }
 
-    func testAnExistingEnvironmentIsLeftAloneSoItsProtectionRulesSurvive() throws {
-        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+    func testAMissingEnvironmentIsCreatedAndLimitedToTheMainBranchBeforeAnySecretIsWritten() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .missing)
 
-        let result = try run(setup, environmentExists: true, typing: ["y"] + answers)
+        let result = try run(setup, typing: ["y"] + answers)
 
         XCTAssertEqual(result.status, 0, result.output)
-        XCTAssertFalse(setup.ghCalls.contains { $0.contains("--method PUT") }, setup.ghCalls.joined(separator: "\n"))
+        let put = try XCTUnwrap(setup.ghCalls.firstIndex { $0.hasPrefix("gh api --method PUT repos/acme/widgets/environments/release") },
+                                setup.ghCalls.joined(separator: "\n"))
+        XCTAssertTrue(setup.ghCalls[put].contains("deployment_branch_policy[custom_branch_policies]=true"), setup.ghCalls[put])
+        XCTAssertTrue(setup.ghCalls[put].contains("deployment_branch_policy[protected_branches]=false"), setup.ghCalls[put])
+        let policy = try XCTUnwrap(setup.ghCalls.firstIndex {
+            $0.hasPrefix("gh api --method POST repos/acme/widgets/environments/release/deployment-branch-policies")
+        }, setup.ghCalls.joined(separator: "\n"))
+        XCTAssertTrue(setup.ghCalls[policy].contains("name=main"), setup.ghCalls[policy])
+        XCTAssertTrue(setup.ghCalls[policy].contains("type=branch"), setup.ghCalls[policy])
+        let firstSecret = try XCTUnwrap(setup.ghCalls.firstIndex { $0.hasPrefix("gh secret set") })
+        XCTAssertLessThan(put, policy, "the policy needs the environment to exist")
+        XCTAssertLessThan(policy, firstSecret, "no secret may exist in an environment any branch can use")
+    }
+
+    func testAnExistingEnvironmentIsLeftAloneSoItsProtectionRulesSurvive() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .exists)
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(setup.environmentWrites, [], "a bare PUT would reset its reviewers and branch policy")
         XCTAssertEqual(setup.secretWrites.count, 6)
+        XCTAssertTrue(result.output.contains("already existed"), "it says it did not touch the rules: \(result.output)")
+    }
+
+    func testAnErrorLookingUpTheEnvironmentIsNotTakenForAMissingOne() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .unavailable)
+
+        let result = try run(setup, typing: ["y"] + answers)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertEqual(setup.environmentWrites, [], "a 502 says nothing about the environment: \(setup.ghCalls)")
+        XCTAssertEqual(setup.secretWrites, [])
+        XCTAssertTrue(result.output.contains("502"), result.output)
+    }
+
+    func testTheEnvironmentIsCheckedBeforeAnySecretIsTypedSoAFailureWastesNoTyping() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .unavailable)
+
+        let result = try run(setup, typing: ["y"])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.contains("502"), "it fails on the lookup, not on a missing answer: \(result.output)")
     }
 
     func testNothingIsWrittenUntilTheTargetIsConfirmed() throws {
