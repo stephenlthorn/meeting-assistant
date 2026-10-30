@@ -16,6 +16,8 @@ struct LifecycleHarness {
     let scheduler: ManualScheduler
     /// The health checks' timer, kept apart so the restart and drain timers stay countable.
     let watchdogScheduler: ManualScheduler
+    /// The limits on system audio calls that might never return, kept apart for the same reason.
+    let timeoutScheduler: ManualScheduler
     let workspaceNotifications: NotificationCenter
     let screenNotifications: NotificationCenter
 
@@ -30,6 +32,7 @@ struct LifecycleHarness {
         meterClock = MeterClock()
         scheduler = ManualScheduler()
         watchdogScheduler = ManualScheduler()
+        timeoutScheduler = ManualScheduler()
         workspaceNotifications = NotificationCenter()
         screenNotifications = NotificationCenter()
         controller = AssistantController(settings: settings, systemAudio: systemAudio, microphone: microphone,
@@ -39,7 +42,8 @@ struct LifecycleHarness {
                                          workspaceNotifications: workspaceNotifications,
                                          notifications: screenNotifications,
                                          meterClock: { [meterClock] in meterClock.seconds },
-                                         watchdogSchedule: watchdogScheduler.schedule)
+                                         watchdogSchedule: watchdogScheduler.schedule,
+                                         timeoutSchedule: timeoutScheduler.schedule)
     }
 
     /// Lets `seconds` go by in the health checks' own steps. Every step delivers

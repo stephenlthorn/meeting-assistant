@@ -8,9 +8,12 @@ final class FakeTranscriptFiles: TranscriptFileStoring {
     private(set) var reads = 0
     private(set) var prepared: [URL] = []
     var failure: Error?
+    /// Makes reads fail the way a permissions problem does, as opposed to a file that is not there.
+    var readFailure: Error?
 
-    func read(_ url: URL) -> Data? {
+    func read(_ url: URL) throws -> Data? {
         reads += 1
+        if let readFailure { throw readFailure }
         return files[url]
     }
 

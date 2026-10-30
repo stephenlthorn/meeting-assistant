@@ -288,6 +288,101 @@ final class AssistantControllerSummaryTests: XCTestCase {
                        "Covers only the most recent part of the call; earlier lines were trimmed. Turn on Save transcripts in Settings to summarize a long call in full.")
     }
 
+    // MARK: - After a Clear (APP2-8)
+
+    func testClearingTheTranscriptAlsoClearsTheSummary() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We decided to ship in May.")
+        h.controller.summarizeMeeting()
+        h.answerer.streams[0].yield("Ship in May.")
+        h.answerer.streams[0].finish()
+        await eventually { !h.controller.isSummarizing && !h.controller.summary.isEmpty }
+
+        h.controller.clearTranscript()
+
+        XCTAssertEqual(h.controller.summary, "")
+        XCTAssertNil(h.controller.summaryNote)
+    }
+
+    func testClearingWhileASummaryIsStreamingStopsItFromComingBack() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We decided to ship in May.")
+        h.controller.summarizeMeeting()
+        h.answerer.streams[0].yield("Ship")
+
+        h.controller.clearTranscript()
+        h.answerer.streams[0].yield(" in May.")
+        h.answerer.streams[0].finish()
+        await settle()
+
+        XCTAssertEqual(h.controller.summary, "")
+        XCTAssertFalse(h.controller.isSummarizing)
+    }
+
+    func testASummaryOfASavedCallAfterAClearLeavesOutEverythingBeforeIt() async {
+        let h = makeHarness(saving: true)
+        await startListening(h)
+        talk(h, turns: 450)
+        h.controller.clearTranscript()
+        talk(h, turns: 450, first: 1_000, them: "Afterwards review", you: "Replied")
+
+        h.controller.summarizeMeeting()
+
+        let user = h.answerer.requests.first?.user ?? ""
+        XCTAssertTrue(user.contains("Afterwards review 1000 is complete."), "the first line after the clear, trimmed from memory, is there")
+        XCTAssertTrue(user.contains("Replied 1449 alpha beta gamma."))
+        XCTAssertFalse(user.contains("Budget review 0 is complete."), "nothing from before the clear")
+        XCTAssertFalse(user.contains("Noted 449 alpha beta gamma."))
+        XCTAssertNil(h.controller.summaryNote)
+    }
+
+    func testTheSavedFileStillHasEverythingAfterAClear() async {
+        let h = makeHarness(saving: true)
+        await startListening(h)
+        talk(h, turns: 10)
+        h.controller.clearTranscript()
+        talk(h, turns: 10, first: 1_000, them: "Afterwards review", you: "Replied")
+
+        h.controller.stop()
+
+        let text = h.files.files.first(where: { !$0.key.lastPathComponent.hasSuffix("-summary.md") })
+            .flatMap { String(data: $0.value, encoding: .utf8) } ?? ""
+        XCTAssertTrue(text.contains("Budget review 0 is complete."))
+        XCTAssertTrue(text.contains("Afterwards review 1008 is complete."))
+    }
+
+    // MARK: - The sample before the terms (APP2-1)
+
+    func testSummarizingTheSampleBeforeTheTermsAreAcceptedStaysOnThisMac() async {
+        let h = makeHarness(acceptTerms: false)
+        h.settings.extraInstructions = "Always mention Acme."
+        h.controller.startSample()
+        await playSample(h, lines: 2)
+        XCTAssertEqual(h.controller.listening, .sample)
+
+        h.controller.summarizeMeeting()
+
+        XCTAssertTrue(h.answerer.requests.isEmpty, "the real API is never called before the terms are accepted")
+        XCTAssertTrue(h.controller.summary.hasPrefix("Sample summary"), h.controller.summary)
+        XCTAssertFalse(h.controller.isSummarizing)
+    }
+
+    func testSummarizingTheSampleAfterTheTermsNeverSendsTheExtraInstructions() async {
+        let h = makeHarness()
+        h.settings.extraInstructions = "Always mention Acme."
+        h.controller.startSample()
+        await playSample(h, lines: 2)
+        XCTAssertEqual(h.controller.listening, .sample)
+
+        h.controller.summarizeMeeting()
+
+        let request = h.answerer.requests.last
+        XCTAssertEqual(request?.system, SummaryPrompt.system(extraInstructions: ""))
+        XCTAssertFalse(request?.system.contains("Acme") ?? true)
+    }
+
     // MARK: - Harness
 
     private struct Harness {
@@ -327,13 +422,23 @@ final class AssistantControllerSummaryTests: XCTestCase {
         }
     }
 
+    /// Lets the sample meeting show its next `lines` lines, one scheduled step at a time.
+    private func playSample(_ h: Harness, lines: Int) async {
+        for _ in 0..<lines {
+            h.scheduler.fireAll()
+            await settle()
+        }
+    }
+
     /// Alternating sides, worded differently so the microphone never reads as an echo.
-    private func talk(_ h: Harness, turns: Int) {
-        for index in 0..<turns {
+    /// `first` numbers the utterances, so a call can carry on after a Clear.
+    private func talk(_ h: Harness, turns: Int, first: Int = 0,
+                      them: String = "Budget review", you: String = "Noted") {
+        for index in first..<(first + turns) {
             if index.isMultiple(of: 2) {
-                h.transcribers.latest(.them)?.emit("Budget review \(index) is complete.", utterance: index)
+                h.transcribers.latest(.them)?.emit("\(them) \(index) is complete.", utterance: index)
             } else {
-                h.transcribers.latest(.you)?.emit("Noted \(index) alpha beta gamma.", utterance: index)
+                h.transcribers.latest(.you)?.emit("\(you) \(index) alpha beta gamma.", utterance: index)
             }
         }
     }

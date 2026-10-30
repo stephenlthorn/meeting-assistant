@@ -220,8 +220,9 @@ final class AssistantControllerPrivacyTests: XCTestCase {
         await eventually { h.controller.listening == .listening }
         h.scheduler.fireAll()
 
-        await eventually { h.transcribers.made.count == 3 }
+        await eventually { h.transcribers.made.count == 4 }
         XCTAssertEqual(h.transcribers.latest(.them)?.starts, 1)
+        XCTAssertEqual(h.transcribers.latest(.you)?.starts, 0, "its microphone never came up, so it stays unstarted")
     }
 
     // MARK: - Harness

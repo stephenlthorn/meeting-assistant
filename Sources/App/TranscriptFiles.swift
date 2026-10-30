@@ -3,7 +3,10 @@ import Foundation
 /// The file operations transcript saving needs, so tests can use a fake and
 /// the app uses the disk.
 protocol TranscriptFileStoring {
-    func read(_ url: URL) -> Data?
+    /// The file's contents, or nil when there is no such file. Any other reason
+    /// the file cannot be read (permissions, a failing disk) throws: a file that
+    /// is there but unreadable must never be mistaken for one that is gone.
+    func read(_ url: URL) throws -> Data?
     func exists(_ url: URL) -> Bool
     /// Creates the folder if needed. Called when a call starts, so a folder macOS
     /// asks permission for, or one that cannot be used, shows up then and not
@@ -16,8 +19,24 @@ protocol TranscriptFileStoring {
 }
 
 struct DiskTranscriptFiles: TranscriptFileStoring {
-    func read(_ url: URL) -> Data? {
-        try? Data(contentsOf: url)
+    func read(_ url: URL) throws -> Data? {
+        let descriptor = open(url.path, O_RDONLY)
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw Self.failure()
+        }
+        defer { close(descriptor) }
+        var data = Data()
+        var chunk = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = Darwin.read(descriptor, &chunk, chunk.count)
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw Self.failure()
+            }
+            if count == 0 { return data }
+            data.append(chunk, count: count)
+        }
     }
 
     func exists(_ url: URL) -> Bool {

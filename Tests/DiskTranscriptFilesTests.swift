@@ -47,13 +47,25 @@ final class DiskTranscriptFilesTests: XCTestCase {
 
     func testReadingGivesWhatWasWrittenAndNothingForAMissingFile() throws {
         let file = try makeFolder().appendingPathComponent("call.md")
-        XCTAssertNil(files.read(file))
+        XCTAssertNil(try files.read(file))
         XCTAssertFalse(files.exists(file))
 
         try files.replace(file, with: Data("kept".utf8))
 
-        XCTAssertEqual(files.read(file), Data("kept".utf8))
+        XCTAssertEqual(try files.read(file), Data("kept".utf8))
         XCTAssertTrue(files.exists(file))
+    }
+
+    func testAReadThatFailsIsAnErrorNotAMissingFile() throws {
+        let folder = try makeFolder()
+
+        XCTAssertThrowsError(try files.read(folder), "a path that cannot be read as a file is not 'missing'")
+    }
+
+    func testAFolderThatDoesNotExistMeansTheFileIsMissing() throws {
+        let file = try makeFolder().appendingPathComponent("gone/call.md")
+
+        XCTAssertNil(try files.read(file))
     }
 
     func testAFolderThatCannotBeCreatedIsAnError() throws {

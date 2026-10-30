@@ -28,16 +28,22 @@ enum ListeningState: Equatable {
 ///
 /// Capture that dies mid-call is brought back: system audio (a display going to
 /// sleep, a monitor unplugged) is restarted with backoff while its transcriber
-/// keeps running, and again at once when the Mac wakes or the displays change;
+/// keeps running (a stream that dies at once backs off further each time, and a
+/// capture call that never returns is given up on), and again at once when the
+/// Mac wakes or the displays change;
 /// if that fails for good the side is marked failed, so the status never claims
 /// to be listening to something that is not there. The microphone retries
 /// itself and reports only when that fails or recovers.
 ///
 /// With "Save transcripts" on, the call is also written to a Markdown file (see
 /// `TranscriptArchive`), and the in-memory transcript keeps only its newest turns,
-/// because the older ones are already on disk. "Summarize Meeting" sends the whole
-/// transcript, not just the recent tail an answer gets. A question the other side
-/// asks while an answer is streaming waits for it instead of being dropped.
+/// because the older ones are already on disk. The file has its own copy of the
+/// conversation, so Clear Transcript empties what the overlay shows and nothing
+/// else, and turning saving off ends the file on the spot. Every way a call can
+/// end (Stop, both sides failing) writes what was said. "Summarize Meeting" sends
+/// the whole transcript since the last Clear, not just the recent tail an answer
+/// gets. A question the other side asks while an answer is streaming waits for
+/// it instead of being dropped, unless you answer it aloud first.
 ///
 /// A side can also break without saying so. A transcriber that gives up says so
 /// (`onFatal`) and its side is marked failed at once. A watchdog per side, checked
@@ -52,7 +58,13 @@ enum ListeningState: Equatable {
 ///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
-/// sample meeting needs no terms, since it records nothing.
+/// sample meeting needs no terms, since it records nothing and, until they are
+/// accepted, sends nothing: canned answers stand in for Claude.
+///
+/// Withdrawing consent in the middle of a call (Deepgram switched off, its key
+/// removed, Apple's servers revoked) replaces the transcriber of every side and
+/// cancels the old ones, so no audio queued for them is sent and no side can
+/// bring one back.
 @MainActor
 @Observable
 final class AssistantController {
@@ -66,6 +78,13 @@ final class AssistantController {
     static let systemAudioRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15, 15]
     /// How often each side's audio is checked for silent breakage.
     static let watchdogInterval: TimeInterval = 5
+    /// A restarted stream that delivered audio for this long was a good one: its
+    /// death starts the backoff over, where one that dies at once makes it longer.
+    static let healthyStreamDuration: TimeInterval = 30
+    /// Longest wait for system audio to start, or to stop, before the call is
+    /// given up on so it cannot hold up every Stop and Start queued behind it.
+    static let systemAudioStartTimeout: TimeInterval = 30
+    static let systemAudioStopTimeout: TimeInterval = 10
     private static let maxProblems = 3
     private static let trimmedAndSavedNote = "[earlier lines trimmed - they are in your saved transcript file]"
 
@@ -109,6 +128,7 @@ final class AssistantController {
     @ObservationIgnored private let drainWindow: TimeInterval
     @ObservationIgnored private let transcriptFiles: TranscriptFileStoring
     @ObservationIgnored private let watchdogSchedule: (TimeInterval, @escaping () -> Void) -> Void
+    @ObservationIgnored private let timeoutSchedule: (TimeInterval, @escaping () -> Void) -> Void
 
     @ObservationIgnored private let themSlot = TranscriberSlot()
     @ObservationIgnored private let youSlot = TranscriberSlot()
@@ -126,6 +146,13 @@ final class AssistantController {
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
     @ObservationIgnored private var themRecovery = 0
     @ObservationIgnored private var themAttempts = 0
+    /// When their stream last came up and how many buffers had arrived by then,
+    /// to tell a stream that worked for a while from one that died at once.
+    @ObservationIgnored private var themUpSince = Date.distantPast
+    @ObservationIgnored private var themUpBuffers = 0
+    /// A restart of their stream is starting, and a death reported meanwhile is held.
+    @ObservationIgnored private var themRestarting = false
+    @ObservationIgnored private var themDiedWhileRestarting: CaptureFailure?
     @ObservationIgnored private var themCanRevive = false
     @ObservationIgnored private var captureProblems: [Speaker: Problem] = [:]
     @ObservationIgnored private var watchdogs: [Speaker: SideWatchdog] = [:]
@@ -137,6 +164,10 @@ final class AssistantController {
 
     @ObservationIgnored private var transcript = Transcript()
     @ObservationIgnored private var archive: TranscriptArchive?
+    /// Everything said this call, whatever Clear does to the overlay's transcript:
+    /// the saved file is the record, so a Clear must not cut a sentence that was
+    /// still being spoken. Exists only while an archive does.
+    @ObservationIgnored private var archiveFeed: Transcript?
     @ObservationIgnored private var archiveProblem: Problem?
     @ObservationIgnored private var sessionStartedAt: Date?
     @ObservationIgnored private let markdown = TranscriptMarkdown()
@@ -145,6 +176,9 @@ final class AssistantController {
     @ObservationIgnored private var answerRequest = 0
     @ObservationIgnored private var lastAutoAnswer = Date.distantPast
     @ObservationIgnored private var questions = QuestionQueue()
+    /// How many of your own turns have finished, so a question that waited can
+    /// tell whether you answered it aloud in the meantime.
+    @ObservationIgnored private var youTurnsFinished = 0
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
     @ObservationIgnored private var summaryRequest = 0
     @ObservationIgnored private var summaryProblem: Problem?
@@ -164,7 +198,8 @@ final class AssistantController {
          workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
          notifications: NotificationCenter = .default,
          meterClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         watchdogSchedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
+         watchdogSchedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
+         timeoutSchedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
         self.settings = settings
         self.systemAudio = systemAudio
         self.microphone = microphone
@@ -176,6 +211,7 @@ final class AssistantController {
         self.drainWindow = drainWindow
         self.transcriptFiles = transcriptFiles
         self.watchdogSchedule = watchdogSchedule
+        self.timeoutSchedule = timeoutSchedule
         let levels = self.levels
         themMeter = AudioMeter(clock: meterClock, onLevel: { level in
             deliverOnMain { levels.update(.them, rms: level) }
@@ -254,16 +290,24 @@ final class AssistantController {
 
     func stop() {
         guard listening != .idle else { return }
-        let stopped = session
+        endSession(status: "Stopped")
+        clearNotices()
+    }
+
+    /// Everything that ends a call, whoever ended it: the transcribers are told
+    /// to stop, what was said is written down, a question that was waiting is
+    /// forgotten, and the last words a recognizer is still working on are
+    /// accepted for a moment.
+    private func endSession(status endStatus: String) {
+        let ended = session
         let hadTranscribers = themTranscriber != nil || youTranscriber != nil
         session += 1
         tearDown()
         listening = .idle
-        status = "Stopped"
-        clearNotices()
+        status = endStatus
         questions.clear()
         flushArchive()
-        if hadTranscribers { drain(stopped) }
+        if hadTranscribers { drain(ended) }
     }
 
     /// The transcribers were just told to stop, and a recognizer that was
@@ -299,12 +343,12 @@ final class AssistantController {
         them.start()
         themSlot.set(them)
         let previous = lifecycle
-        lifecycle = Task { [weak self, systemAudio] in
+        lifecycle = Task { [weak self] in
             await previous?.value
             do {
-                try await systemAudio.start(application: self?.settings.captureAppBundleID)
+                try await self?.startSystemAudio()
                 guard let self, self.session == current else {
-                    await systemAudio.stop()
+                    await self?.stopSystemAudioNow()
                     return
                 }
                 // Their transcriber may have given up while this was starting; the
@@ -353,10 +397,7 @@ final class AssistantController {
     private func resolveStartup() {
         switch (themSide, youSide) {
         case (.failed, .failed):
-            session += 1
-            tearDown()
-            listening = .idle
-            status = "Not listening"
+            endSession(status: "Not listening")
         case (.up, _), (_, .up), (.reconnecting, _), (_, .reconnecting):
             listening = .listening
             status = listeningStatus()
@@ -370,7 +411,12 @@ final class AssistantController {
     private func sideChanged(_ speaker: Speaker, to state: SideState) {
         levels.setActive(speaker, state == .up)
         switch state {
-        case .up: armWatchdog(for: speaker)
+        case .up:
+            armWatchdog(for: speaker)
+            if speaker == .them {
+                themUpSince = now()
+                themUpBuffers = themMeter.reading().buffers
+            }
         case .reconnecting: break
         case .off, .pending, .failed: watchdogs[speaker] = nil
         }
@@ -398,8 +444,11 @@ final class AssistantController {
         if themSide == .pending || themSide == .up || themSide == .reconnecting {
             stopSystemAudio()
         }
-        if themSide != .failed { themTranscriber?.stop() }
-        if youSide != .failed { youTranscriber?.stop() }
+        // A Stop that lands before a consent withdrawal was applied must not drain
+        // the backend the user just withdrew from.
+        let stop: (LiveTranscriber?) -> Void = consentWithdrawn ? { $0?.cancel() } : { $0?.stop() }
+        if themSide != .failed { stop(themTranscriber) }
+        if youSide != .failed { stop(youTranscriber) }
         themTranscriber = nil
         youTranscriber = nil
         awaitingSpeechPermission = []
@@ -409,10 +458,92 @@ final class AssistantController {
 
     private func stopSystemAudio() {
         let previous = lifecycle
-        lifecycle = Task { [systemAudio] in
+        lifecycle = Task { [weak self] in
             await previous?.value
+            await self?.stopSystemAudioNow()
+        }
+    }
+
+    /// Starts and stops go through the lifecycle chain, and a call that never
+    /// comes back (ScreenCaptureKit can hang) must not hold up the chain for
+    /// good: after the limit the controller stops waiting. The call itself
+    /// cannot be cancelled, so it is left to finish on its own, and the next
+    /// start begins by stopping whatever is running.
+    private func startSystemAudio() async throws {
+        let systemAudio = systemAudio
+        let application = settings.captureAppBundleID
+        try await Self.raced(timeout: Self.systemAudioStartTimeout, schedule: timeoutSchedule) {
+            try await systemAudio.start(application: application)
+        }
+    }
+
+    private func stopSystemAudioNow() async {
+        let systemAudio = systemAudio
+        _ = try? await Self.raced(timeout: Self.systemAudioStopTimeout, schedule: timeoutSchedule) {
             await systemAudio.stop()
         }
+    }
+
+    /// The result of `operation`, or `SystemAudioError.timedOut` once `timeout`
+    /// has gone by, whichever comes first.
+    private static func raced(timeout: TimeInterval,
+                              schedule: (TimeInterval, @escaping () -> Void) -> Void,
+                              _ operation: @escaping () async throws -> Void) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let race = Race(continuation)
+            Task {
+                do {
+                    try await operation()
+                    race.finish(nil)
+                } catch {
+                    race.finish(error)
+                }
+            }
+            schedule(timeout) { race.finish(SystemAudioError.timedOut) }
+        }
+    }
+
+    /// Resumes its continuation once, for whichever of the operation and the
+    /// timer gets there first.
+    private final class Race: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Error>?
+
+        init(_ continuation: CheckedContinuation<Void, Error>) {
+            self.continuation = continuation
+        }
+
+        func finish(_ error: Error?) {
+            let waiting = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+                defer { continuation = nil }
+                return continuation
+            }
+            guard let waiting else { return }
+            if let error { waiting.resume(throwing: error) } else { waiting.resume() }
+        }
+    }
+
+    private func transcriber(for speaker: Speaker) -> LiveTranscriber? {
+        speaker == .them ? themTranscriber : youTranscriber
+    }
+
+    private func slot(for speaker: Speaker) -> TranscriberSlot {
+        speaker == .them ? themSlot : youSlot
+    }
+
+    private func side(of speaker: Speaker) -> SideState {
+        speaker == .them ? themSide : youSide
+    }
+
+    /// Brings a side's own transcriber back with its capture: a side that was
+    /// down is revived with the transcriber it has, which is always one built
+    /// for the plan in force (a privacy switch replaces every side's, down or
+    /// not). A replacement still waiting for its permission answer is started
+    /// when the answer comes, not twice.
+    private func reviveTranscriber(for speaker: Speaker) {
+        guard !awaitingSpeechPermission.contains(speaker), let revived = transcriber(for: speaker) else { return }
+        revived.start()
+        slot(for: speaker).set(revived)
     }
 
     // MARK: - Capture that stops mid-call
@@ -437,15 +568,28 @@ final class AssistantController {
     }
 
     private func systemAudioStopped(_ failure: CaptureFailure, session current: Int) {
-        guard session == current, themSide == .up else { return }
+        guard session == current else { return }
+        // The restart that is starting has not finished, so it cannot be told it
+        // is up yet; the death is held until it is, and counts against it then.
+        if themSide == .reconnecting, themRestarting {
+            themDiedWhileRestarting = failure
+            return
+        }
+        guard themSide == .up else { return }
         guard failure.isRetryable else {
             giveUpOnSystemAudio(Problem(message: "Meeting audio stopped: \(failure.message)"), canRevive: false)
             return
         }
         themSide = .reconnecting
-        themAttempts = 0
+        if streamWasHealthy { themAttempts = 0 }
         status = listeningStatus()
         scheduleSystemAudioRestart(session: current)
+    }
+
+    /// Their stream delivered audio for a good while before it died.
+    private var streamWasHealthy: Bool {
+        now().timeIntervalSince(themUpSince) >= Self.healthyStreamDuration
+            && themMeter.reading().buffers > themUpBuffers
     }
 
     private func scheduleSystemAudioRestart(session current: Int) {
@@ -463,29 +607,49 @@ final class AssistantController {
 
     /// Stops the dead stream and starts a new one through the same chain as
     /// Start and Stop, so the two never overlap. The transcriber is untouched:
-    /// it keeps its state and utterance numbering across the gap.
+    /// it keeps its state and utterance numbering across the gap. A restart that
+    /// comes up only counts as an attempt used: the backoff starts over when the
+    /// stream has proved itself, not merely because it started.
     private func restartSystemAudio(session current: Int, recovery: Int) {
         guard isRecovering(session: current, recovery: recovery) else { return }
         let previous = lifecycle
-        lifecycle = Task { [weak self, systemAudio] in
+        lifecycle = Task { [weak self] in
             await previous?.value
             guard let self, self.isRecovering(session: current, recovery: recovery) else { return }
-            await systemAudio.stop()
+            self.themRestarting = true
+            self.themDiedWhileRestarting = nil
+            await self.stopSystemAudioNow()
             do {
-                try await systemAudio.start(application: self.settings.captureAppBundleID)
+                try await self.startSystemAudio()
+                self.themRestarting = false
                 guard self.session == current, self.themSide == .reconnecting else {
-                    await systemAudio.stop()
+                    await self.stopSystemAudioNow()
+                    return
+                }
+                if let failure = self.themDiedWhileRestarting {
+                    self.themDiedWhileRestarting = nil
+                    self.streamDiedWhileRestarting(failure, session: current)
                     return
                 }
                 self.themSide = .up
-                self.themAttempts = 0
+                self.themAttempts += 1
                 self.clearCaptureProblem(for: .them)
                 self.status = self.listeningStatus()
             } catch {
+                self.themRestarting = false
+                self.themDiedWhileRestarting = nil
                 guard self.isRecovering(session: current, recovery: recovery) else { return }
                 self.systemAudioRestartFailed(error, session: current)
             }
         }
+    }
+
+    private func streamDiedWhileRestarting(_ failure: CaptureFailure, session current: Int) {
+        guard failure.isRetryable else {
+            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped: \(failure.message)"), canRevive: false)
+            return
+        }
+        restartAttemptFailed(because: failure.message, session: current)
     }
 
     private func systemAudioRestartFailed(_ error: Error, session current: Int) {
@@ -493,9 +657,13 @@ final class AssistantController {
             giveUpOnSystemAudio(Self.problem(forSystemAudioError: error), canRevive: false)
             return
         }
+        restartAttemptFailed(because: error.localizedDescription, session: current)
+    }
+
+    private func restartAttemptFailed(because reason: String, session current: Int) {
         themAttempts += 1
         guard themAttempts < Self.systemAudioRetryDelays.count else {
-            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped and couldn't be restarted: \(error.localizedDescription)"),
+            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped and couldn't be restarted: \(reason)"),
                                 canRevive: true)
             return
         }
@@ -526,11 +694,10 @@ final class AssistantController {
     }
 
     private func microphoneRecovered(session current: Int) {
-        guard session == current, youSide == .failed, let you = youTranscriber else { return }
+        guard session == current, youSide == .failed, youTranscriber != nil else { return }
         youSide = .up
         clearCaptureProblem(for: .you)
-        you.start()
-        youSlot.set(you)
+        reviveTranscriber(for: .you)
         status = listeningStatus()
     }
 
@@ -549,8 +716,7 @@ final class AssistantController {
             themCanRevive = false
             themAttempts = 0
             clearCaptureProblem(for: .them)
-            themTranscriber?.start()
-            themSlot.set(themTranscriber)
+            reviveTranscriber(for: .them)
             status = listeningStatus()
             themRecovery += 1
             restartSystemAudio(session: session, recovery: themRecovery)
@@ -616,7 +782,8 @@ final class AssistantController {
             watchdogs[speaker] = watch
             return
         }
-        let verdict = watch.check(reading, at: time)
+        let preparing = transcriber(for: speaker)?.isPreparing == true
+        let verdict = watch.check(reading, at: time, judgesText: !preparing)
         watchdogs[speaker] = watch
         if !watch.isHearingAudio { levels.silence(speaker) }
         guard let verdict else { return }
@@ -635,9 +802,10 @@ final class AssistantController {
         case .captureResumed:
             clearCaptureProblem(for: speaker)
         case .restartTranscriber:
-            guard let transcriber = speaker == .them ? themTranscriber : youTranscriber else { return }
-            transcriber.stop()
-            transcriber.start()
+            guard let stalled = transcriber(for: speaker) else { return }
+            stalled.stop()
+            stalled.start()
+            slot(for: speaker).set(stalled)
         case .transcriberStillSilent:
             let side = speaker == .them ? "Their" : "Your"
             reportCaptureProblem(Problem(message: "\(side) side is being heard but nothing is being transcribed. Stop and start listening to try again."),
@@ -675,18 +843,26 @@ final class AssistantController {
             if self.session == current { self.heardText(segment, from: speaker) }
             self.receive(segment, from: speaker, isLive: self.session == current)
         }
-        transcriber.onError = { [weak self] message in
-            guard let self, self.session == current else { return }
+        transcriber.onError = { [weak self, weak transcriber] message in
+            guard let self, self.session == current, self.isCurrent(transcriber, for: speaker) else { return }
             self.report(Problem(message: "\(speaker.rawValue): \(message)"))
         }
         transcriber.onFatal = { [weak self, weak transcriber] message in
             guard let self, let transcriber, self.session == current else { return }
             self.transcriberGaveUp(transcriber, as: speaker, message: message)
         }
-        transcriber.onNotice = { [weak self] message in
-            guard let self, self.session == current else { return }
+        transcriber.onNotice = { [weak self, weak transcriber] message in
+            guard let self, self.session == current, self.isCurrent(transcriber, for: speaker) else { return }
             self.setNotice(message, from: speaker)
         }
+    }
+
+    /// A replaced transcriber keeps its words (they are still accepted) but no
+    /// longer speaks for its side: its notices and errors are about a backend
+    /// that is gone.
+    private func isCurrent(_ transcriber: LiveTranscriber?, for speaker: Speaker) -> Bool {
+        guard let transcriber else { return false }
+        return self.transcriber(for: speaker) === transcriber
     }
 
     /// Words arriving prove the transcriber works, and take down a report that it did not.
@@ -761,14 +937,14 @@ final class AssistantController {
         let seen = Dictionary(uniqueKeysWithValues: [Speaker.them, .you].compactMap { speaker in
             transcript.highestUtterance(of: speaker).map { (speaker, $0) }
         })
-        keepWhatWasSaved()
+        archive?.markCleared()
         resetTranscriptAndAnswer()
+        resetSummary()
         clearedThrough = seen
     }
 
     private func resetTranscriptAndAnswer() {
         transcript = Transcript()
-        transcript.collectsCommitted = archive != nil
         clearedThrough = [:]
         transcriptDisplay = ""
         answerTask?.cancel()
@@ -780,10 +956,11 @@ final class AssistantController {
     }
 
     private func receive(_ segment: TranscriptSegment, from speaker: Speaker, isLive: Bool) {
+        feedArchive(segment, from: speaker)
         guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
-        archive?.append(transcript.collectCommitted())
+        if finished?.speaker == .you { youTurnsFinished += 1 }
         guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
         questionAsked(finished.text)
@@ -794,15 +971,18 @@ final class AssistantController {
     /// Decided once per Start: with saving on, this call gets a file. Turning
     /// saving on in the middle of a call waits for the next Start.
     private func beginArchive() {
+        // The call being replaced may still hold lines (a Start inside the drain
+        // window of a Stop): they go to its file before it is let go.
+        flushArchive()
         sessionStartedAt = now()
         archive = nil
-        guard settings.saveTranscripts else {
-            transcript.collectsCommitted = false
-            return
-        }
+        archiveFeed = nil
+        guard settings.saveTranscripts else { return }
         archive = TranscriptArchive(folder: settings.transcriptFolder, started: now(), files: transcriptFiles,
                                     format: markdown)
-        transcript.collectsCommitted = true
+        var feed = Transcript()
+        feed.collectsCommitted = true
+        archiveFeed = feed
         scheduleArchiveFlush(session: session)
         // Now, not at the first write: macOS may ask permission for a folder like
         // Documents, and a bad folder should be said so at Start, not 30 s in.
@@ -813,9 +993,29 @@ final class AssistantController {
         }
     }
 
+    /// Turning saving off ends the archive on the spot: what was waiting to be
+    /// written is not written, and nothing said from now on is kept, even if
+    /// saving is turned on again (that waits for the next Start).
     private func endArchive() {
         archive = nil
-        transcript.collectsCommitted = false
+        archiveFeed = nil
+        showSaveProblem(nil)
+    }
+
+    private func savingMayHaveChanged() {
+        guard archive != nil, !settings.saveTranscripts else { return }
+        endArchive()
+    }
+
+    /// Every segment goes to the saved file, fenced by a Clear or not.
+    private func feedArchive(_ segment: TranscriptSegment, from speaker: Speaker) {
+        guard let archive else { return }
+        guard settings.saveTranscripts else {
+            endArchive()
+            return
+        }
+        archiveFeed?.apply(segment, from: speaker, at: now())
+        archive.append(archiveFeed?.collectCommitted() ?? [])
     }
 
     private func scheduleArchiveFlush(session current: Int) {
@@ -837,22 +1037,14 @@ final class AssistantController {
             endArchive()
             return
         }
-        archive.append(transcript.collectCommitted())
-        archive.flush(snapshot: transcript.uncommittedTurns)
+        archive.append(archiveFeed?.collectCommitted() ?? [])
+        archive.flush(snapshot: archiveFeed?.uncommittedTurns ?? [])
         showSaveProblem(archive.lastError)
     }
 
     /// Quitting in the middle of a call: what was said since the last write is saved too.
     func saveBeforeQuit() {
         flushArchive()
-    }
-
-    /// Clearing the overlay's transcript must not lose lines from the saved one.
-    private func keepWhatWasSaved() {
-        guard let archive, settings.saveTranscripts else { return }
-        archive.append(transcript.collectCommitted() + transcript.uncommittedTurns)
-        archive.flush(snapshot: [])
-        showSaveProblem(archive.lastError)
     }
 
     private func showSaveProblem(_ error: Error?) {
@@ -918,9 +1110,14 @@ final class AssistantController {
             return
         }
         let stream: AsyncThrowingStream<String, Error>
-        if let apiKey = settings.resolveAPIKey() {
+        if inSample && !settings.hasAcceptedTerms {
+            // Trying the app before agreeing to anything: nothing leaves the Mac,
+            // whatever keys exist.
+            stream = nextSampleAnswer()
+        } else if let apiKey = settings.resolveAPIKey() {
+            // The sample is not the user's call, so their own instructions stay out of it.
             stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: settings.systemPrompt,
+                                                   system: inSample ? settings.profile.systemPrompt : settings.systemPrompt,
                                                    user: Self.userPrompt(context)))
         } else if inSample {
             stream = nextSampleAnswer()
@@ -958,13 +1155,16 @@ final class AssistantController {
     /// (nothing streaming, and the pause since the last auto-answer is over).
     private func questionAsked(_ text: String) {
         guard settings.autoAnswer else { return }
-        questions.hold(text, at: now())
+        if let replaced = questions.hold(text, at: now(), afterYouTurns: youTurnsFinished) {
+            answerNote = QuestionQueue.replacedNote(for: replaced)
+        }
         answerWaitingQuestion()
     }
 
     /// Answers the waiting question if it can be answered now. It is asked
     /// again when the answer in progress finishes or the pause ends; one that
-    /// waited past `QuestionQueue.maxAge` is dropped with a note.
+    /// waited past `QuestionQueue.maxAge`, or that you answered aloud while it
+    /// waited, is dropped with a note.
     private func answerWaitingQuestion() {
         guard let waiting = questions.waiting else { return }
         guard settings.autoAnswer, listening == .listening || listening == .starting else {
@@ -972,6 +1172,11 @@ final class AssistantController {
             return
         }
         guard !isAnswering else { return }
+        guard youTurnsFinished == waiting.afterYouTurns else {
+            answerNote = QuestionQueue.answeredByYouNote(for: waiting)
+            questions.clear()
+            return
+        }
         guard now().timeIntervalSince(waiting.detectedAt) <= QuestionQueue.maxAge else {
             answerNote = QuestionQueue.skippedNote(for: waiting, at: now())
             questions.clear()
@@ -1023,6 +1228,11 @@ final class AssistantController {
             isSummarizing = false
             return
         }
+        if inSample && !settings.hasAcceptedTerms {
+            summary = SampleMeeting.sampleSummary
+            isSummarizing = false
+            return
+        }
         guard let apiKey = settings.resolveAPIKey() else {
             summary = missingKeyMessage
             isSummarizing = false
@@ -1034,7 +1244,7 @@ final class AssistantController {
         summary = ""
         isSummarizing = true
         let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: SummaryPrompt.system(extraInstructions: settings.extraInstructions),
+                                                   system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions),
                                                    user: SummaryPrompt.user(input)))
         summaryTask = Task { [weak self] in
             do {
@@ -1101,10 +1311,14 @@ final class AssistantController {
     func startSample() {
         guard listening == .idle else { return }
         session += 1
+        // The call that just ended must not leak into the sample: its last words
+        // go to its own file, and the drain window closes.
+        drainingSession = nil
         listening = .sample
         status = "Sample meeting (nothing is recorded)"
         problems = []
         clearNotices()
+        flushArchive()
         endArchive()
         resetTranscriptAndAnswer()
         resetSummary()
@@ -1178,7 +1392,18 @@ final class AssistantController {
         guard settingsObserver == nil else { return }
         settingsObserver = settings.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.speechSettingsMayHaveChanged() }
+            .sink { [weak self] _ in
+                self?.speechSettingsMayHaveChanged()
+                self?.savingMayHaveChanged()
+            }
+    }
+
+    /// The settings now say less than the running session was built for: Deepgram
+    /// was turned off or lost its key, or Apple's servers were revoked. (Turning
+    /// Deepgram on is not a withdrawal: it waits for the next Start.)
+    private var consentWithdrawn: Bool {
+        let plan = TranscriberFactory.plan(for: settings)
+        return plan != activePlan && plan != .deepgram
     }
 
     /// Turning Deepgram off, removing its key, or revoking Apple's servers
@@ -1186,8 +1411,8 @@ final class AssistantController {
     /// for the next Start, as Settings says.
     private func speechSettingsMayHaveChanged() {
         guard listening == .starting || listening == .listening else { return }
+        guard consentWithdrawn else { return }
         let plan = TranscriberFactory.plan(for: settings)
-        guard plan != activePlan, plan != .deepgram else { return }
         guard listening == .listening else {
             schedule(Self.settingsRecheckInterval) { [weak self] in
                 deliverOnMain { self?.speechSettingsMayHaveChanged() }
@@ -1197,9 +1422,11 @@ final class AssistantController {
         restartTranscribers(to: plan)
     }
 
-    /// Replaces the transcriber on every side that is capturing with one built
-    /// from the current settings. Audio is cut off from the old one first, so
-    /// nothing more reaches a backend the user switched off.
+    /// Replaces the transcriber on every side with one built from the current
+    /// settings, whatever state the side is in, so no side can ever start (or
+    /// restart, when it comes back) one built for the backend the user switched
+    /// off. The old ones are cancelled, not drained: audio still queued for them
+    /// is dropped and nothing more reaches a backend the user withdrew from.
     private func restartTranscribers(to plan: SpeechPlan) {
         let current = session
         activePlan = plan
@@ -1207,17 +1434,19 @@ final class AssistantController {
         let offset = restartGeneration * Self.restartUtteranceStride
         var replaced: [Replacement] = []
         for speaker in [Speaker.them, .you] {
+            guard let old = transcriber(for: speaker) else { continue }
             let started: Bool
-            switch speaker == .them ? themSide : youSide {
+            switch side(of: speaker) {
             // A reconnecting side keeps its transcriber running while capture
             // comes back, so it is replaced exactly like a side that is up.
             case .up, .reconnecting: started = true
             case .pending: started = speaker == .them
-            case .off, .failed: continue
+            // Replaced, but only started if the side comes back.
+            case .failed, .off: started = false
             }
-            guard let old = speaker == .them ? themTranscriber : youTranscriber else { continue }
-            (speaker == .them ? themSlot : youSlot).set(nil)
-            if started { old.stop() }
+            slot(for: speaker).set(nil)
+            old.cancel()
+            speakerNotices[speaker] = nil
             let fresh = makeTranscriber(speaker)
             wire(fresh, as: speaker, session: current)
             let forward = fresh.onSegment
@@ -1229,6 +1458,7 @@ final class AssistantController {
             if started { awaitingSpeechPermission.insert(speaker) }
             replaced.append(Replacement(speaker: speaker, transcriber: fresh, started: started))
         }
+        refreshNotice()
         guard let first = replaced.first else { return }
         backendName = first.transcriber.backendName
         if listening == .listening { status = listeningStatus() }
@@ -1247,11 +1477,10 @@ final class AssistantController {
             return
         }
         for item in replaced where item.started {
-            let side = item.speaker == .them ? themSide : youSide
-            let still = item.speaker == .them ? themTranscriber : youTranscriber
-            guard side == .up || side == .pending, still === item.transcriber else { continue }
+            guard [.up, .pending, .reconnecting].contains(side(of: item.speaker)),
+                  transcriber(for: item.speaker) === item.transcriber else { continue }
             item.transcriber.start()
-            (item.speaker == .them ? themSlot : youSlot).set(item.transcriber)
+            slot(for: item.speaker).set(item.transcriber)
         }
     }
 }

@@ -388,6 +388,35 @@ final class AnalyzerTranscriberTests: XCTestCase {
         XCTAssertEqual(h.notices, ["Downloading the on-device speech model…", nil])
     }
 
+    // MARK: - Preparing (CAP2-3)
+
+    func testItIsPreparingWhileThePipelineIsBeingBuiltAndNotOnceItRuns() async {
+        let h = makeHarness()
+        h.gate.holds = true
+        XCTAssertFalse(h.transcriber.isPreparing, "not started yet")
+
+        h.transcriber.start()
+        await eventually { h.gate.waiting }
+        XCTAssertTrue(h.transcriber.isPreparing, "the model may still be downloading")
+
+        h.gate.release()
+        await eventually { h.gate.handedOut }
+        await eventually { !h.transcriber.isPreparing }
+    }
+
+    func testItIsPreparingWhileWaitingToRebuildAfterAFailureAndNotAfterStopping() async {
+        let h = makeHarness()
+        h.gate.error = TestFailure(message: "Offline")
+        h.transcriber.start()
+        await eventually { h.gate.makes == 1 }
+        await eventually { !h.scheduler.delays.isEmpty }
+        XCTAssertTrue(h.transcriber.isPreparing)
+
+        h.transcriber.stop()
+
+        XCTAssertFalse(h.transcriber.isPreparing)
+    }
+
     // MARK: - Harness
 
     private final class Harness {

@@ -98,6 +98,9 @@ final class AnalyzerTranscriber: LiveTranscriber {
         launch(run: current)
     }
 
+    /// Setting up (a model may be downloading) or waiting to rebuild after a failure.
+    var isPreparing: Bool { lock.withLock { running && pipeline == nil } }
+
     func stop() {
         let (pipeline, settingUp) = lock.withLock { () -> (AnalyzerPipeline?, Task<Void, Never>?) in
             running = false

@@ -109,7 +109,7 @@ final class CaptureHealthTests: XCTestCase {
         XCTAssertEqual(h.controller.problems, [])
     }
 
-    func testTheReplacementOfADeadTranscriberIsLeftAlone() async {
+    func testTheReplacementOfADeadTranscriberIsNotStarted() async {
         let h = LifecycleHarness(testCase: self)
         h.settings.setDeepgramKey("dg-key")
         h.settings.acceptCloudAudio()
@@ -120,7 +120,8 @@ final class CaptureHealthTests: XCTestCase {
         h.settings.useCloudSTT = false
         await settle()
 
-        XCTAssertEqual(h.transcribers.made.count, 3, "only your side, which still runs, is replaced")
+        XCTAssertEqual(h.transcribers.made.count, 4, "both are replaced, so no side can bring Deepgram back")
+        XCTAssertEqual(h.transcribers.latest(.them)?.starts, 0, "the dead side's replacement is not started")
         XCTAssertEqual(h.controller.status, "Listening (on-device, your side only)")
     }
 
@@ -428,6 +429,45 @@ final class CaptureHealthTests: XCTestCase {
         await eventually { replacement?.starts == 1 }
         await h.pass(60, hearing: [.you], talking: [.them])
         XCTAssertEqual(replacement?.stops, 1, "watched again once it runs")
+    }
+
+    func testATranscriberThatIsStillPreparingIsNotRestartedOrReported() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        let you = h.transcribers.latest(.you)
+        you?.isPreparing = true
+        you?.notice("Downloading the on-device speech model…")
+
+        await h.pass(180, hearing: [.them], talking: [.you])
+
+        XCTAssertEqual(you?.stops, 0, "a model download is not a dead transcriber")
+        XCTAssertEqual(h.controller.problems, [])
+        XCTAssertEqual(h.controller.notice, "Downloading the on-device speech model…")
+    }
+
+    func testOnceItIsReadyASilentTranscriberIsJudgedAgainFromThatPoint() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        let you = h.transcribers.latest(.you)
+        you?.isPreparing = true
+        await h.pass(180, hearing: [.them], talking: [.you])
+
+        you?.isPreparing = false
+        await h.pass(55, hearing: [.them], talking: [.you])
+        XCTAssertEqual(you?.stops, 0, "the minutes spent preparing do not count")
+        await h.pass(5, hearing: [.them], talking: [.you])
+
+        XCTAssertEqual(you?.stops, 1)
+    }
+
+    func testCaptureIsStillWatchedWhileItsTranscriberPrepares() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+        h.transcribers.latest(.you)?.isPreparing = true
+
+        await h.pass(30, hearing: [.them])
+
+        XCTAssertEqual(h.microphone.reconnects, 1, "a microphone that went silent is still caught")
     }
 
     // MARK: - Never during a stop (M1)

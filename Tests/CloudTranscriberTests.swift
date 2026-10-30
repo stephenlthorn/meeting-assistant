@@ -540,6 +540,171 @@ final class CloudTranscriberTests: XCTestCase {
         XCTAssertTrue(h.fatals.first?.hasPrefix("Deepgram couldn't be reached after") ?? false)
     }
 
+    // MARK: - Withdrawing consent (codex round 2 P1 #1)
+
+    func testBuffersQueuedBeforeACancelAreNeverSentAndNothingIsDrained() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        let socket = h.sockets.latest
+        let release = h.holdTheQueue()
+
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertEqual(socket?.sentData.count, 0, "audio queued before the withdrawal must not leave the Mac")
+        XCTAssertEqual(socket?.sentText, [], "not even a CloseStream: the session is cancelled, not drained")
+        XCTAssertEqual(socket?.closed, true)
+        XCTAssertFalse(h.scheduler.delays.contains(CloudTranscriber.defaultDrainTimeout))
+    }
+
+    func testBuffersQueuedBeforeAUserStopAreStillSentSoTheLastWordsArrive() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        let socket = h.sockets.latest
+        let release = h.holdTheQueue()
+
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.stop()
+        release()
+        h.flush()
+
+        XCTAssertEqual(socket?.sentData.count, 2)
+        XCTAssertEqual(socket?.sentText, [#"{"type":"CloseStream"}"#])
+    }
+
+    func testAudioHandedOverAfterACancelReturnedIsDropped() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+
+        h.transcriber.cancel()
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.flush()
+
+        XCTAssertEqual(h.sockets.latest?.sentData.count, 0)
+    }
+
+    func testAStartQueuedBeforeACancelNeverConnects() {
+        let h = makeHarness()
+        let release = h.holdTheQueue()
+
+        h.transcriber.start()
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertTrue(h.sockets.requests.isEmpty, "not even a handshake after the withdrawal")
+    }
+
+    func testAReconnectQueuedBeforeACancelNeverConnects() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.sockets.latest?.serverDrops()
+        h.flush()
+        let release = h.holdTheQueue()
+
+        h.scheduler.fire(delay: 1)
+        h.transcriber.cancel()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.sockets.requests.count, 1)
+    }
+
+    func testACancelFinishesTheUtteranceThatWasOpenAndLeavesNothingHanging() async {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.sockets.latest?.serverSends(transcript: "we could move", isFinal: true, speechFinal: false)
+        h.flush()
+
+        h.transcriber.cancel()
+        h.flush()
+
+        await eventually { h.segments.count == 2 }
+        XCTAssertEqual(h.segments.last, TranscriptSegment(utterance: 0, text: "we could move", isFinal: true))
+        h.sockets.latest?.serverSends(transcript: "late", isFinal: true)
+        h.flush()
+        await settle()
+        XCTAssertEqual(h.segments.count, 2)
+    }
+
+    func testAStartAfterACancelWorksAndNeverSendsTheOldQueuedAudio() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        let release = h.holdTheQueue()
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.transcriber.cancel()
+
+        h.transcriber.start()
+        release()
+        h.flush()
+
+        XCTAssertEqual(h.sockets.requests.count, 2)
+        XCTAssertEqual(h.sockets.latest?.sentData.count, 0, "audio from before the withdrawal is not carried over")
+        h.transcriber.append(tone(amplitude: 0.1))
+        h.flush()
+        XCTAssertEqual(h.sockets.latest?.sentData.count, 1)
+    }
+
+    // MARK: - Preparing (CAP2-3)
+
+    func testItIsPreparingWhileItReconnectsAndNotOtherwise() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        XCTAssertFalse(h.transcriber.isPreparing)
+
+        h.sockets.latest?.serverDrops()
+        h.flush()
+        XCTAssertTrue(h.transcriber.isPreparing, "waiting to reconnect")
+        h.scheduler.fire(delay: 1)
+        h.flush()
+        XCTAssertTrue(h.transcriber.isPreparing, "reconnected but the server has not answered yet")
+
+        h.sockets.latest?.serverSends(transcript: "back", isFinal: false)
+        h.flush()
+        XCTAssertFalse(h.transcriber.isPreparing)
+    }
+
+    func testItIsNotPreparingOnceStoppedCancelledOrGivenUp() {
+        let h = makeHarness()
+        h.transcriber.start()
+        h.flush()
+        h.sockets.latest?.serverDrops()
+        h.flush()
+        XCTAssertTrue(h.transcriber.isPreparing)
+
+        h.transcriber.stop()
+        h.flush()
+        XCTAssertFalse(h.transcriber.isPreparing)
+
+        let other = makeHarness()
+        other.transcriber.start()
+        other.flush()
+        other.sockets.latest?.serverDrops()
+        other.flush()
+        other.transcriber.cancel()
+        other.flush()
+        XCTAssertFalse(other.transcriber.isPreparing)
+
+        let refused = makeHarness()
+        refused.transcriber.start()
+        refused.flush()
+        refused.sockets.latest?.handshakeStatusCode = 401
+        refused.sockets.latest?.serverDrops()
+        refused.flush()
+        XCTAssertFalse(refused.transcriber.isPreparing)
+    }
+
     // MARK: - Harness
 
     private final class Harness {
@@ -560,6 +725,14 @@ final class CloudTranscriberTests: XCTestCase {
         }
 
         func flush() { queue.sync {} }
+
+        /// Blocks the transcriber's queue, so what is handed over next waits behind
+        /// it. Call the result to let the queue go.
+        func holdTheQueue() -> () -> Void {
+            let gate = DispatchSemaphore(value: 0)
+            queue.async { gate.wait() }
+            return { gate.signal() }
+        }
     }
 
     private func makeHarness(apiKey: String = "dg-key") -> Harness {

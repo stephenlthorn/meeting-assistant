@@ -12,7 +12,11 @@ final class FakeTranscriber: LiveTranscriber {
     var holdsAuthorization = false
     private var heldAuthorization: ((Bool) -> Void)?
     private(set) var starts = 0
+    /// Counts `stop()` and `cancel()` alike, so "was stopped" reads the same either way.
     private(set) var stops = 0
+    /// Only the privacy stops: audio is cut off and nothing is drained.
+    private(set) var cancels = 0
+    var isPreparing = false
     private let lock = NSLock()
     private var appendedCount = 0
 
@@ -38,6 +42,10 @@ final class FakeTranscriber: LiveTranscriber {
 
     func start() { starts += 1 }
     func stop() { stops += 1 }
+    func cancel() {
+        cancels += 1
+        stops += 1
+    }
     func append(_ buffer: AVAudioPCMBuffer) { lock.withLock { appendedCount += 1 } }
 
     @MainActor func emit(_ text: String, utterance: Int = 0, isFinal: Bool = true) {
