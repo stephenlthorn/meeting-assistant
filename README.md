@@ -119,9 +119,10 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 
 ## Download
 
-Grab `MeetingAssistant.app.zip` from the latest [Release](../../releases/latest), or
-from the **Actions** tab (latest `build` run > Artifacts). Signed and notarized
-releases open normally. An ad-hoc signed build needs quarantine cleared before first
+**[Download MeetingAssistant.app.zip](https://github.com/stephenlthorn/meeting-assistant/releases/latest/download/MeetingAssistant.app.zip)**
+(the latest [release](../../releases/latest); every release lists what changed).
+Unreleased changes from `main` are in the **Actions** tab (latest `build` run >
+Artifacts), for testing only. Signed and notarized releases open normally. An ad-hoc signed build needs quarantine cleared before first
 launch:
 
 ```bash
