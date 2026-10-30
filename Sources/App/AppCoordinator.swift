@@ -28,11 +28,14 @@ protocol ClipboardWriting {
     func copy(_ text: String)
 }
 
-/// The panels that ask the user for a place on disk. A nil answer is a cancel.
+/// The panels that ask the user for a place on disk, and Finder, which shows them
+/// one. A nil answer is a cancel.
 @MainActor
 protocol TranscriptDialogs {
     func chooseTranscriptFile(suggestedName: String, startingIn folder: URL) -> URL?
     func chooseTranscriptFolder(startingAt folder: URL) -> URL?
+    /// Shows `folder` in Finder, creating it first when it does not exist yet.
+    func revealInFinder(_ folder: URL)
 }
 
 /// The app shell: what the menu, the shortcuts, the welcome screen and the
@@ -178,6 +181,12 @@ final class AppCoordinator {
     func summarizeMeeting() {
         summary.show()
         controller.summarizeMeeting()
+    }
+
+    /// Show Transcripts Folder: the default folder lives in Library, which Finder hides,
+    /// so the menu and Settings both offer a way in.
+    func showTranscriptsFolder() {
+        dialogs.revealInFinder(settings.transcriptFolder)
     }
 
     /// Settings > Transcripts > Choose Folder...

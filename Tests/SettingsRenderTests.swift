@@ -10,7 +10,7 @@ final class SettingsRenderTests: XCTestCase {
         let settings = makeTestSettings(for: self)
         settings.captureAppBundleID = "us.zoom.xos"
         let view = SettingsView(settings: settings, hotKeys: HotKeyBinder(), showWelcome: {}, withdrawTerms: {},
-                            chooseTranscriptFolder: {})
+                                chooseTranscriptFolder: {}, showTranscriptsFolder: {})
 
         let png = try render(view, size: NSSize(width: 480, height: 720))
 

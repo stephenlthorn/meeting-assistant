@@ -16,7 +16,8 @@ struct MeetingAssistantApp: App {
             SettingsView(settings: appDelegate.settings, hotKeys: appDelegate.hotKeys,
                          showWelcome: { appDelegate.coordinator.showWelcome() },
                          withdrawTerms: { appDelegate.coordinator.withdrawTerms() },
-                         chooseTranscriptFolder: { appDelegate.coordinator.chooseTranscriptFolder() })
+                         chooseTranscriptFolder: { appDelegate.coordinator.chooseTranscriptFolder() },
+                         showTranscriptsFolder: { appDelegate.coordinator.showTranscriptsFolder() })
         }
     }
 }

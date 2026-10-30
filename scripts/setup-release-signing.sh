@@ -8,8 +8,9 @@
 # lives in (not from the directory you run it in), or from --repo. It is shown and
 # must be confirmed before anything is written, so the secrets cannot land in the
 # wrong repository. Secrets go into the "release" environment so that only the
-# release job can read them; restrict that environment to the main branch in
-# Settings > Environments.
+# release job can read them. The environment's branch policy, not the workflow, is what
+# keeps a build of another branch from reading them: a missing environment is created
+# limited to main, and an existing one is left exactly as configured.
 #
 # Export the .p12 from Keychain Access (My Certificates > "Developer ID
 # Application: ..." > Export). Create the app-specific password at
@@ -49,16 +50,33 @@ case "$CONFIRM" in
   *) echo "Aborted. Nothing was written." >&2; exit 1 ;;
 esac
 
+# The environment is checked before anything is typed, so a GitHub hiccup wastes no
+# answers. Only a genuine 404 creates it: updating one that exists would reset the
+# reviewers and branch policy configured on it, and an error such as a 502 says nothing
+# about whether it exists. Created, it accepts deployments from main only, and that
+# policy is in place before any secret is.
+ENV_URL="repos/$REPO/environments/release"
+LOOKUP_STATUS=0
+LOOKUP_ERROR="$(gh api "$ENV_URL" 2>&1 >/dev/null)" || LOOKUP_STATUS=$?
+if [ "$LOOKUP_STATUS" -eq 0 ]; then
+  CREATED=false
+elif printf '%s\n' "$LOOKUP_ERROR" | grep -Eq '\(HTTP 404\)[[:space:]]*$'; then
+  gh api --method PUT "$ENV_URL" \
+    -F 'deployment_branch_policy[protected_branches]=false' \
+    -F 'deployment_branch_policy[custom_branch_policies]=true' >/dev/null
+  gh api --method POST "$ENV_URL/deployment-branch-policies" -f name=main -f type=branch >/dev/null \
+    || { echo "Created the release environment but could not limit it to main. No secret was written; add the main branch policy in Settings > Environments > release, then run this again." >&2; exit 1; }
+  CREATED=true
+else
+  echo "Could not check whether the release environment exists, so nothing was written: ${LOOKUP_ERROR:-gh exited with status $LOOKUP_STATUS}" >&2
+  exit 1
+fi
+
 read -rsp "Password for $P12: " P12_PASSWORD; echo
 read -rp "Signing identity (e.g. Developer ID Application: Your Name (TEAMID)): " IDENTITY
 read -rp "Apple ID email (for notarization): " APPLE_ID
 read -rp "Team ID: " TEAM_ID
 read -rsp "App-specific password: " APP_PASSWORD; echo
-
-# Only creates the environment when it is missing: updating an existing one could
-# reset the protection rules you configured on it.
-gh api "repos/$REPO/environments/release" >/dev/null 2>&1 \
-  || gh api --method PUT "repos/$REPO/environments/release" >/dev/null
 
 base64 -i "$P12" | gh secret set MACOS_CERTIFICATE_P12 --repo "$REPO" --env release
 printf '%s' "$P12_PASSWORD" | gh secret set MACOS_CERTIFICATE_PASSWORD --repo "$REPO" --env release
@@ -67,5 +85,9 @@ printf '%s' "$APPLE_ID" | gh secret set APPLE_ID --repo "$REPO" --env release
 printf '%s' "$TEAM_ID" | gh secret set APPLE_TEAM_ID --repo "$REPO" --env release
 printf '%s' "$APP_PASSWORD" | gh secret set APPLE_APP_PASSWORD --repo "$REPO" --env release
 
-echo "Done. Bump VERSION on main to publish a signed, notarized release."
-echo "Next: in $REPO > Settings > Environments > release, limit deployment branches to main."
+if [ "$CREATED" = true ]; then
+  echo "Done. The release environment only accepts deployments from main. Bump VERSION on main to publish a signed, notarized release."
+else
+  echo "Done. The release environment already existed, so its protection rules were left as they are."
+  echo "Next: in $REPO > Settings > Environments > release, check that deployment branches are limited to main."
+fi

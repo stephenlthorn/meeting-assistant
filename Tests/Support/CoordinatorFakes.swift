@@ -75,14 +75,19 @@ final class FakeClipboard: ClipboardWriting {
     func copy(_ text: String) { copies.append(text) }
 }
 
-/// The save and folder panels. Each answers with what the test set up, which
-/// is nil when the user cancels, and remembers how it was asked.
+/// The save and folder panels, and Finder. Each panel answers with what the test
+/// set up, which is nil when the user cancels, and remembers how it was asked.
 @MainActor
 final class FakeDialogs: TranscriptDialogs {
     var fileChoice: URL?
     var folderChoice: URL?
     private(set) var fileRequests: [(suggestedName: String, folder: URL)] = []
     private(set) var folderRequests: [URL] = []
+    private(set) var revealedFolders: [URL] = []
+
+    func revealInFinder(_ folder: URL) {
+        revealedFolders.append(folder)
+    }
 
     func chooseTranscriptFile(suggestedName: String, startingIn folder: URL) -> URL? {
         fileRequests.append((suggestedName, folder))

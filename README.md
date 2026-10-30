@@ -58,8 +58,9 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 - Two-sided transcription: system audio (them) + microphone (you), merged into one
   speaker-labeled transcript in the order people spoke.
 - **Listen to the meeting app only.** Settings > Meeting audio takes "All apps" or one
-  running app (Zoom, Teams, Webex, FaceTime, Slack or a browser), so music,
-  notification sounds and other tabs stay out of "Them". If the chosen app isn't
+  running app (Zoom, Teams, Webex, FaceTime, Slack or a browser), so music and
+  notification sounds stay out of "Them". An app is captured whole: pick a browser and
+  audio from all of its tabs is heard, not only the call's. If the chosen app isn't
   running when you start, every app is heard and the overlay says so.
 - On-device STT: SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14-15. If a
   14-15 Mac can't transcribe your language on-device, nothing is transcribed
@@ -84,9 +85,13 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
   It works while listening and after Stop.
 - **Saved transcripts**, off until you turn them on (Settings > Transcripts): each call
   is written as a timestamped Markdown file every 30 seconds and when you stop, into
-  `~/Documents/Meeting Assistant` or a folder you pick. Files are readable only by
-  you and never leave your Mac. A summary is saved next to its transcript. **Save
-  Transcript...** in the menu saves the current call anywhere, at any time.
+  `~/Library/Application Support/Meeting Assistant/Transcripts` or a folder you pick.
+  Files are readable only by you, and Meeting Assistant never sends them anywhere; they
+  stay on this Mac unless you choose a folder that syncs to iCloud, which Settings warns
+  about. **Show Transcripts Folder** in the menu (and **Show in Finder** in Settings)
+  opens the folder, since Finder hides Library. A summary is saved next to its
+  transcript. **Save Transcript...** in the menu saves the current call anywhere, at
+  any time.
 - **Long calls stay light.** Only the newest turns are kept in memory. With saving on,
   the older ones are already on disk, so Summarize Meeting can still cover a
   three-hour call in full; with saving off, it summarizes the recent part and says so.
@@ -121,10 +126,20 @@ open MeetingAssistant.app
 An ad-hoc build has a new code identity every release, so macOS asks for Screen
 Recording and Microphone again after each update.
 
+## Upgrading
+
+- **Shortcuts moved to Control-Option.** If you never changed the shortcuts in Settings,
+  Answer now is now ⌃⌥Space and Show or hide the overlay is ⌃⌥H (they were ⌘⇧Space and
+  ⌘⇧H, which shadow Home in Finder and browsers). If you ever picked a shortcut yourself,
+  it is kept; the old ones are still in the Settings > Shortcuts lists.
+- **Saved transcripts have a new default folder**, `~/Library/Application Support/Meeting
+  Assistant/Transcripts`, so iCloud's Desktop & Documents sync cannot upload them. A folder
+  you chose yourself is kept as it was, and Settings now warns when it syncs to iCloud.
+
 ## Build from source
 
 Requirements: macOS 14+ at runtime, Xcode 26+ to build (the macOS 26 SDK defines
-SpeechAnalyzer; the app still deploys to 14), [XcodeGen](https://github.com/yonsm/XcodeGen)
+SpeechAnalyzer; the app still deploys to 14), [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 (`brew install xcodegen`), and an Anthropic API key (optionally a Deepgram key).
 
 ```bash
@@ -165,9 +180,10 @@ The Deepgram key comes from the Keychain, then `DEEPGRAM_API_KEY`.
 - **Microphone** captures your side. Deny it and the app transcribes their side only.
 - **Speech Recognition** is needed on macOS 14-15 only; SpeechAnalyzer on macOS 26 runs
   without it.
-- **Documents folder**: macOS asks the first time Meeting Assistant saves a transcript
-  there (the default folder is `~/Documents/Meeting Assistant`). Nothing is written until
-  you turn on saving or choose Save Transcript.
+- **Documents folder**: only if you choose a folder inside Documents (or Desktop) for saved
+  transcripts, macOS asks the first time Meeting Assistant writes there. The default
+  folder, `~/Library/Application Support/Meeting Assistant/Transcripts`, needs no
+  permission. Nothing is written until you turn on saving or choose Save Transcript.
 
 When a permission is missing, the overlay says so with an **Open Settings** button for
 the right privacy pane.
@@ -180,7 +196,10 @@ when you choose Summarize Meeting. Audio goes to Deepgram only if you turn it on
 (macOS 14-15 only, when on-device recognition isn't available for your language) audio
 goes to Apple's speech servers only if you separately allow it. Transcripts are written
 to disk only if you turn on saving or choose Save Transcript, as files readable only by
-you that stay on this Mac. There are no analytics, accounts or developer servers.
+you that stay on this Mac unless you choose a folder that syncs to iCloud (a folder in
+iCloud Drive, or in Desktop or Documents while their iCloud sync is on); Settings warns
+when the chosen folder is one. The sample meeting uses canned answers and sends nothing
+until you agree to the terms. There are no analytics, accounts or developer servers.
 
 The welcome screen says all of this and asks for your agreement. It records which version
 of the terms you agreed to and asks again when they change; version 3 added Summarize
@@ -227,11 +246,12 @@ Meeting and saved transcripts. The full policy is in [PRIVACY.md](PRIVACY.md).
 | `Sources/UI/SettingsView.swift` | Preferences window |
 | `Sources/UI/Clipboard.swift` | Copy helper |
 | `Sources/System/AppSettings.swift` / `KeychainStore.swift` | Settings, consent (terms version) + Keychain |
+| `Sources/System/ICloudFolderCheck.swift` | Whether the transcript folder is one iCloud syncs, behind the warning in Settings |
 | `Sources/System/HotKeyManager.swift` / `HotKeyBinder.swift` | Global shortcuts (Carbon) |
 | `Resources/Assets.xcassets` | App icon (regenerate with `swift scripts/make-app-icon.swift`) |
 | `Config/MeetingAssistant.entitlements` | Hardened-runtime microphone entitlement |
 | `.github/workflows/` | `build.yml` (tests, plus an ad-hoc signed build kept as an artifact) and `release.yml` (the signed release) |
-| `scripts/release-*.sh`, `scripts/setup-release-signing.sh` | Release plumbing the workflow delegates to, and the one-time signing setup |
+| `scripts/release-*.sh`, `scripts/install-xcodegen.sh`, `scripts/setup-release-signing.sh` | Release plumbing the workflow delegates to (version, signing mode, release lookup, pinned XcodeGen), and the one-time signing setup |
 | `docs/plans/` | Roadmaps |
 | `Tests/` | Unit tests (a hostless XCTest bundle over the app sources; only `@main` is left out) |
 
@@ -245,7 +265,11 @@ A release is published from `main` when `VERSION` changes. To cut one:
    The released app is stamped from `VERSION`; its build number is derived from it
    (major x 1,000,000 + minor x 1,000 + patch).
 2. Push to `main`. The workflow tests, builds, signs and publishes the release, and
-   never re-publishes an existing tag. A manual run works only from `main`, and its tag
+   never re-publishes an existing tag: only a GitHub "not found" counts as no release,
+   any other error fails the run, and a tag that exists without a release fails it too
+   (`scripts/release-exists.sh`). Releases run one at a time, the job and notarization
+   have time limits, and every action and XcodeGen (`scripts/install-xcodegen.sh`) is
+   pinned to a commit or checksum. A manual run works only from `main`, and its tag
    input must equal `VERSION`.
 
 **Signing is all or nothing.** With all six secrets below set, the release is signed with
@@ -265,9 +289,11 @@ secrets, and reach only the steps that sign and notarize:
 Run `scripts/setup-release-signing.sh path/to/DeveloperID.p12` to store all six in the
 `release` environment with the GitHub CLI. It targets the checkout's `origin`, or the
 repository you name with `--repo OWNER/NAME`, shows the target and asks you to confirm
-before it writes anything. Afterwards, in Settings > Environments > `release`, limit
-deployment branches to `main`, and delete any older repository-level copies of these
-secrets. Create the certificate in Xcode (Settings > Accounts > Manage Certificates >
+before it writes anything. A missing environment is created limited to `main` before any
+secret is written; an existing one is never modified (and a GitHub error stops the script
+rather than being taken for "missing"), so in Settings > Environments > `release` check
+that deployment branches are limited to `main`, and delete any older repository-level
+copies of these secrets. Create the certificate in Xcode (Settings > Accounts > Manage Certificates >
 Developer ID Application) and export it from Keychain Access.
 
 ## Notes

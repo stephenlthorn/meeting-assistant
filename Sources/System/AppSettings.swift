@@ -34,9 +34,15 @@ final class AppSettings: ObservableObject {
     }()
 
     /// Where saved transcripts go until the user picks a folder. Not sandboxed, so a plain path is enough.
+    /// It is under Library, not Documents or Desktop, because iCloud's "Desktop & Documents Folders"
+    /// sync would upload the files and the app promises they stay on this Mac. Only a user who never
+    /// chose a folder gets it: the default is never written to the saved settings.
     static var defaultTranscriptFolder: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/Meeting Assistant", isDirectory: true)
+        defaultTranscriptFolder(home: FileManager.default.homeDirectoryForCurrentUser)
+    }
+
+    nonisolated static func defaultTranscriptFolder(home: URL) -> URL {
+        home.appendingPathComponent("Library/Application Support/Meeting Assistant/Transcripts", isDirectory: true)
     }
 
     private static let anthropicAccount = "anthropic_api_key"
@@ -89,10 +95,15 @@ final class AppSettings: ObservableObject {
         return deepgramKeySource.map { $0 != .unreadable } ?? false
     }
 
+    /// Whether the chosen transcript folder is one iCloud uploads, which Settings warns about.
+    /// Asked of the disk each time, since the user can turn Desktop & Documents sync on or off at any moment.
+    var transcriptFolderSyncsToICloud: Bool { iCloud.syncs(transcriptFolder) }
+
     private let defaults: UserDefaults
     private let secrets: SecretStore
     private let environment: [String: String]
     private let anthropicKeyFile: URL
+    private let iCloud: ICloudFolderCheck
 
     /// Keychain secrets already read this session. Reading one can raise a
     /// macOS access prompt that blocks the main thread, so it happens up front
@@ -102,11 +113,13 @@ final class AppSettings: ObservableObject {
     /// next `loadKeysForListening` or a successful save.
     private var unreadableAccounts: Set<String> = []
 
-    init(defaults: UserDefaults, secrets: SecretStore, environment: [String: String], anthropicKeyFile: URL) {
+    init(defaults: UserDefaults, secrets: SecretStore, environment: [String: String], anthropicKeyFile: URL,
+         iCloud: ICloudFolderCheck = .onDisk()) {
         self.defaults = defaults
         self.secrets = secrets
         self.environment = environment
         self.anthropicKeyFile = anthropicKeyFile
+        self.iCloud = iCloud
         model = defaults.string(forKey: "model") ?? "claude-haiku-4-5"
         profile = defaults.string(forKey: "profile").flatMap(Profile.init(rawValue:)) ?? .general
         extraInstructions = defaults.string(forKey: "extraInstructions") ?? ""

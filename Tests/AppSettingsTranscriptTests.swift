@@ -6,12 +6,52 @@ final class AppSettingsTranscriptTests: XCTestCase {
         XCTAssertFalse(makeSettings().saveTranscripts)
     }
 
-    func testTheDefaultFolderIsMeetingAssistantInDocuments() {
+    func testTheDefaultFolderIsInApplicationSupportWhereICloudDoesNotReach() {
         let expected = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/Meeting Assistant", isDirectory: true)
+            .appendingPathComponent("Library/Application Support/Meeting Assistant/Transcripts", isDirectory: true)
 
         XCTAssertEqual(makeSettings().transcriptFolder.path, expected.path)
         XCTAssertEqual(AppSettings.defaultTranscriptFolder.path, expected.path)
+    }
+
+    func testTheDefaultFolderIsNotInDocumentsOrDesktopWhichICloudCanSync() {
+        let path = AppSettings.defaultTranscriptFolder.path
+
+        XCTAssertFalse(path.contains("/Documents"), path)
+        XCTAssertFalse(path.contains("/Desktop"), path)
+        XCTAssertFalse(path.contains("Mobile Documents"), path)
+    }
+
+    func testAFolderTheUserNeverChoseIsNotWrittenDownSoOnlyTheirOwnChoiceIsKept() {
+        let defaults = freshDefaults()
+
+        _ = makeSettings(defaults: defaults).transcriptFolder
+
+        XCTAssertNil(defaults.object(forKey: "transcriptFolder"), "saving the default would turn it into a choice")
+    }
+
+    func testAFolderChosenWhenTheDefaultWasInDocumentsIsKept() {
+        let defaults = freshDefaults()
+        defaults.set("/Users/someone/Documents/Meeting Assistant", forKey: "transcriptFolder")
+
+        XCTAssertEqual(makeSettings(defaults: defaults).transcriptFolder.path, "/Users/someone/Documents/Meeting Assistant")
+    }
+
+    func testSettingsKnowWhenTheChosenFolderSyncsToICloud() {
+        let synced = URL(fileURLWithPath: "/Users/someone/Synced/Calls", isDirectory: true)
+        let check = ICloudFolderCheck(home: URL(fileURLWithPath: "/Users/someone"),
+                                      exists: { _ in true }, isUbiquitous: { $0.path.hasPrefix("/Users/someone/Synced") })
+        let settings = makeSettings(iCloud: check)
+
+        XCTAssertFalse(settings.transcriptFolderSyncsToICloud, "the default folder is local")
+
+        settings.transcriptFolder = synced
+
+        XCTAssertTrue(settings.transcriptFolderSyncsToICloud)
+
+        settings.transcriptFolder = URL(fileURLWithPath: "/Users/someone/Local/Calls", isDirectory: true)
+
+        XCTAssertFalse(settings.transcriptFolderSyncsToICloud)
     }
 
     func testTheChoiceToSaveAndTheFolderPersist() {
@@ -69,8 +109,8 @@ final class AppSettingsTranscriptTests: XCTestCase {
         return defaults
     }
 
-    private func makeSettings(defaults: UserDefaults? = nil) -> AppSettings {
+    private func makeSettings(defaults: UserDefaults? = nil, iCloud: ICloudFolderCheck = .onDisk()) -> AppSettings {
         AppSettings(defaults: defaults ?? freshDefaults(), secrets: InMemorySecretStore(), environment: [:],
-                    anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"))
+                    anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"), iCloud: iCloud)
     }
 }

@@ -129,4 +129,15 @@ struct AppKitTranscriptDialogs: TranscriptDialogs {
         guard panel.runModal() == .OK else { return nil }
         return panel.url
     }
+
+    /// Creates the folder first, owner-only like the files in it, so there is something to show
+    /// before the first transcript. If that fails, the closest folder that exists is shown instead.
+    func revealInFinder(_ folder: URL) {
+        try? DiskTranscriptFiles().prepareFolder(folder)
+        var target = folder
+        while !FileManager.default.fileExists(atPath: target.path), target.path != "/" {
+            target = target.deletingLastPathComponent()
+        }
+        NSWorkspace.shared.open(target)
+    }
 }

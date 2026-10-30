@@ -1,5 +1,16 @@
 import SwiftUI
 
+/// Settings wording that carries a promise, kept apart from the layout so a test can
+/// check it, like `WelcomeText`.
+enum SettingsText {
+    /// A browser is one app to ScreenCaptureKit, so choosing it cannot leave a tab out.
+    static let meetingAudioHelp = "Pick the app your calls happen in to keep music and notification sounds out of the transcript. A browser is captured whole: if you pick one, audio from all of its tabs is heard, not only the call. If the app isn't running when you start listening, every app is heard and the overlay says so. Takes effect the next time you start listening."
+
+    static let transcriptsHelp = "Off by default. When on, each call is saved as a Markdown file every 30 seconds and when you stop, readable only by you. The files stay on this Mac unless you choose a folder that syncs to iCloud. Turning it on applies from the next Start Listening; turning it off stops saving right away. Saving also lets Summarize Meeting cover a very long call in full, and saves each summary next to its transcript."
+
+    static let iCloudFolderWarning = "This folder syncs to iCloud, so saved transcripts are uploaded to Apple's servers and appear on your other devices. Choose a folder that isn't synced to keep them on this Mac."
+}
+
 /// Preferences window: API key (Keychain), model, behavior, shortcuts, which
 /// app's audio to listen to, extra prompt instructions, optional Deepgram cloud
 /// STT and Apple's speech servers (each only after agreeing to send audio
@@ -10,6 +21,7 @@ struct SettingsView: View {
     let showWelcome: () -> Void
     let withdrawTerms: () -> Void
     let chooseTranscriptFolder: () -> Void
+    let showTranscriptsFolder: () -> Void
     @State private var apiKeyField = ""
     @State private var deepgramField = ""
     @State private var saveFailed = false
@@ -75,7 +87,7 @@ struct SettingsView: View {
                         Text(MeetingApps.label(for: app, running: runningApps)).tag(String?.some(app.bundleID))
                     }
                 }
-                Text("Pick the app your calls happen in to keep music, notification sounds and other tabs out of the transcript. If it isn't running when you start listening, every app is heard and the overlay says so. Takes effect the next time you start listening.")
+                Text(SettingsText.meetingAudioHelp)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -126,9 +138,15 @@ struct SettingsView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
+                    Button("Show in Finder", action: showTranscriptsFolder)
                     Button("Choose Folder…", action: chooseTranscriptFolder)
                 }
-                Text("Off by default. When on, each call is saved as a Markdown file every 30 seconds and when you stop, readable only by you. The files stay on this Mac. Turning it on applies from the next Start Listening; turning it off stops saving right away. Saving also lets Summarize Meeting cover a very long call in full, and saves each summary next to its transcript.")
+                if settings.transcriptFolderSyncsToICloud {
+                    Label(SettingsText.iCloudFolderWarning, systemImage: "exclamationmark.icloud.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Text(SettingsText.transcriptsHelp)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
