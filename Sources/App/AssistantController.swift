@@ -28,16 +28,22 @@ enum ListeningState: Equatable {
 ///
 /// Capture that dies mid-call is brought back: system audio (a display going to
 /// sleep, a monitor unplugged) is restarted with backoff while its transcriber
-/// keeps running, and again at once when the Mac wakes or the displays change;
+/// keeps running (a stream that dies at once backs off further each time, and a
+/// capture call that never returns is given up on), and again at once when the
+/// Mac wakes or the displays change;
 /// if that fails for good the side is marked failed, so the status never claims
 /// to be listening to something that is not there. The microphone retries
 /// itself and reports only when that fails or recovers.
 ///
 /// With "Save transcripts" on, the call is also written to a Markdown file (see
 /// `TranscriptArchive`), and the in-memory transcript keeps only its newest turns,
-/// because the older ones are already on disk. "Summarize Meeting" sends the whole
-/// transcript, not just the recent tail an answer gets. A question the other side
-/// asks while an answer is streaming waits for it instead of being dropped.
+/// because the older ones are already on disk. The file has its own copy of the
+/// conversation, so Clear Transcript empties what the overlay shows and nothing
+/// else, and turning saving off ends the file on the spot. Every way a call can
+/// end (Stop, both sides failing) writes what was said. "Summarize Meeting" sends
+/// the whole transcript since the last Clear, not just the recent tail an answer
+/// gets. A question the other side asks while an answer is streaming waits for
+/// it instead of being dropped, unless you answer it aloud first.
 ///
 /// A side can also break without saying so. A transcriber that gives up says so
 /// (`onFatal`) and its side is marked failed at once. A watchdog per side, checked
@@ -52,7 +58,13 @@ enum ListeningState: Equatable {
 ///
 /// Listening and answering wait until the privacy terms are accepted;
 /// `onTermsNeeded` receives a closure that carries on once they are. The
-/// sample meeting needs no terms, since it records nothing.
+/// sample meeting needs no terms, since it records nothing and, until they are
+/// accepted, sends nothing: canned answers stand in for Claude.
+///
+/// Withdrawing consent in the middle of a call (Deepgram switched off, its key
+/// removed, Apple's servers revoked) replaces the transcriber of every side and
+/// cancels the old ones, so no audio queued for them is sent and no side can
+/// bring one back.
 @MainActor
 @Observable
 final class AssistantController {
@@ -432,8 +444,11 @@ final class AssistantController {
         if themSide == .pending || themSide == .up || themSide == .reconnecting {
             stopSystemAudio()
         }
-        if themSide != .failed { themTranscriber?.stop() }
-        if youSide != .failed { youTranscriber?.stop() }
+        // A Stop that lands before a consent withdrawal was applied must not drain
+        // the backend the user just withdrew from.
+        let stop: (LiveTranscriber?) -> Void = consentWithdrawn ? { $0?.cancel() } : { $0?.stop() }
+        if themSide != .failed { stop(themTranscriber) }
+        if youSide != .failed { stop(youTranscriber) }
         themTranscriber = nil
         youTranscriber = nil
         awaitingSpeechPermission = []
@@ -1383,13 +1398,21 @@ final class AssistantController {
             }
     }
 
+    /// The settings now say less than the running session was built for: Deepgram
+    /// was turned off or lost its key, or Apple's servers were revoked. (Turning
+    /// Deepgram on is not a withdrawal: it waits for the next Start.)
+    private var consentWithdrawn: Bool {
+        let plan = TranscriberFactory.plan(for: settings)
+        return plan != activePlan && plan != .deepgram
+    }
+
     /// Turning Deepgram off, removing its key, or revoking Apple's servers
     /// takes effect now, not at the next Start. Turning Deepgram on is left
     /// for the next Start, as Settings says.
     private func speechSettingsMayHaveChanged() {
         guard listening == .starting || listening == .listening else { return }
+        guard consentWithdrawn else { return }
         let plan = TranscriberFactory.plan(for: settings)
-        guard plan != activePlan, plan != .deepgram else { return }
         guard listening == .listening else {
             schedule(Self.settingsRecheckInterval) { [weak self] in
                 deliverOnMain { self?.speechSettingsMayHaveChanged() }

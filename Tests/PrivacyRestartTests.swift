@@ -22,6 +22,30 @@ final class PrivacyRestartTests: XCTestCase {
         XCTAssertEqual(h.transcribers.latest(.them)?.stops, 1)
     }
 
+    func testAStopRightAfterWithdrawingConsentCancelsInsteadOfDraining() async {
+        let h = await deepgramHarness()
+        let cloudThem = h.transcribers.latest(.them)
+        let cloudYou = h.transcribers.latest(.you)
+
+        h.settings.useCloudSTT = false
+        h.controller.stop()
+
+        XCTAssertEqual(cloudThem?.cancels, 1, "the withdrawal had not been applied yet, and Stop must not drain Deepgram")
+        XCTAssertEqual(cloudYou?.cancels, 1)
+    }
+
+    func testAStopAfterTurningDeepgramOnStillDrains() async {
+        let h = LifecycleHarness(testCase: self)
+        await h.startListening()
+
+        h.settings.setDeepgramKey("dg-key")
+        h.settings.acceptCloudAudio()
+        h.controller.stop()
+
+        XCTAssertEqual(h.transcribers.latest(.them)?.cancels, 0, "turning something on is not a withdrawal")
+        XCTAssertEqual(h.transcribers.latest(.them)?.stops, 1)
+    }
+
     // MARK: - A side that was down cannot bring the old backend back (CAP2-1)
 
     func testAMicrophoneThatReturnsAfterDeepgramWasSwitchedOffRestartsOnDeviceSpeechNotDeepgram() async {
