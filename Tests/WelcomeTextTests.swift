@@ -27,10 +27,12 @@ final class WelcomeTextTests: XCTestCase {
         XCTAssertTrue(WelcomeText.whereYourDataGoes.contains("the last few minutes of transcript text"))
     }
 
-    func testTheWelcomeScreenSaysSavedTranscriptsStayOnThisMac() {
+    func testTheWelcomeScreenSaysSavedTranscriptsStayOnThisMacUnlessTheFolderSyncs() {
         let text = WelcomeText.whereYourDataGoes
 
-        XCTAssertTrue(text.contains("If you turn on saving, transcripts are written as files only on this Mac"), text)
+        XCTAssertTrue(text.contains("If you turn on saving, transcripts are written as files on this Mac"), text)
+        XCTAssertTrue(text.contains("stay on this Mac unless you choose a folder that syncs to iCloud"), text)
+        XCTAssertFalse(text.contains("only on this Mac"), "that promise was false for a folder iCloud syncs")
     }
 
     func testTheWelcomeScreenStillSaysNothingGoesToTheDeveloper() {

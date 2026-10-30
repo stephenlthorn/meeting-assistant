@@ -504,6 +504,46 @@ final class AppCoordinatorTests: XCTestCase {
         XCTAssertEqual(h.files.writes, [])
     }
 
+    func testShowTranscriptsFolderRevealsTheFolderSavedTranscriptsGoTo() {
+        let h = makeHarness()
+        h.coordinator.start()
+
+        h.coordinator.showTranscriptsFolder()
+
+        XCTAssertEqual(h.dialogs.revealedFolders, [folder])
+    }
+
+    func testShowTranscriptsFolderRevealsTheDefaultFolderWhenNoneWasChosen() {
+        let h = makeHarness()
+        h.settings.transcriptFolder = AppSettings.defaultTranscriptFolder
+
+        h.coordinator.showTranscriptsFolder()
+
+        XCTAssertEqual(h.dialogs.revealedFolders.map(\.path), [AppSettings.defaultTranscriptFolder.path])
+    }
+
+    func testShowTranscriptsFolderFollowsANewFolderChoice() {
+        let h = makeHarness()
+        let chosen = URL(fileURLWithPath: "/Volumes/Work/Calls", isDirectory: true)
+        h.dialogs.folderChoice = chosen
+        h.coordinator.chooseTranscriptFolder()
+
+        h.coordinator.showTranscriptsFolder()
+
+        XCTAssertEqual(h.dialogs.revealedFolders, [chosen])
+    }
+
+    func testShowTranscriptsFolderNeedsNoTermsBecauseNothingLeavesTheMac() {
+        let h = makeHarness(termsAccepted: false)
+        h.coordinator.start()
+        let shown = h.welcome.shows
+
+        h.coordinator.showTranscriptsFolder()
+
+        XCTAssertEqual(h.dialogs.revealedFolders, [folder])
+        XCTAssertEqual(h.welcome.shows, shown, "revealing a folder does not ask for the terms")
+    }
+
     func testSummarizeMeetingAsksClaudeAndShowsTheSummaryWindow() async {
         let h = makeHarness()
         h.coordinator.start()

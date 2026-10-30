@@ -45,6 +45,7 @@ struct MenuContent: View {
             .disabled(!menu.canCopyTranscript)
         Button("Save Transcript…") { coordinator.saveTranscript() }
             .disabled(!menu.canSaveTranscript)
+        Button("Show Transcripts Folder") { coordinator.showTranscriptsFolder() }
         Button("Summarize Meeting") { coordinator.summarizeMeeting() }
             .disabled(!menu.canSummarize)
         Button("Copy Summary") { coordinator.copySummary() }
