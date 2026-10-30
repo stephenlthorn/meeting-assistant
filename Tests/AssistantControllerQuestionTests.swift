@@ -84,6 +84,55 @@ final class AssistantControllerQuestionTests: XCTestCase {
         await eventually { h.answerer.requests.count == 2 }
     }
 
+    // MARK: - A question that is no longer worth answering (APP2-9)
+
+    func testAHeldQuestionYouAnsweredYourselfIsSkippedWithAQuietNote() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.them.emit("What's the plan?", utterance: 0)
+        h.clock.now += 10
+        h.them.emit("And who owns it?", utterance: 1)
+
+        h.you.emit("Let me take that one myself.", utterance: 0)
+        h.answerer.streams[0].finish()
+        await eventually { !h.controller.isAnswering }
+        await settle()
+
+        XCTAssertEqual(h.answerer.requests.count, 1, "no answer to a question you already answered aloud")
+        XCTAssertEqual(h.controller.answerNote, "Skipped a question you already answered: \"And who owns it?\"")
+    }
+
+    func testAYouTurnBeforeTheQuestionWasAskedDoesNotSkipIt() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.them.emit("What's the plan?", utterance: 0)
+        h.you.emit("Let me think about that for a second.", utterance: 0)
+        h.clock.now += 10
+        h.them.emit("And who owns it?", utterance: 1)
+
+        h.answerer.streams[0].finish()
+
+        await eventually { h.answerer.requests.count == 2 }
+        XCTAssertNil(h.controller.answerNote)
+    }
+
+    func testASecondHeldQuestionLeavesANoteAboutTheOneItReplaced() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.them.emit("What's the plan?", utterance: 0)
+        h.clock.now += 8
+        h.them.emit("And who owns it?", utterance: 1)
+        XCTAssertNil(h.controller.answerNote, "nothing was replaced yet")
+
+        h.clock.now += 2
+        h.them.emit("When do we start?", utterance: 2)
+
+        XCTAssertEqual(h.controller.answerNote, "Skipped an earlier question: \"And who owns it?\"")
+        h.answerer.streams[0].finish()
+        await eventually { h.answerer.requests.count == 2 }
+        XCTAssertTrue(h.answerer.requests[1].user.contains("When do we start?"))
+    }
+
     // MARK: - The pause between auto-answers
 
     func testAQuestionHeldBackByThePauseIsAnsweredWhenThePauseEnds() async {
@@ -212,6 +261,7 @@ final class AssistantControllerQuestionTests: XCTestCase {
         let scheduler: ManualScheduler
 
         var them: FakeTranscriber { transcribers.latest(.them)! }
+        var you: FakeTranscriber { transcribers.latest(.you)! }
     }
 
     private func makeHarness() -> Harness {

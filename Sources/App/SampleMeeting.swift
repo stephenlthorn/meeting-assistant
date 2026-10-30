@@ -1,8 +1,10 @@
 import Foundation
 
 /// A scripted sales call for trying the app without a live meeting. Nothing
-/// is recorded. With an API key the sample transcript (not a real
-/// conversation) goes to Claude; without one, canned answers stream instead.
+/// is recorded. Until the privacy terms are accepted, or without an API key,
+/// canned answers and a canned summary stand in for Claude and nothing is sent
+/// anywhere. After that, with a key, the sample transcript (not a real
+/// conversation) goes to Claude, without the user's own extra instructions.
 enum SampleMeeting {
     struct Line: Equatable {
         let speaker: Speaker
@@ -27,6 +29,21 @@ enum SampleMeeting {
         "- Text back every missed call within a minute with a booking link\n- Send after-hours calls to an AI receptionist that books appointments\n- Ask which scheduling software the offices use",
         "- Pilot one office for two weeks, then roll out four offices at a time\n- About six weeks for all twelve\n- Ask who owns front-desk operations across the offices",
     ]
+
+    /// Stands in for Claude's summary while the sample plays before the privacy terms are accepted.
+    static let sampleSummary = """
+        Sample summary (accept the privacy terms and add your Anthropic API key in Settings for real summaries from Claude):
+
+        ## Summary
+        The prospect runs twelve dental offices whose front desks miss a lot of calls, and wants every caller answered within minutes.
+
+        ## Decisions
+        - None yet
+
+        ## Action items
+        - Owner not stated: walk through how missed calls would get a fast response
+        - Owner not stated: scope a rollout across all twelve offices
+        """
 
     /// Streams `text` word by word, like a live answer.
     static func streamAnswer(_ text: String, wordDelay: TimeInterval) -> AsyncThrowingStream<String, Error> {

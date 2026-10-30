@@ -489,6 +489,41 @@ final class AssistantControllerTests: XCTestCase {
         XCTAssertEqual(asked, 0)
     }
 
+    func testTheSampleMeetingNeverCallsTheRealAPIBeforeThePrivacyTermsAreAccepted() async {
+        let h = makeHarness(acceptTerms: false)
+        h.settings.extraInstructions = "Always mention Acme."
+
+        h.controller.startSample()
+        await advanceSample(h, lines: SampleMeeting.lines.count)
+
+        await eventually { !h.controller.isAnswering && !h.controller.answer.isEmpty }
+        XCTAssertTrue(h.answerer.requests.isEmpty, "a key and a sample are not consent to send anything")
+        XCTAssertTrue(h.controller.answer.hasPrefix("Sample answer"), h.controller.answer)
+    }
+
+    func testTheSampleMeetingNeverSendsTheUsersExtraInstructions() async {
+        let h = makeHarness()
+        h.settings.extraInstructions = "Always mention Acme."
+
+        h.controller.startSample()
+        await advanceSample(h, lines: firstSampleQuestion + 1)
+
+        XCTAssertEqual(h.answerer.requests.count, 1)
+        XCTAssertEqual(h.answerer.requests.first?.system, h.settings.profile.systemPrompt)
+        XCTAssertFalse(h.answerer.requests.first?.system.contains("Acme") ?? true)
+    }
+
+    func testARealCallStillSendsTheExtraInstructions() async {
+        let h = makeHarness()
+        h.settings.extraInstructions = "Always mention Acme."
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("What's the timeline?")
+
+        h.controller.answerNow()
+
+        XCTAssertTrue(h.answerer.requests.first?.system.contains("Always mention Acme.") ?? false)
+    }
+
     func testStoppingEndsTheSampleMeeting() async {
         let h = makeHarness()
         h.controller.startSample()

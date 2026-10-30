@@ -137,6 +137,10 @@ final class AssistantController {
 
     @ObservationIgnored private var transcript = Transcript()
     @ObservationIgnored private var archive: TranscriptArchive?
+    /// Everything said this call, whatever Clear does to the overlay's transcript:
+    /// the saved file is the record, so a Clear must not cut a sentence that was
+    /// still being spoken. Exists only while an archive does.
+    @ObservationIgnored private var archiveFeed: Transcript?
     @ObservationIgnored private var archiveProblem: Problem?
     @ObservationIgnored private var sessionStartedAt: Date?
     @ObservationIgnored private let markdown = TranscriptMarkdown()
@@ -145,6 +149,9 @@ final class AssistantController {
     @ObservationIgnored private var answerRequest = 0
     @ObservationIgnored private var lastAutoAnswer = Date.distantPast
     @ObservationIgnored private var questions = QuestionQueue()
+    /// How many of your own turns have finished, so a question that waited can
+    /// tell whether you answered it aloud in the meantime.
+    @ObservationIgnored private var youTurnsFinished = 0
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
     @ObservationIgnored private var summaryRequest = 0
     @ObservationIgnored private var summaryProblem: Problem?
@@ -254,16 +261,24 @@ final class AssistantController {
 
     func stop() {
         guard listening != .idle else { return }
-        let stopped = session
+        endSession(status: "Stopped")
+        clearNotices()
+    }
+
+    /// Everything that ends a call, whoever ended it: the transcribers are told
+    /// to stop, what was said is written down, a question that was waiting is
+    /// forgotten, and the last words a recognizer is still working on are
+    /// accepted for a moment.
+    private func endSession(status endStatus: String) {
+        let ended = session
         let hadTranscribers = themTranscriber != nil || youTranscriber != nil
         session += 1
         tearDown()
         listening = .idle
-        status = "Stopped"
-        clearNotices()
+        status = endStatus
         questions.clear()
         flushArchive()
-        if hadTranscribers { drain(stopped) }
+        if hadTranscribers { drain(ended) }
     }
 
     /// The transcribers were just told to stop, and a recognizer that was
@@ -353,10 +368,7 @@ final class AssistantController {
     private func resolveStartup() {
         switch (themSide, youSide) {
         case (.failed, .failed):
-            session += 1
-            tearDown()
-            listening = .idle
-            status = "Not listening"
+            endSession(status: "Not listening")
         case (.up, _), (_, .up), (.reconnecting, _), (_, .reconnecting):
             listening = .listening
             status = listeningStatus()
@@ -792,14 +804,14 @@ final class AssistantController {
         let seen = Dictionary(uniqueKeysWithValues: [Speaker.them, .you].compactMap { speaker in
             transcript.highestUtterance(of: speaker).map { (speaker, $0) }
         })
-        keepWhatWasSaved()
+        archive?.markCleared()
         resetTranscriptAndAnswer()
+        resetSummary()
         clearedThrough = seen
     }
 
     private func resetTranscriptAndAnswer() {
         transcript = Transcript()
-        transcript.collectsCommitted = archive != nil
         clearedThrough = [:]
         transcriptDisplay = ""
         answerTask?.cancel()
@@ -811,10 +823,11 @@ final class AssistantController {
     }
 
     private func receive(_ segment: TranscriptSegment, from speaker: Speaker, isLive: Bool) {
+        feedArchive(segment, from: speaker)
         guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
-        archive?.append(transcript.collectCommitted())
+        if finished?.speaker == .you { youTurnsFinished += 1 }
         guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
         questionAsked(finished.text)
@@ -825,15 +838,18 @@ final class AssistantController {
     /// Decided once per Start: with saving on, this call gets a file. Turning
     /// saving on in the middle of a call waits for the next Start.
     private func beginArchive() {
+        // The call being replaced may still hold lines (a Start inside the drain
+        // window of a Stop): they go to its file before it is let go.
+        flushArchive()
         sessionStartedAt = now()
         archive = nil
-        guard settings.saveTranscripts else {
-            transcript.collectsCommitted = false
-            return
-        }
+        archiveFeed = nil
+        guard settings.saveTranscripts else { return }
         archive = TranscriptArchive(folder: settings.transcriptFolder, started: now(), files: transcriptFiles,
                                     format: markdown)
-        transcript.collectsCommitted = true
+        var feed = Transcript()
+        feed.collectsCommitted = true
+        archiveFeed = feed
         scheduleArchiveFlush(session: session)
         // Now, not at the first write: macOS may ask permission for a folder like
         // Documents, and a bad folder should be said so at Start, not 30 s in.
@@ -844,9 +860,29 @@ final class AssistantController {
         }
     }
 
+    /// Turning saving off ends the archive on the spot: what was waiting to be
+    /// written is not written, and nothing said from now on is kept, even if
+    /// saving is turned on again (that waits for the next Start).
     private func endArchive() {
         archive = nil
-        transcript.collectsCommitted = false
+        archiveFeed = nil
+        showSaveProblem(nil)
+    }
+
+    private func savingMayHaveChanged() {
+        guard archive != nil, !settings.saveTranscripts else { return }
+        endArchive()
+    }
+
+    /// Every segment goes to the saved file, fenced by a Clear or not.
+    private func feedArchive(_ segment: TranscriptSegment, from speaker: Speaker) {
+        guard let archive else { return }
+        guard settings.saveTranscripts else {
+            endArchive()
+            return
+        }
+        archiveFeed?.apply(segment, from: speaker, at: now())
+        archive.append(archiveFeed?.collectCommitted() ?? [])
     }
 
     private func scheduleArchiveFlush(session current: Int) {
@@ -868,22 +904,14 @@ final class AssistantController {
             endArchive()
             return
         }
-        archive.append(transcript.collectCommitted())
-        archive.flush(snapshot: transcript.uncommittedTurns)
+        archive.append(archiveFeed?.collectCommitted() ?? [])
+        archive.flush(snapshot: archiveFeed?.uncommittedTurns ?? [])
         showSaveProblem(archive.lastError)
     }
 
     /// Quitting in the middle of a call: what was said since the last write is saved too.
     func saveBeforeQuit() {
         flushArchive()
-    }
-
-    /// Clearing the overlay's transcript must not lose lines from the saved one.
-    private func keepWhatWasSaved() {
-        guard let archive, settings.saveTranscripts else { return }
-        archive.append(transcript.collectCommitted() + transcript.uncommittedTurns)
-        archive.flush(snapshot: [])
-        showSaveProblem(archive.lastError)
     }
 
     private func showSaveProblem(_ error: Error?) {
@@ -949,9 +977,14 @@ final class AssistantController {
             return
         }
         let stream: AsyncThrowingStream<String, Error>
-        if let apiKey = settings.resolveAPIKey() {
+        if inSample && !settings.hasAcceptedTerms {
+            // Trying the app before agreeing to anything: nothing leaves the Mac,
+            // whatever keys exist.
+            stream = nextSampleAnswer()
+        } else if let apiKey = settings.resolveAPIKey() {
+            // The sample is not the user's call, so their own instructions stay out of it.
             stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: settings.systemPrompt,
+                                                   system: inSample ? settings.profile.systemPrompt : settings.systemPrompt,
                                                    user: Self.userPrompt(context)))
         } else if inSample {
             stream = nextSampleAnswer()
@@ -989,13 +1022,16 @@ final class AssistantController {
     /// (nothing streaming, and the pause since the last auto-answer is over).
     private func questionAsked(_ text: String) {
         guard settings.autoAnswer else { return }
-        questions.hold(text, at: now())
+        if let replaced = questions.hold(text, at: now(), afterYouTurns: youTurnsFinished) {
+            answerNote = QuestionQueue.replacedNote(for: replaced)
+        }
         answerWaitingQuestion()
     }
 
     /// Answers the waiting question if it can be answered now. It is asked
     /// again when the answer in progress finishes or the pause ends; one that
-    /// waited past `QuestionQueue.maxAge` is dropped with a note.
+    /// waited past `QuestionQueue.maxAge`, or that you answered aloud while it
+    /// waited, is dropped with a note.
     private func answerWaitingQuestion() {
         guard let waiting = questions.waiting else { return }
         guard settings.autoAnswer, listening == .listening || listening == .starting else {
@@ -1003,6 +1039,11 @@ final class AssistantController {
             return
         }
         guard !isAnswering else { return }
+        guard youTurnsFinished == waiting.afterYouTurns else {
+            answerNote = QuestionQueue.answeredByYouNote(for: waiting)
+            questions.clear()
+            return
+        }
         guard now().timeIntervalSince(waiting.detectedAt) <= QuestionQueue.maxAge else {
             answerNote = QuestionQueue.skippedNote(for: waiting, at: now())
             questions.clear()
@@ -1054,6 +1095,11 @@ final class AssistantController {
             isSummarizing = false
             return
         }
+        if inSample && !settings.hasAcceptedTerms {
+            summary = SampleMeeting.sampleSummary
+            isSummarizing = false
+            return
+        }
         guard let apiKey = settings.resolveAPIKey() else {
             summary = missingKeyMessage
             isSummarizing = false
@@ -1065,7 +1111,7 @@ final class AssistantController {
         summary = ""
         isSummarizing = true
         let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: SummaryPrompt.system(extraInstructions: settings.extraInstructions),
+                                                   system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions),
                                                    user: SummaryPrompt.user(input)))
         summaryTask = Task { [weak self] in
             do {
@@ -1132,10 +1178,14 @@ final class AssistantController {
     func startSample() {
         guard listening == .idle else { return }
         session += 1
+        // The call that just ended must not leak into the sample: its last words
+        // go to its own file, and the drain window closes.
+        drainingSession = nil
         listening = .sample
         status = "Sample meeting (nothing is recorded)"
         problems = []
         clearNotices()
+        flushArchive()
         endArchive()
         resetTranscriptAndAnswer()
         resetSummary()
@@ -1209,7 +1259,10 @@ final class AssistantController {
         guard settingsObserver == nil else { return }
         settingsObserver = settings.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.speechSettingsMayHaveChanged() }
+            .sink { [weak self] _ in
+                self?.speechSettingsMayHaveChanged()
+                self?.savingMayHaveChanged()
+            }
     }
 
     /// Turning Deepgram off, removing its key, or revoking Apple's servers

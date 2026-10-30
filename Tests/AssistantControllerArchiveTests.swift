@@ -195,6 +195,161 @@ final class AssistantControllerArchiveTests: XCTestCase {
         XCTAssertTrue(savedText(h).contains("Only the new session."))
     }
 
+    // MARK: - The end of a call that was not a Stop (CAP2-4, codex round 2 P2)
+
+    func testBothSidesFailingStillSavesWhatWasSaid() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("Decision: ship Friday.", utterance: 0)
+
+        h.transcribers.latest(.them)?.die("Deepgram rejected the API key (401).")
+        h.transcribers.latest(.you)?.die("Deepgram rejected the API key (401).")
+
+        XCTAssertEqual(h.controller.listening, .idle)
+        XCTAssertTrue(savedText(h).contains("Decision: ship Friday."), "the last lines were written at once")
+    }
+
+    func testBothSidesFailingDrainsLikeAStopAndForgetsTheWaitingQuestion() async {
+        let h = makeHarness()
+        h.settings.autoAnswer = true
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("What's the plan?", utterance: 0)
+        h.clock.now += 10
+        h.transcribers.latest(.them)?.emit("And who owns it?", utterance: 1)
+
+        h.transcribers.latest(.them)?.die("Deepgram rejected the API key (401).")
+        h.transcribers.latest(.you)?.die("Deepgram rejected the API key (401).")
+        h.transcribers.latest(.them)?.emit("One last thing.", utterance: 2)
+        h.scheduler.fire(delay: AssistantController.defaultDrainWindow)
+
+        await eventually { savedText(h).contains("One last thing.") }
+        h.answerer.streams[0].finish()
+        await settle()
+        XCTAssertEqual(h.answerer.requests.count, 1, "the waiting question is not answered after the call ended")
+    }
+
+    func testStartingAgainWithinTheDrainWindowKeepsTheLastWordsOfTheOldCall() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We should ship", utterance: 0, isFinal: false)
+        h.controller.stop()
+        h.transcribers.latest(.them)?.emit("We should ship in May.", utterance: 0)
+
+        await startListening(h)
+
+        XCTAssertEqual(h.files.files.count, 1)
+        XCTAssertTrue(savedText(h).contains("Them: We should ship in May."), savedText(h))
+    }
+
+    func testStartingTheSampleKeepsTheLastWordsOfTheCallOutOfItAndInItsFile() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We should ship", utterance: 0, isFinal: false)
+        h.controller.stop()
+        h.transcribers.latest(.them)?.emit("We should ship in May.", utterance: 0)
+
+        h.controller.startSample()
+        h.transcribers.latest(.them)?.emit("And one more thing.", utterance: 1)
+
+        XCTAssertTrue(savedText(h).contains("Them: We should ship in May."), "the old call's file has its last words")
+        XCTAssertEqual(h.controller.transcriptText, "", "the sample starts empty")
+        h.scheduler.fireAll()
+        await settle()
+        XCTAssertFalse(h.controller.transcriptText.contains("one more thing"))
+        XCTAssertFalse(h.controller.transcriptText.contains("May"))
+    }
+
+    // MARK: - Clear only clears the overlay (CAP2-9)
+
+    func testClearingKeepsTheFinalOfASentenceThatWasStillOpenInTheSavedFile() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We should ship", utterance: 0, isFinal: false)
+
+        h.controller.clearTranscript()
+        h.transcribers.latest(.them)?.emit("We should ship in May.", utterance: 0)
+        h.controller.stop()
+
+        let text = savedText(h)
+        XCTAssertTrue(text.contains("Them: We should ship in May."), text)
+        XCTAssertEqual(text.components(separatedBy: "We should ship").count - 1, 1, "once, not cut off and again whole")
+        XCTAssertEqual(h.controller.transcriptText, "", "the overlay stays cleared")
+    }
+
+    func testWhatIsSaidAfterTheClearStillGoesToTheFileInOrder() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("Before the clear.", utterance: 0)
+        h.controller.clearTranscript()
+
+        h.transcribers.latest(.you)?.emit("Right after it, in my own words.", utterance: 0)
+        h.transcribers.latest(.them)?.emit("And later still.", utterance: 1)
+        h.controller.stop()
+
+        let lines = savedText(h).components(separatedBy: "\n").filter { $0.hasPrefix("- [") }
+        XCTAssertEqual(lines.map { String($0.drop(while: { $0 != "]" }).dropFirst(2)) },
+                       ["Them: Before the clear.", "You: Right after it, in my own words.", "Them: And later still."])
+    }
+
+    // MARK: - Saving switched off mid-call (APP2-6)
+
+    func testLinesSpokenWhileSavingWasOffAreNeverWrittenEvenIfItIsTurnedBackOn() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("Before the switch.", utterance: 0)
+
+        h.settings.saveTranscripts = false
+        h.transcribers.latest(.them)?.emit("While it was off.", utterance: 1)
+        h.settings.saveTranscripts = true
+        h.transcribers.latest(.them)?.emit("After it came back on.", utterance: 2)
+        h.scheduler.fire(delay: 30)
+        await settle()
+        h.controller.stop()
+
+        XCTAssertEqual(h.files.writes, [], "archiving ended when saving went off; the next call gets a file")
+    }
+
+    func testTurningSavingOffEndsTheArchiveWithoutWaitingForSomeoneToSpeak() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("Before the switch.", utterance: 0)
+
+        h.settings.saveTranscripts = false
+        await settle()
+        h.settings.saveTranscripts = true
+        await settle()
+        h.transcribers.latest(.them)?.emit("After it came back on.", utterance: 1)
+        h.scheduler.fire(delay: 30)
+        await settle()
+        h.controller.stop()
+
+        XCTAssertEqual(h.files.writes, [])
+        XCTAssertEqual(h.controller.transcriptText, "Them: Before the switch. After it came back on.")
+    }
+
+    // MARK: - A folder that stops working (codex round 2 P2)
+
+    func testAFolderThatKeepsFailingPausesSavingWithOneProblemThatSaysSo() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.files.failure = TestFailure(message: "The disk is full")
+        h.transcribers.latest(.them)?.emit("Important decision.", utterance: 0)
+
+        for _ in 0..<TranscriptArchive.defaultFailuresBeforePausing {
+            h.scheduler.fire(delay: 30)
+            await eventually { h.scheduler.delays.contains(30) }
+        }
+        await eventually { h.controller.problems.map(\.message).contains { $0.contains("Saving is paused") } }
+
+        XCTAssertEqual(h.controller.problems.count, 1)
+        XCTAssertEqual(h.controller.problems.first?.message,
+                       "Couldn't save the transcript: The disk is full. Saving is paused; lines spoken until it works again are not kept.")
+        h.files.failure = nil
+        h.scheduler.fire(delay: 30)
+        await eventually { h.controller.problems.isEmpty }
+        XCTAssertTrue(savedText(h).contains("Important decision."))
+    }
+
     // MARK: - Save Transcript...
 
     func testSaveTranscriptWritesTheTranscriptWhereTheUserChoseEvenWithSavingOff() async {
