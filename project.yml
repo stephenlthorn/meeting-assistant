@@ -21,6 +21,7 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSSpeechRecognitionUsageDescription: "Transcribes call audio into text, on this Mac. If your Mac cannot do that for your language, audio goes to Apple's speech servers only after you allow it in Settings."
         NSMicrophoneUsageDescription: "Captures your microphone so your side of the call can be transcribed. It is transcribed on this Mac unless you turn on Deepgram or Apple's speech servers in Settings."
+        NSDocumentsFolderUsageDescription: "Saves your meeting transcripts and summaries as files in your Documents folder (Documents/Meeting Assistant unless you pick another folder), only when you turn on Save transcripts in Settings or choose Save Transcript. The files stay on this Mac."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stephenthorn.meetingassistant
