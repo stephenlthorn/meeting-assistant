@@ -88,7 +88,12 @@ final class DocumentedPromiseTests: XCTestCase {
 
         XCTAssertTrue(policy.contains("sample meeting"))
         XCTAssertTrue(policy.contains("canned answers"), "before agreeing, the sample answers locally")
-        XCTAssertTrue(policy.contains("only when you ask"), "after agreeing, Claude is called only on request")
+        // After agreeing, the sample answers its own scripted questions as they come up
+        // (AssistantController.showSampleLine), so the policy must not claim "only when you ask".
+        XCTAssertTrue(policy.contains("answers the scripted questions with Claude as they come up"),
+                      "after agreeing, the sample answers its scripted questions automatically")
+        XCTAssertTrue(policy.contains("or your extra instructions"), "extra instructions never go with the sample")
+        XCTAssertFalse(policy.contains("only when you ask for an answer"), "the sample does not wait to be asked")
         XCTAssertFalse(policy.contains("The sample meeting captures nothing."), "that sentence left out what it sends")
     }
 

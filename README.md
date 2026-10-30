@@ -95,6 +95,13 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 - **Long calls stay light.** Only the newest turns are kept in memory. With saving on,
   the older ones are already on disk, so Summarize Meeting can still cover a
   three-hour call in full; with saving off, it summarizes the recent part and says so.
+- **Saving behaves the way you would expect.** Turning saving off ends the file at once,
+  and nothing said while it is off is ever written. Clear Transcript clears the
+  overlay only; the saved file keeps the whole call. If the folder cannot be written
+  for a while, saving pauses and the app says so.
+- **Consent changes take effect mid-call.** Turning Deepgram or Apple's speech servers
+  off cuts the audio to them immediately, including audio already queued, and
+  transcription carries on with the backend you still allow.
 - Echo suppression: on speakers your mic also hears the other side, so "You" lines
   that repeat what they just said are hidden.
 - A welcome screen that says exactly what is captured and where it goes, and a
