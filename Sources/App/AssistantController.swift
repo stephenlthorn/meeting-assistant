@@ -66,6 +66,13 @@ final class AssistantController {
     static let systemAudioRetryDelays: [TimeInterval] = [1, 2, 4, 8, 15, 15]
     /// How often each side's audio is checked for silent breakage.
     static let watchdogInterval: TimeInterval = 5
+    /// A restarted stream that delivered audio for this long was a good one: its
+    /// death starts the backoff over, where one that dies at once makes it longer.
+    static let healthyStreamDuration: TimeInterval = 30
+    /// Longest wait for system audio to start, or to stop, before the call is
+    /// given up on so it cannot hold up every Stop and Start queued behind it.
+    static let systemAudioStartTimeout: TimeInterval = 30
+    static let systemAudioStopTimeout: TimeInterval = 10
     private static let maxProblems = 3
     private static let trimmedAndSavedNote = "[earlier lines trimmed - they are in your saved transcript file]"
 
@@ -109,6 +116,7 @@ final class AssistantController {
     @ObservationIgnored private let drainWindow: TimeInterval
     @ObservationIgnored private let transcriptFiles: TranscriptFileStoring
     @ObservationIgnored private let watchdogSchedule: (TimeInterval, @escaping () -> Void) -> Void
+    @ObservationIgnored private let timeoutSchedule: (TimeInterval, @escaping () -> Void) -> Void
 
     @ObservationIgnored private let themSlot = TranscriberSlot()
     @ObservationIgnored private let youSlot = TranscriberSlot()
@@ -126,6 +134,13 @@ final class AssistantController {
     @ObservationIgnored private var lifecycle: Task<Void, Never>?
     @ObservationIgnored private var themRecovery = 0
     @ObservationIgnored private var themAttempts = 0
+    /// When their stream last came up and how many buffers had arrived by then,
+    /// to tell a stream that worked for a while from one that died at once.
+    @ObservationIgnored private var themUpSince = Date.distantPast
+    @ObservationIgnored private var themUpBuffers = 0
+    /// A restart of their stream is starting, and a death reported meanwhile is held.
+    @ObservationIgnored private var themRestarting = false
+    @ObservationIgnored private var themDiedWhileRestarting: CaptureFailure?
     @ObservationIgnored private var themCanRevive = false
     @ObservationIgnored private var captureProblems: [Speaker: Problem] = [:]
     @ObservationIgnored private var watchdogs: [Speaker: SideWatchdog] = [:]
@@ -171,7 +186,8 @@ final class AssistantController {
          workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
          notifications: NotificationCenter = .default,
          meterClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         watchdogSchedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
+         watchdogSchedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
+         timeoutSchedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter) {
         self.settings = settings
         self.systemAudio = systemAudio
         self.microphone = microphone
@@ -183,6 +199,7 @@ final class AssistantController {
         self.drainWindow = drainWindow
         self.transcriptFiles = transcriptFiles
         self.watchdogSchedule = watchdogSchedule
+        self.timeoutSchedule = timeoutSchedule
         let levels = self.levels
         themMeter = AudioMeter(clock: meterClock, onLevel: { level in
             deliverOnMain { levels.update(.them, rms: level) }
@@ -314,12 +331,12 @@ final class AssistantController {
         them.start()
         themSlot.set(them)
         let previous = lifecycle
-        lifecycle = Task { [weak self, systemAudio] in
+        lifecycle = Task { [weak self] in
             await previous?.value
             do {
-                try await systemAudio.start(application: self?.settings.captureAppBundleID)
+                try await self?.startSystemAudio()
                 guard let self, self.session == current else {
-                    await systemAudio.stop()
+                    await self?.stopSystemAudioNow()
                     return
                 }
                 // Their transcriber may have given up while this was starting; the
@@ -382,7 +399,12 @@ final class AssistantController {
     private func sideChanged(_ speaker: Speaker, to state: SideState) {
         levels.setActive(speaker, state == .up)
         switch state {
-        case .up: armWatchdog(for: speaker)
+        case .up:
+            armWatchdog(for: speaker)
+            if speaker == .them {
+                themUpSince = now()
+                themUpBuffers = themMeter.reading().buffers
+            }
         case .reconnecting: break
         case .off, .pending, .failed: watchdogs[speaker] = nil
         }
@@ -421,9 +443,68 @@ final class AssistantController {
 
     private func stopSystemAudio() {
         let previous = lifecycle
-        lifecycle = Task { [systemAudio] in
+        lifecycle = Task { [weak self] in
             await previous?.value
+            await self?.stopSystemAudioNow()
+        }
+    }
+
+    /// Starts and stops go through the lifecycle chain, and a call that never
+    /// comes back (ScreenCaptureKit can hang) must not hold up the chain for
+    /// good: after the limit the controller stops waiting. The call itself
+    /// cannot be cancelled, so it is left to finish on its own, and the next
+    /// start begins by stopping whatever is running.
+    private func startSystemAudio() async throws {
+        let systemAudio = systemAudio
+        let application = settings.captureAppBundleID
+        try await Self.raced(timeout: Self.systemAudioStartTimeout, schedule: timeoutSchedule) {
+            try await systemAudio.start(application: application)
+        }
+    }
+
+    private func stopSystemAudioNow() async {
+        let systemAudio = systemAudio
+        _ = try? await Self.raced(timeout: Self.systemAudioStopTimeout, schedule: timeoutSchedule) {
             await systemAudio.stop()
+        }
+    }
+
+    /// The result of `operation`, or `SystemAudioError.timedOut` once `timeout`
+    /// has gone by, whichever comes first.
+    private static func raced(timeout: TimeInterval,
+                              schedule: (TimeInterval, @escaping () -> Void) -> Void,
+                              _ operation: @escaping () async throws -> Void) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let race = Race(continuation)
+            Task {
+                do {
+                    try await operation()
+                    race.finish(nil)
+                } catch {
+                    race.finish(error)
+                }
+            }
+            schedule(timeout) { race.finish(SystemAudioError.timedOut) }
+        }
+    }
+
+    /// Resumes its continuation once, for whichever of the operation and the
+    /// timer gets there first.
+    private final class Race: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Error>?
+
+        init(_ continuation: CheckedContinuation<Void, Error>) {
+            self.continuation = continuation
+        }
+
+        func finish(_ error: Error?) {
+            let waiting = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+                defer { continuation = nil }
+                return continuation
+            }
+            guard let waiting else { return }
+            if let error { waiting.resume(throwing: error) } else { waiting.resume() }
         }
     }
 
@@ -472,15 +553,28 @@ final class AssistantController {
     }
 
     private func systemAudioStopped(_ failure: CaptureFailure, session current: Int) {
-        guard session == current, themSide == .up else { return }
+        guard session == current else { return }
+        // The restart that is starting has not finished, so it cannot be told it
+        // is up yet; the death is held until it is, and counts against it then.
+        if themSide == .reconnecting, themRestarting {
+            themDiedWhileRestarting = failure
+            return
+        }
+        guard themSide == .up else { return }
         guard failure.isRetryable else {
             giveUpOnSystemAudio(Problem(message: "Meeting audio stopped: \(failure.message)"), canRevive: false)
             return
         }
         themSide = .reconnecting
-        themAttempts = 0
+        if streamWasHealthy { themAttempts = 0 }
         status = listeningStatus()
         scheduleSystemAudioRestart(session: current)
+    }
+
+    /// Their stream delivered audio for a good while before it died.
+    private var streamWasHealthy: Bool {
+        now().timeIntervalSince(themUpSince) >= Self.healthyStreamDuration
+            && themMeter.reading().buffers > themUpBuffers
     }
 
     private func scheduleSystemAudioRestart(session current: Int) {
@@ -498,29 +592,49 @@ final class AssistantController {
 
     /// Stops the dead stream and starts a new one through the same chain as
     /// Start and Stop, so the two never overlap. The transcriber is untouched:
-    /// it keeps its state and utterance numbering across the gap.
+    /// it keeps its state and utterance numbering across the gap. A restart that
+    /// comes up only counts as an attempt used: the backoff starts over when the
+    /// stream has proved itself, not merely because it started.
     private func restartSystemAudio(session current: Int, recovery: Int) {
         guard isRecovering(session: current, recovery: recovery) else { return }
         let previous = lifecycle
-        lifecycle = Task { [weak self, systemAudio] in
+        lifecycle = Task { [weak self] in
             await previous?.value
             guard let self, self.isRecovering(session: current, recovery: recovery) else { return }
-            await systemAudio.stop()
+            self.themRestarting = true
+            self.themDiedWhileRestarting = nil
+            await self.stopSystemAudioNow()
             do {
-                try await systemAudio.start(application: self.settings.captureAppBundleID)
+                try await self.startSystemAudio()
+                self.themRestarting = false
                 guard self.session == current, self.themSide == .reconnecting else {
-                    await systemAudio.stop()
+                    await self.stopSystemAudioNow()
+                    return
+                }
+                if let failure = self.themDiedWhileRestarting {
+                    self.themDiedWhileRestarting = nil
+                    self.streamDiedWhileRestarting(failure, session: current)
                     return
                 }
                 self.themSide = .up
-                self.themAttempts = 0
+                self.themAttempts += 1
                 self.clearCaptureProblem(for: .them)
                 self.status = self.listeningStatus()
             } catch {
+                self.themRestarting = false
+                self.themDiedWhileRestarting = nil
                 guard self.isRecovering(session: current, recovery: recovery) else { return }
                 self.systemAudioRestartFailed(error, session: current)
             }
         }
+    }
+
+    private func streamDiedWhileRestarting(_ failure: CaptureFailure, session current: Int) {
+        guard failure.isRetryable else {
+            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped: \(failure.message)"), canRevive: false)
+            return
+        }
+        restartAttemptFailed(because: failure.message, session: current)
     }
 
     private func systemAudioRestartFailed(_ error: Error, session current: Int) {
@@ -528,9 +642,13 @@ final class AssistantController {
             giveUpOnSystemAudio(Self.problem(forSystemAudioError: error), canRevive: false)
             return
         }
+        restartAttemptFailed(because: error.localizedDescription, session: current)
+    }
+
+    private func restartAttemptFailed(because reason: String, session current: Int) {
         themAttempts += 1
         guard themAttempts < Self.systemAudioRetryDelays.count else {
-            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped and couldn't be restarted: \(error.localizedDescription)"),
+            giveUpOnSystemAudio(Problem(message: "Meeting audio stopped and couldn't be restarted: \(reason)"),
                                 canRevive: true)
             return
         }

@@ -16,8 +16,8 @@ import Foundation
 /// being tried, and when one works the file carries on with a note where the gap is.
 @MainActor
 final class TranscriptArchive {
-    static let defaultMaximumUnwrittenCharacters = 2_000_000
-    static let defaultFailuresBeforePausing = 5
+    nonisolated static let defaultMaximumUnwrittenCharacters = 2_000_000
+    nonisolated static let defaultFailuresBeforePausing = 5
     private static let missingNote = "[earlier lines were not found when this file was updated]\n\n"
     private static let pausedNote = "[lines spoken while saving was paused are not in this file]\n\n"
 

@@ -57,11 +57,14 @@ protocol MicrophoneCapturing: AnyObject {
 enum SystemAudioError: LocalizedError, Equatable {
     case permissionDenied
     case noDisplay
+    /// Starting capture did not come back in time, so it was given up on.
+    case timedOut
 
     var errorDescription: String? {
         switch self {
         case .permissionDenied: "Screen Recording permission is off."
         case .noDisplay: "No display available for capture."
+        case .timedOut: "Starting meeting audio capture took too long."
         }
     }
 }
