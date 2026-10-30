@@ -36,16 +36,50 @@ final class ReleaseWorkflowTests: XCTestCase {
                      "The job token can write releases; only the steps that call GitHub should get it")
     }
 
-    func testThirdPartyActionsArePinnedToACommitWithAVersionComment() throws {
+    func testEveryActionIsPinnedToACommitWithAVersionComment() throws {
         for file in ["build.yml", "release.yml"] {
             let workflow = try Workflow(file)
+            let actions = workflow.steps.compactMap(\.uses)
+            XCTAssertFalse(actions.isEmpty, file)
             for step in workflow.steps {
-                guard let uses = step.uses, !uses.hasPrefix("actions/"), !uses.hasPrefix("./") else { continue }
+                guard let uses = step.uses else { continue }
                 XCTAssertNotNil(uses.range(of: #"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$"#, options: .regularExpression),
-                                "\(file): \(uses) must be pinned to a full commit SHA")
-                XCTAssertNotNil(step.text.range(of: #"uses:\s*\S+@[0-9a-f]{40}\s+# v\d"#, options: .regularExpression),
-                                "\(file): \(uses) needs a version comment so the pin can be reviewed")
+                                "\(file): \(uses) must be pinned to a full commit SHA; a tag such as v4 can be moved, GitHub's own actions included")
+                XCTAssertNotNil(step.text.range(of: #"uses:\s*\S+@[0-9a-f]{40}\s+# v\d+\.\d+\.\d+"#, options: .regularExpression),
+                                "\(file): \(uses) needs an exact version comment (# v1.2.3) so the pin can be reviewed")
             }
+        }
+    }
+
+    func testTheReleaseJobRunsOneAtATimeAndNeverCancelsARunHalfwayThroughPublishing() throws {
+        let release = try Workflow("release.yml")
+
+        XCTAssertTrue(release.header.contains("\n    concurrency:\n      group: release\n      cancel-in-progress: false\n"),
+                      "two releases must queue, and cancelling mid-notarization could leave a tag without its asset")
+    }
+
+    func testEveryJobHasATimeoutSoAStuckStepCannotRunForSixHours() throws {
+        for file in ["build.yml", "release.yml"] {
+            let header = try Workflow(file).header
+            let minutes = captures(#"\n    timeout-minutes: (\d+)\n"#, in: header).first?.first.flatMap(Int.init)
+            XCTAssertNotNil(minutes, "\(file) needs a job-level timeout-minutes")
+            XCTAssertLessThanOrEqual(minutes ?? .max, 120, file)
+        }
+    }
+
+    func testNotarizationIsBoundedSoTheStepCannotWaitForeverOnApple() throws {
+        let notarize = try Workflow("release.yml").step("Notarize")
+
+        XCTAssertTrue(notarize.text.contains("--wait --timeout 30m"), notarize.text)
+    }
+
+    func testXcodeGenIsInstalledAtAPinnedVersionNotWhateverHomebrewHasToday() throws {
+        for file in ["build.yml", "release.yml"] {
+            let workflow = try Workflow(file)
+            let install = try workflow.step("Install XcodeGen")
+
+            XCTAssertTrue(install.text.contains("scripts/install-xcodegen.sh"), file)
+            XCTAssertFalse(workflow.text.contains("brew install xcodegen"), "\(file): an unpinned install can change what ships")
         }
     }
 
@@ -332,7 +366,7 @@ final class ReleaseScriptTests: XCTestCase {
     }
 
     func testTheScriptsTheWorkflowsCallAreExecutable() throws {
-        for name in ["release-resolve-version.sh", "release-check-signing.sh", "release-exists.sh", "release-notes.sh", "setup-release-signing.sh"] {
+        for name in ["release-resolve-version.sh", "release-check-signing.sh", "release-exists.sh", "release-notes.sh", "setup-release-signing.sh", "install-xcodegen.sh"] {
             XCTAssertTrue(FileManager.default.isExecutableFile(atPath: Repo.url("scripts/\(name)").path), name)
         }
     }
@@ -453,6 +487,129 @@ final class ReleaseExistsScriptTests: XCTestCase {
 
         XCTAssertNotEqual(outcome.result.status, 0)
         XCTAssertTrue(outcome.calls.isEmpty)
+    }
+}
+
+// MARK: - Pinned XcodeGen
+
+final class InstallXcodeGenScriptTests: XCTestCase {
+    private struct Install {
+        let result: Shell.Outcome
+        let destination: URL
+        let pathAdditions: [String]
+        let curlCalls: [String]
+    }
+
+    /// A release zip with the layout XcodeGen publishes (xcodegen/bin/xcodegen), whose binary reports `reports`.
+    private func makeArchive(reports version: String) throws -> (zip: URL, sha256: String) {
+        let work = try Shell.makeTempDirectory(for: self)
+        let bin = work.appendingPathComponent("xcodegen/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let binary = bin.appendingPathComponent("xcodegen")
+        try "#!/bin/sh\necho 'Version: \(version)'\n".write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        let zip = work.appendingPathComponent("xcodegen.zip")
+        let made = try Shell.run("/usr/bin/ditto", ["-c", "-k", "--keepParent", work.appendingPathComponent("xcodegen").path, zip.path])
+        XCTAssertEqual(made.status, 0, made.output)
+        let digest = try Shell.run("/usr/bin/shasum", ["-a", "256", zip.path])
+        return (zip, String(try XCTUnwrap(digest.output.split(separator: " ").first)))
+    }
+
+    /// Runs a copy of the script. `pin` rewrites its checksum to the fixture's, which is the only way to
+    /// exercise the success path without the real release zip; nil keeps the real pin.
+    private func install(serving archive: URL?, pin: String? = nil, curlFails: Bool = false) throws -> Install {
+        let checkout = try Shell.makeTempDirectory(for: self)
+        let bin = try Shell.makeTempDirectory(for: self)
+        let destination = try Shell.makeTempDirectory(for: self).appendingPathComponent("xcodegen-install")
+        let log = bin.appendingPathComponent("curl.log")
+        let pathFile = bin.appendingPathComponent("github_path")
+        FileManager.default.createFile(atPath: pathFile.path, contents: nil)
+
+        var script = try Repo.text("scripts/install-xcodegen.sh")
+        if let pin {
+            script = script.replacingOccurrences(of: #"SHA256="[0-9a-f]{64}""#, with: "SHA256=\"\(pin)\"", options: .regularExpression)
+        }
+        let copy = checkout.appendingPathComponent("install-xcodegen.sh")
+        try script.write(to: copy, atomically: true, encoding: .utf8)
+
+        let curl = bin.appendingPathComponent("curl")
+        try """
+        #!/bin/bash
+        echo "curl $*" >> "$CURL_LOG"
+        [ -z "${CURL_FAILS:-}" ] || exit 22
+        while [ $# -gt 0 ]; do
+          if [ "$1" = "--output" ]; then cp "$FAKE_ARCHIVE" "$2"; fi
+          shift
+        done
+        """.write(to: curl, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: curl.path)
+
+        var env = ["PATH": "\(bin.path):/usr/bin:/bin", "CURL_LOG": log.path, "GITHUB_PATH": pathFile.path]
+        if let archive { env["FAKE_ARCHIVE"] = archive.path }
+        if curlFails { env["CURL_FAILS"] = "1" }
+        let result = try Shell.runBash(copy, args: [destination.path], env: env)
+        func lines(_ url: URL) -> [String] {
+            ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+        }
+        return Install(result: result, destination: destination, pathAdditions: lines(pathFile), curlCalls: lines(log))
+    }
+
+    func testTheScriptPinsAnExactVersionAndItsChecksum() throws {
+        let script = try Repo.text("scripts/install-xcodegen.sh")
+
+        XCTAssertNotNil(script.range(of: #"(?m)^VERSION="\d+\.\d+\.\d+"$"#, options: .regularExpression))
+        XCTAssertNotNil(script.range(of: #"(?m)^SHA256="[0-9a-f]{64}"$"#, options: .regularExpression))
+        XCTAssertTrue(script.contains("https://github.com/yonaskolb/XcodeGen/releases/download/$VERSION/xcodegen.zip"))
+    }
+
+    func testAVerifiedDownloadIsUnpackedAndItsBinDirectoryPutOnThePath() throws {
+        let archive = try makeArchive(reports: "2.45.3")
+
+        let outcome = try install(serving: archive.zip, pin: archive.sha256)
+
+        XCTAssertEqual(outcome.result.status, 0, outcome.result.output)
+        let bin = outcome.destination.appendingPathComponent("xcodegen/bin").path
+        XCTAssertEqual(outcome.pathAdditions, [bin])
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: bin + "/xcodegen"))
+    }
+
+    func testItDownloadsOverHTTPSAndFailsOnHTTPErrors() throws {
+        let archive = try makeArchive(reports: "2.45.3")
+
+        let outcome = try install(serving: archive.zip, pin: archive.sha256)
+
+        XCTAssertEqual(outcome.curlCalls.count, 1, outcome.curlCalls.joined(separator: "\n"))
+        XCTAssertTrue(outcome.curlCalls[0].contains("--fail"), "an HTML error page must not be saved as the zip")
+        XCTAssertTrue(outcome.curlCalls[0].contains(" https://github.com/yonaskolb/XcodeGen/releases/download/"), outcome.curlCalls[0])
+    }
+
+    func testADownloadThatDoesNotMatchThePinnedChecksumIsRejectedAndNeverReachesThePath() throws {
+        let archive = try makeArchive(reports: "2.45.3")
+
+        let outcome = try install(serving: archive.zip)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertTrue(outcome.result.output.contains("checksum"), outcome.result.output)
+        XCTAssertEqual(outcome.pathAdditions, [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outcome.destination.appendingPathComponent("xcodegen").path),
+                       "an archive that failed its check must not be unpacked")
+    }
+
+    func testABinaryThatIsNotThePinnedVersionIsRejected() throws {
+        let archive = try makeArchive(reports: "9.9.9")
+
+        let outcome = try install(serving: archive.zip, pin: archive.sha256)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertTrue(outcome.result.output.contains("9.9.9"), outcome.result.output)
+        XCTAssertEqual(outcome.pathAdditions, [])
+    }
+
+    func testAFailedDownloadFailsTheStep() throws {
+        let outcome = try install(serving: nil, curlFails: true)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertEqual(outcome.pathAdditions, [])
     }
 }
 
