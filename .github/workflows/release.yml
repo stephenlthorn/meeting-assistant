@@ -50,11 +50,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.ver.outputs.tag }}
-        run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Release $TAG already exists. Bump VERSION to publish a new one."
-          fi
+        run: scripts/release-exists.sh "$TAG"
 
       - name: Check signing secrets
         id: signing

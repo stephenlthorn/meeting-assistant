@@ -146,6 +146,16 @@ final class ReleaseWorkflowTests: XCTestCase {
         }
     }
 
+    func testTheExistingReleaseCheckLeavesTheDecisionToTheScriptSoNoFailureReadsAsNoRelease() throws {
+        let check = try Workflow("release.yml").step("Check whether the release exists")
+
+        XCTAssertTrue(check.text.contains("scripts/release-exists.sh"))
+        XCTAssertFalse(check.text.contains("gh release view"), "any failure of that call used to count as 'no release'")
+        XCTAssertTrue(check.text.contains("id: existing"))
+        XCTAssertTrue(check.text.contains("TAG: ${{ steps.ver.outputs.tag }}"))
+        XCTAssertTrue(check.text.contains("GH_REPO: ${{ github.repository }}"))
+    }
+
     func testWorkflowsParseAsYAML() throws {
         for file in ["build.yml", "release.yml"] {
             let result = try Shell.run("/usr/bin/env", ["ruby", "-ryaml", "-e", "YAML.load_file(ARGV[0])", Repo.url(".github/workflows/\(file)").path],
@@ -322,9 +332,127 @@ final class ReleaseScriptTests: XCTestCase {
     }
 
     func testTheScriptsTheWorkflowsCallAreExecutable() throws {
-        for name in ["release-resolve-version.sh", "release-check-signing.sh", "release-notes.sh", "setup-release-signing.sh"] {
+        for name in ["release-resolve-version.sh", "release-check-signing.sh", "release-exists.sh", "release-notes.sh", "setup-release-signing.sh"] {
             XCTAssertTrue(FileManager.default.isExecutableFile(atPath: Repo.url("scripts/\(name)").path), name)
         }
+    }
+}
+
+// MARK: - Release existence check
+
+final class ReleaseExistsScriptTests: XCTestCase {
+    private let releaseLookup = "api repos/*/releases/tags/*"
+    private let tagLookup = "api repos/*/git/ref/tags/*"
+
+    private struct Check {
+        let result: Shell.Outcome
+        let calls: [String]
+    }
+
+    private func check(tag: String = "v1.2.3", release: FakeGitHub.Answer, tagRef: FakeGitHub.Answer = .notFound,
+                       repo: String? = "acme/widgets") throws -> Check {
+        let github = try FakeGitHub(for: self, rules: [(releaseLookup, release), (tagLookup, tagRef)])
+        var env = github.environment
+        env["GH_TOKEN"] = "fake-token"
+        if let repo { env["GH_REPO"] = repo }
+        let result = try Shell.runScript("release-exists.sh", args: [tag], env: env)
+        return Check(result: result, calls: github.calls)
+    }
+
+    func testAPublishedReleaseMeansThereIsNothingToDo() throws {
+        let outcome = try check(release: .ok)
+
+        XCTAssertEqual(outcome.result.status, 0, outcome.result.output)
+        XCTAssertEqual(outcome.result.outputs["exists"], "true")
+        XCTAssertTrue(outcome.result.output.contains("v1.2.3"), "the notice names the release: \(outcome.result.output)")
+    }
+
+    func testNoReleaseAndNoTagMeansTheVersionIsFree() throws {
+        let outcome = try check(release: .notFound, tagRef: .notFound)
+
+        XCTAssertEqual(outcome.result.status, 0, outcome.result.output)
+        XCTAssertEqual(outcome.result.outputs["exists"], "false")
+    }
+
+    func testOnlyANotFoundAnswerCountsAsNoRelease() throws {
+        let answers: [FakeGitHub.Answer] = [
+            .failure(code: 502, message: "Bad Gateway"),
+            .failure(code: 503, message: "Service Unavailable"),
+            .failure(code: 500, message: "Server Error"),
+            .failure(code: 403, message: "API rate limit exceeded"),
+            .failure(code: 401, message: "Bad credentials"),
+        ]
+        for answer in answers {
+            let outcome = try check(release: answer)
+
+            XCTAssertNotEqual(outcome.result.status, 0, "\(answer): a failed lookup must not read as 'no release'")
+            XCTAssertNil(outcome.result.outputs["exists"], "\(answer): no verdict may be left for later steps")
+            XCTAssertTrue(outcome.result.output.contains("::error::"), outcome.result.output)
+        }
+    }
+
+    func testTheFailureNamesWhatGitHubSaid() throws {
+        let outcome = try check(release: .failure(code: 502, message: "Bad Gateway"))
+
+        XCTAssertTrue(outcome.result.output.contains("HTTP 502"), outcome.result.output)
+        XCTAssertTrue(outcome.result.output.contains("v1.2.3"), outcome.result.output)
+    }
+
+    func testATagThatAlreadyExistsWithoutAReleaseFailsSoNewCodeIsNeverAttachedToAnOldTag() throws {
+        let outcome = try check(release: .notFound, tagRef: .ok)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertNil(outcome.result.outputs["exists"])
+        XCTAssertTrue(outcome.result.output.contains("::error::"), outcome.result.output)
+        XCTAssertTrue(outcome.result.output.contains("v1.2.3"), outcome.result.output)
+        XCTAssertTrue(outcome.result.output.contains("tag"), outcome.result.output)
+    }
+
+    func testAnErrorLookingUpTheTagFailsToo() throws {
+        let outcome = try check(release: .notFound, tagRef: .failure(code: 502, message: "Bad Gateway"))
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertNil(outcome.result.outputs["exists"])
+    }
+
+    func testTheTagIsOnlyLookedUpWhenThereIsNoRelease() throws {
+        let outcome = try check(release: .ok, tagRef: .ok)
+
+        XCTAssertEqual(outcome.result.status, 0, "a release with its tag is the normal state of a published version")
+        XCTAssertEqual(outcome.calls.count, 1, outcome.calls.joined(separator: "\n"))
+    }
+
+    func testItAsksAboutTheExactTagInTheNamedRepository() throws {
+        let outcome = try check(release: .notFound, tagRef: .notFound, repo: "someone/else")
+
+        XCTAssertEqual(outcome.calls, ["gh api repos/someone/else/releases/tags/v1.2.3",
+                                       "gh api repos/someone/else/git/ref/tags/v1.2.3"])
+    }
+
+    func testItOnlyReadsFromGitHub() throws {
+        let outcome = try check(release: .notFound, tagRef: .notFound)
+
+        XCTAssertFalse(outcome.calls.isEmpty)
+        for call in outcome.calls {
+            XCTAssertTrue(call.hasPrefix("gh api repos/"), call)
+            XCTAssertFalse(call.contains("--method") || call.contains("-X"), "a check must never write: \(call)")
+        }
+    }
+
+    func testAMalformedTagIsRefusedBeforeGitHubIsAsked() throws {
+        for bad in ["", "1.2.3", "v1.2", "v1.2.3/../x", "v1.2.3 v1.2.4", "$(id)"] {
+            let outcome = try check(tag: bad, release: .notFound)
+
+            XCTAssertNotEqual(outcome.result.status, 0, "'\(bad)' should be refused")
+            XCTAssertTrue(outcome.calls.isEmpty, "'\(bad)' must not reach the API path: \(outcome.calls)")
+        }
+    }
+
+    func testTheRepositoryMustBeNamed() throws {
+        let outcome = try check(release: .notFound, repo: nil)
+
+        XCTAssertNotEqual(outcome.result.status, 0)
+        XCTAssertTrue(outcome.calls.isEmpty)
     }
 }
 
@@ -584,6 +712,62 @@ private struct Workflow {
     }
 
     enum WorkflowError: Error { case noSteps(String) }
+}
+
+/// The GitHub CLI, the one boundary the release scripts talk to and the one that must never be reached from a
+/// test. Every call is logged. Answers come from rules, first match wins: a glob over the arguments and what
+/// the real `gh` does on failure (a message on stderr, status 1). A call no rule covers succeeds silently.
+private struct FakeGitHub {
+    enum Answer {
+        case ok
+        case notFound
+        case failure(code: Int, message: String)
+
+        fileprivate var line: String {
+            switch self {
+            case .ok: return "0|"
+            case .notFound: return "1|gh: Not Found (HTTP 404)"
+            case let .failure(code, message): return "1|gh: \(message) (HTTP \(code))"
+            }
+        }
+    }
+
+    let bin: URL
+    private let log: URL
+    private let rules: URL
+
+    init(for test: XCTestCase, rules answers: [(arguments: String, answer: Answer)] = []) throws {
+        bin = try Shell.makeTempDirectory(for: test)
+        log = bin.appendingPathComponent("gh.log")
+        rules = bin.appendingPathComponent("gh.rules")
+        try answers.map { "\($0.arguments)|\($0.answer.line)\n" }.joined()
+            .write(to: rules, atomically: true, encoding: .utf8)
+        let gh = bin.appendingPathComponent("gh")
+        try """
+        #!/bin/bash
+        echo "gh $*" >> "$GH_LOG"
+        if [ "$1 $2" = "secret set" ]; then cat >/dev/null; fi
+        while IFS='|' read -r pattern status message || [ -n "$pattern" ]; do
+          [ -n "$pattern" ] || continue
+          case "$*" in
+            $pattern)
+              [ -z "$message" ] || echo "$message" >&2
+              exit "$status" ;;
+          esac
+        done < "$GH_RULES"
+        exit 0
+        """.write(to: gh, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: gh.path)
+    }
+
+    /// The environment that puts this fake first on the PATH.
+    var environment: [String: String] {
+        ["PATH": "\(bin.path):/usr/bin:/bin", "GH_LOG": log.path, "GH_RULES": rules.path]
+    }
+
+    var calls: [String] {
+        ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
 }
 
 private enum Shell {
