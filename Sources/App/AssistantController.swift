@@ -242,7 +242,7 @@ final class AssistantController {
         AssistantController(settings: settings,
                             systemAudio: SystemAudioCapture(),
                             microphone: MicCapture(),
-                            makeTranscriber: { _ in TranscriberFactory.make(settings: settings) },
+                            makeTranscriber: { _ in TranscriberFactory.makeForSession(settings: settings) },
                             answerer: AnthropicClient())
     }
 

@@ -85,6 +85,13 @@ enum TranscriberFactory {
     /// started with (`AppSettings.activeSpeechOptions`, else the saved choices).
     /// `extraVocabulary` is for features that bring their own terms; the user's
     /// own terms win the 100-phrase cap.
+    /// The transcriber a listening session uses: instant cards fire on recognized text,
+    /// so their trigger phrases join the vocabulary behind the user's own terms.
+    @MainActor
+    static func makeForSession(settings: AppSettings) -> LiveTranscriber {
+        make(settings: settings, extraVocabulary: settings.cards.triggerPhrases)
+    }
+
     @MainActor
     static func make(settings: AppSettings, extraVocabulary: [String] = []) -> LiveTranscriber {
         let options = settings.activeSpeechOptions ?? settings.speechOptions
