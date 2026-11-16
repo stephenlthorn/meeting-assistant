@@ -3,8 +3,12 @@ import Foundation
 struct AnswerRequest: Equatable, Sendable {
     let apiKey: String
     let model: String
+    /// The stable part of the prompt (profile and extra instructions). Sent as a
+    /// cached block; anything that changes per request belongs in `user`.
     let system: String
     let user: String
+    /// Whether the model takes `effort: low`, from the model catalog; nil when unknown.
+    var supportsEffort: Bool? = nil
 }
 
 /// Streams an answer as text chunks, in order. Cancelling the consuming task
@@ -80,6 +84,9 @@ enum AnthropicStreamEvent: Equatable {
             return .failure(message: error?["message"] as? String ?? "stream error",
                             isOverloaded: error?["type"] as? String == "overloaded_error")
         default:
+            // `content_block_start` (including the server-side `fallback` block and any
+            // block type added later) and unknown events carry no text: skipped, so the
+            // text deltas around them are still yielded.
             return nil
         }
     }
@@ -150,14 +157,21 @@ struct AnthropicClient: AnswerStreaming {
             "model": request.model,
             "max_tokens": maxTokens,
             "stream": true,
-            "system": request.system,
+            // One block, cached: the prefix is the same for every request in a session.
+            // Prefixes under the model's minimum silently do not cache, which is fine.
+            "system": [["type": "text", "text": request.system, "cache_control": ["type": "ephemeral"]]],
             "messages": [["role": "user", "content": request.user]],
         ]
-        // Effort is accepted by Opus and Sonnet but rejected by Haiku 4.5.
-        if !request.model.contains("haiku") {
+        // Whether a model takes effort is a fact about that model, so the catalog's
+        // capability wins; the rule only covers a model the catalog has not described.
+        if request.supportsEffort ?? EffortRule.conservativeDefault(for: request.model) {
             body["output_config"] = ["effort": "low"]
         }
-        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+        if ServerSideFallback.supports(request.model) {
+            urlRequest.setValue(ServerSideFallback.betaHeader, forHTTPHeaderField: "anthropic-beta")
+            body["fallbacks"] = "default"
+        }
+        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return urlRequest
     }
 

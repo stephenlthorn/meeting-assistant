@@ -53,9 +53,14 @@ struct SettingsView: View {
                         .foregroundStyle(.red)
                 }
                 Picker("Model", selection: $settings.model) {
-                    ForEach(settings.availableModels, id: \.self) { id in
-                        Text(modelLabel(id)).tag(id)
+                    ForEach(settings.modelOptions) { option in
+                        Text(option.name).tag(option.id)
                     }
+                }
+                if let notice = settings.modelNotice {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }
 
@@ -192,6 +197,10 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 720)
+        .task { await settings.refreshModels() }
+        .onChange(of: settings.apiKeySource) { _, _ in
+            Task { await settings.refreshModels(force: true) }
+        }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in
             runningApps = Self.runningBundleIDs()
         }
@@ -258,14 +267,5 @@ struct SettingsView: View {
     /// Only a Keychain item can be removed here, readable or not.
     private func canRemove(_ source: AppSettings.KeySource?) -> Bool {
         source == .keychain || source == .unreadable
-    }
-
-    private func modelLabel(_ id: String) -> String {
-        switch id {
-        case "claude-haiku-4-5": return "Haiku 4.5 - fastest (recommended for live)"
-        case "claude-sonnet-5": return "Sonnet 5 - balanced"
-        case "claude-opus-5": return "Opus 5 - most capable, slower"
-        default: return id
-        }
     }
 }

@@ -33,7 +33,7 @@ final class AssistantControllerSummaryTests: XCTestCase {
 
         let request = h.answerer.requests.first
         XCTAssertEqual(request?.apiKey, "sk-test")
-        XCTAssertEqual(request?.model, "claude-haiku-4-5")
+        XCTAssertEqual(request?.model, "claude-haiku-5-5")
         XCTAssertEqual(request?.system, SummaryPrompt.system(extraInstructions: "Write in Spanish."))
         XCTAssertTrue(request?.system.contains("Action items") ?? false)
     }

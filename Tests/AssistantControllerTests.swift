@@ -262,7 +262,7 @@ final class AssistantControllerTests: XCTestCase {
         XCTAssertTrue(h.controller.isAnswering)
         let request = h.answerer.requests.first
         XCTAssertEqual(request?.apiKey, "sk-test")
-        XCTAssertEqual(request?.model, "claude-haiku-4-5")
+        XCTAssertEqual(request?.model, "claude-haiku-5-5")
         XCTAssertEqual(request?.system, h.settings.systemPrompt)
         XCTAssertTrue(request?.user.contains("Them: What's the timeline?") ?? false)
 

@@ -16,6 +16,13 @@ enum ModelName {
         return family.capitalized + " " + version.joined(separator: ".")
     }
 
+    /// "Claude Haiku 5.5" as "Haiku 5.5", for the status line.
+    static func withoutVendor(_ displayName: String) -> String {
+        let prefix = "Claude "
+        guard displayName.hasPrefix(prefix), displayName.count > prefix.count else { return displayName }
+        return String(displayName.dropFirst(prefix.count))
+    }
+
     private static func isSnapshotDate(_ part: String) -> Bool {
         part.count == 8 && part.allSatisfy(\.isNumber)
     }

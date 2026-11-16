@@ -23,7 +23,8 @@ struct MenuState: Equatable {
     @MainActor
     init(controller: AssistantController, settings: AppSettings, hotKeyProblem: String?) {
         let hasTranscript = !controller.transcriptDisplay.isEmpty
-        statusLine = StatusLine.text(status: controller.status, listening: controller.listening, model: settings.model)
+        statusLine = StatusLine.text(status: controller.status, listening: controller.listening, model: settings.model,
+                                    displayName: settings.modelDisplayName)
         listeningTitle = switch controller.listening {
         case .idle: "Start Listening"
         case .starting, .listening: "Stop Listening"
