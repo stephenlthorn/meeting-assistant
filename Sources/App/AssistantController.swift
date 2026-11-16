@@ -110,7 +110,18 @@ final class AssistantController {
     /// The summary ended without error but not whole (declined, or cut off at the length limit).
     private(set) var summaryEndedEarly = false
     /// The follow-up email draft, streamed in under the summary.
-    private(set) var followUp = ""
+    /// The draft alone, without any error or status line: what Copy draft and Open in Mail act on.
+    private(set) var followUpDraft = ""
+    /// Why the draft is not whole (an error, or a missing key), kept apart so it is never copied or mailed.
+    private(set) var followUpStatus: String?
+    /// What the window shows: the draft, then the status under it.
+    var followUp: String {
+        guard let followUpStatus else { return followUpDraft }
+        return followUpDraft.isEmpty ? followUpStatus : followUpDraft + "\n\n" + followUpStatus
+    }
+    /// Whether the draft is whole and clean enough to copy or put in an email: not while
+    /// it is still streaming, and not after an error left half of it.
+    var canUseFollowUpDraft: Bool { !followUpDraft.isEmpty && followUpStatus == nil && !isDraftingFollowUp }
     private(set) var isDraftingFollowUp = false
     /// Per-side loudness for the overlay's level indicator.
     let levels = CaptureLevels()
@@ -1386,16 +1397,19 @@ final class AssistantController {
         followUpRequest += 1
         let current = followUpRequest
         if listening == .sample {
-            followUp = SampleMeeting.sampleFollowUp
+            followUpDraft = SampleMeeting.sampleFollowUp
+            followUpStatus = nil
             isDraftingFollowUp = false
             return
         }
         guard let apiKey = settings.resolveAPIKey() else {
-            followUp = missingKeyMessage
+            followUpDraft = ""
+            followUpStatus = missingKeyMessage
             isDraftingFollowUp = false
             return
         }
-        followUp = ""
+        followUpDraft = ""
+        followUpStatus = nil
         isDraftingFollowUp = true
         let stream = answerer.stream(AnswerRequest(
             apiKey: apiKey, model: settings.model,
@@ -1407,7 +1421,7 @@ final class AssistantController {
             do {
                 for try await chunk in stream {
                     guard let self, self.followUpRequest == current else { return }
-                    self.followUp += chunk
+                    self.followUpDraft += chunk
                 }
                 self?.finishFollowUp(current, error: nil)
             } catch {
@@ -1420,14 +1434,14 @@ final class AssistantController {
         guard request == followUpRequest else { return }
         isDraftingFollowUp = false
         guard let error, !(error is CancellationError) else { return }
-        let message = "Error: \(error.localizedDescription)"
-        followUp = followUp.isEmpty ? message : followUp + "\n\n" + message
+        followUpStatus = "Error: \(error.localizedDescription)"
     }
 
     private func resetFollowUp() {
         followUpTask?.cancel()
         followUpRequest += 1
-        followUp = ""
+        followUpDraft = ""
+        followUpStatus = nil
         isDraftingFollowUp = false
         summaryIsFinal = false
         summaryEndedEarly = false

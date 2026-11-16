@@ -119,6 +119,67 @@ final class AssistantControllerFollowUpTests: XCTestCase {
         XCTAssertTrue(h.controller.followUp.contains("Error:"), h.controller.followUp)
     }
 
+    // MARK: - Using the draft
+
+    func testCopyAndMailAreOffWhileTheDraftIsStillStreaming() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We will ship in May.")
+        await summarize(h, as: "A summary.")
+
+        h.controller.draftFollowUp()
+        h.answerer.streams[1].yield("Subject: Next steps\n\nHi Ma")
+        await eventually { !h.controller.followUp.isEmpty }
+
+        XCTAssertTrue(h.controller.isDraftingFollowUp)
+        XCTAssertFalse(h.controller.canUseFollowUpDraft, "half an email must not be copied or sent")
+    }
+
+    func testCopyAndMailAreOffAfterAFailedDraftAndNeverCarryTheErrorText() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We will ship in May.")
+        await summarize(h, as: "A summary.")
+
+        h.controller.draftFollowUp()
+        h.answerer.streams[1].yield("Hi Maya,")
+        h.answerer.streams[1].finish(throwing: AnthropicError.cutOff)
+        await eventually { !h.controller.isDraftingFollowUp }
+
+        XCTAssertFalse(h.controller.canUseFollowUpDraft)
+        XCTAssertEqual(h.controller.followUpDraft, "Hi Maya,", "the draft field never holds the error")
+        XCTAssertNotNil(h.controller.followUpStatus)
+        XCTAssertTrue(h.controller.followUp.contains("Error:"), "the window still shows what went wrong")
+    }
+
+    func testCopyAndMailAreOnAfterACleanDraft() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We will ship in May.")
+        await summarize(h, as: "A summary.")
+
+        h.controller.draftFollowUp()
+        h.answerer.streams[1].yield("Subject: Next steps\n\nHi Maya,")
+        h.answerer.streams[1].finish()
+        await eventually { !h.controller.isDraftingFollowUp }
+
+        XCTAssertTrue(h.controller.canUseFollowUpDraft)
+        XCTAssertEqual(h.controller.followUpDraft, "Subject: Next steps\n\nHi Maya,")
+        XCTAssertNil(h.controller.followUpStatus)
+    }
+
+    func testTheSampleDraftCanBeCopied() async {
+        let h = makeHarness(acceptTerms: false)
+        h.controller.startSample()
+        await playSample(h, lines: 2)
+        h.controller.summarizeMeeting()
+
+        h.controller.draftFollowUp()
+
+        XCTAssertTrue(h.controller.canUseFollowUpDraft)
+        XCTAssertEqual(h.controller.followUpDraft, SampleMeeting.sampleFollowUp)
+    }
+
     // MARK: - When it is off
 
     func testTheButtonIsOffUntilThereIsASummary() async {

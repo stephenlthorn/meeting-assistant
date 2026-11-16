@@ -68,10 +68,10 @@ struct SummaryView: View {
                 Button("Draft follow-up") { controller.draftFollowUp() }
                     .disabled(controller.followUpBlockedReason != nil || controller.isDraftingFollowUp)
                 Spacer()
-                Button("Copy draft") { Clipboard.copy(controller.followUp) }
-                    .disabled(controller.followUp.isEmpty)
-                Button("Open in Mail") { FollowUpMail.open(draft: controller.followUp) }
-                    .disabled(controller.followUp.isEmpty)
+                Button("Copy draft") { Clipboard.copy(controller.followUpDraft) }
+                    .disabled(!controller.canUseFollowUpDraft)
+                Button("Open in Mail") { FollowUpMail.open(draft: controller.followUpDraft) }
+                    .disabled(!controller.canUseFollowUpDraft)
             }
             if let reason = controller.followUpBlockedReason {
                 Text(reason)
