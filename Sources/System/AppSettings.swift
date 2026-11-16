@@ -51,7 +51,14 @@ final class AppSettings: ObservableObject {
     /// `cloudAudioAccepted`, which is the user's consent and is never copied.
     private static let preferenceKeys = ["model", "profile", "extraInstructions", "autoAnswer"]
 
-    let availableModels = ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+    // MARK: - v0.4 llm
+    /// What a new install starts on. Someone who already chose a model keeps it.
+    static let defaultModel = "claude-haiku-5-5"
+
+    /// Where the model list comes from (Models API, cached, with a built-in fallback).
+    let catalog: ModelCatalog
+    /// Said in Settings when a fetched list no longer has the saved model and the default took its place.
+    @Published private(set) var modelNotice: String?
 
     @Published var model: String { didSet { defaults.set(model, forKey: "model") } }
     @Published var profile: Profile { didSet { defaults.set(profile.rawValue, forKey: "profile") } }
@@ -114,13 +121,13 @@ final class AppSettings: ObservableObject {
     private var unreadableAccounts: Set<String> = []
 
     init(defaults: UserDefaults, secrets: SecretStore, environment: [String: String], anthropicKeyFile: URL,
-         iCloud: ICloudFolderCheck = .onDisk()) {
+         iCloud: ICloudFolderCheck = .onDisk(), modelCatalog: ModelCatalog? = nil) {
         self.defaults = defaults
         self.secrets = secrets
         self.environment = environment
         self.anthropicKeyFile = anthropicKeyFile
         self.iCloud = iCloud
-        model = defaults.string(forKey: "model") ?? "claude-haiku-4-5"
+        model = defaults.string(forKey: "model") ?? Self.defaultModel
         profile = defaults.string(forKey: "profile").flatMap(Profile.init(rawValue:)) ?? .general
         extraInstructions = defaults.string(forKey: "extraInstructions") ?? ""
         autoAnswer = defaults.bool(forKey: "autoAnswer")
@@ -139,6 +146,8 @@ final class AppSettings: ObservableObject {
         captureAppBundleID = defaults.string(forKey: "captureAppBundleID").flatMap { $0.isEmpty ? nil : $0 }
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
         serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
+        // MARK: - v0.4 llm
+        catalog = modelCatalog ?? ModelCatalog(defaults: defaults)
         refreshKeySources()
     }
 
@@ -147,6 +156,45 @@ final class AppSettings: ObservableObject {
         let extra = extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !extra.isEmpty else { return profile.systemPrompt }
         return profile.systemPrompt + "\n\nAdditional instructions from the user:\n" + extra
+    }
+
+    // MARK: - v0.4 llm
+
+    /// The picker's choices, newest first: the catalog's names, plus the saved model
+    /// when the list does not have it (offline, or a model the user chose earlier),
+    /// so the picker never shows a selection it cannot display.
+    var modelOptions: [ModelOption] {
+        var options = catalog.models.map { ModelOption(id: $0.id, name: $0.displayName) }
+        if !options.contains(where: { $0.id == model }) { options.append(ModelOption(id: model, name: ModelName.short(model))) }
+        return options
+    }
+
+    /// The catalog's name for the model in use, when it has one, for the status line.
+    var modelDisplayName: String? { catalog.displayName(for: model) }
+
+    /// Whether the chosen model takes `effort: low`, or nil when the catalog does not know it.
+    var modelSupportsEffort: Bool? { catalog.supportsEffort(model) }
+
+    /// Reads the model list with the saved key, at most hourly unless `force`
+    /// (a newly saved key). If the fresh list no longer has the saved model,
+    /// the default replaces it and `modelNotice` says so.
+    func refreshModels(force: Bool = false) async {
+        guard apiKeyPresent, let key = resolveAPIKey() else { return }
+        guard await catalog.refresh(apiKey: key, force: force) else { return }
+        objectWillChange.send()
+        reconcileModelWithCatalog()
+    }
+
+    private func reconcileModelWithCatalog() {
+        guard catalog.isFromAPI, !catalog.models.contains(where: { $0.id == model }) else {
+            modelNotice = nil
+            return
+        }
+        let replacement = catalog.models.contains(where: { $0.id == Self.defaultModel })
+            ? Self.defaultModel : (catalog.models.first?.id ?? Self.defaultModel)
+        let name = catalog.displayName(for: replacement) ?? ModelName.short(replacement)
+        modelNotice = "\(model) is no longer offered by Anthropic, so Meeting Assistant switched to \(name)."
+        model = replacement
     }
 
     // MARK: - Consent

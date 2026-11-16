@@ -101,6 +101,11 @@ final class AssistantController {
     /// Shown with the summary when it does not cover the whole call.
     private(set) var summaryNote: String?
     private(set) var isSummarizing = false
+    /// The summary finished cleanly (or is the canned sample one), so a follow-up can be written from it.
+    private(set) var summaryIsFinal = false
+    /// The follow-up email draft, streamed in under the summary.
+    private(set) var followUp = ""
+    private(set) var isDraftingFollowUp = false
 ///
     /// Per-side loudness for the overlay's level indicator.
     let levels = CaptureLevels()
@@ -181,6 +186,8 @@ final class AssistantController {
     @ObservationIgnored private var youTurnsFinished = 0
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
     @ObservationIgnored private var summaryRequest = 0
+    @ObservationIgnored private var followUpTask: Task<Void, Never>?
+    @ObservationIgnored private var followUpRequest = 0
     @ObservationIgnored private var summaryProblem: Problem?
     @ObservationIgnored private var questionWakeScheduled = false
     @ObservationIgnored private var sampleAnswersShown = 0
@@ -1118,7 +1125,8 @@ final class AssistantController {
             // The sample is not the user's call, so their own instructions stay out of it.
             stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
                                                    system: inSample ? settings.profile.systemPrompt : settings.systemPrompt,
-                                                   user: Self.userPrompt(context)))
+                                                   user: Self.userPrompt(context),
+                                                   supportsEffort: settings.modelSupportsEffort))
         } else if inSample {
             stream = nextSampleAnswer()
         } else {
@@ -1223,6 +1231,7 @@ final class AssistantController {
         summaryRequest += 1
         let current = summaryRequest
         summaryNote = nil
+        resetFollowUp()
         guard !transcript.isEmpty else {
             summary = "No transcript yet. Start listening first."
             isSummarizing = false
@@ -1230,6 +1239,7 @@ final class AssistantController {
         }
         if inSample && !settings.hasAcceptedTerms {
             summary = SampleMeeting.sampleSummary
+            summaryIsFinal = true
             isSummarizing = false
             return
         }
@@ -1245,7 +1255,8 @@ final class AssistantController {
         isSummarizing = true
         let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
                                                    system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions),
-                                                   user: SummaryPrompt.user(input)))
+                                                   user: SummaryPrompt.user(input),
+                                                   supportsEffort: settings.modelSupportsEffort))
         summaryTask = Task { [weak self] in
             do {
                 for try await chunk in stream {
@@ -1285,6 +1296,7 @@ final class AssistantController {
             summary = summary.isEmpty ? message : summary + "\n\n" + message
             return
         }
+        summaryIsFinal = true
         saveSummaryNextToTranscript()
     }
 
@@ -1301,7 +1313,75 @@ final class AssistantController {
         summary = ""
         summaryNote = nil
         isSummarizing = false
+        resetFollowUp()
         showProblem(nil, saving: "summary", in: &summaryProblem)
+    }
+
+    // MARK: - Follow-up email
+
+    /// Why "Draft follow-up" is off, or nil when it can run. The sample meeting
+    /// needs neither terms nor a key because its draft is canned.
+    var followUpBlockedReason: String? {
+        if listening != .sample {
+            if !settings.hasAcceptedTerms { return "Agree to the privacy terms first." }
+            if !settings.apiKeyPresent { return "Add an Anthropic API key in Settings first." }
+        }
+        guard summaryIsFinal, !summary.isEmpty, !isSummarizing else { return "Summarize the meeting first." }
+        return nil
+    }
+
+    /// One request built from the summary (not the transcript), which Summarize
+    /// Meeting already sent. In the sample meeting a canned draft appears and
+    /// nothing is sent anywhere.
+    func draftFollowUp() {
+        guard followUpBlockedReason == nil else { return }
+        followUpTask?.cancel()
+        followUpRequest += 1
+        let current = followUpRequest
+        if listening == .sample {
+            followUp = SampleMeeting.sampleFollowUp
+            isDraftingFollowUp = false
+            return
+        }
+        guard let apiKey = settings.resolveAPIKey() else {
+            followUp = missingKeyMessage
+            isDraftingFollowUp = false
+            return
+        }
+        followUp = ""
+        isDraftingFollowUp = true
+        let stream = answerer.stream(AnswerRequest(
+            apiKey: apiKey, model: settings.model,
+            system: FollowUpPrompt.system(profile: settings.profile, extraInstructions: settings.extraInstructions),
+            user: FollowUpPrompt.user(summary: summary),
+            supportsEffort: settings.modelSupportsEffort))
+        followUpTask = Task { [weak self] in
+            do {
+                for try await chunk in stream {
+                    guard let self, self.followUpRequest == current else { return }
+                    self.followUp += chunk
+                }
+                self?.finishFollowUp(current, error: nil)
+            } catch {
+                self?.finishFollowUp(current, error: error)
+            }
+        }
+    }
+
+    private func finishFollowUp(_ request: Int, error: Error?) {
+        guard request == followUpRequest else { return }
+        isDraftingFollowUp = false
+        guard let error, !(error is CancellationError) else { return }
+        let message = "Error: \(error.localizedDescription)"
+        followUp = followUp.isEmpty ? message : followUp + "\n\n" + message
+    }
+
+    private func resetFollowUp() {
+        followUpTask?.cancel()
+        followUpRequest += 1
+        followUp = ""
+        isDraftingFollowUp = false
+        summaryIsFinal = false
     }
 
     // MARK: - Sample meeting

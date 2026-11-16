@@ -6,7 +6,7 @@ final class AppSettingsTests: XCTestCase {
     func testNothingSavedMeansFastModelGeneralProfileAndManualAnswers() {
         let settings = makeSettings()
 
-        XCTAssertEqual(settings.model, "claude-haiku-4-5")
+        XCTAssertEqual(settings.model, "claude-haiku-5-5")
         XCTAssertEqual(settings.profile, .general)
         XCTAssertFalse(settings.autoAnswer)
         XCTAssertFalse(settings.useCloudSTT)

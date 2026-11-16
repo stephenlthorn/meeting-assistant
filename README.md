@@ -82,7 +82,9 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
   still recent (30 seconds), otherwise it is skipped with a note under the answer.
 - **Summarize Meeting** (menu bar icon): sends the whole transcript, fenced as untrusted
   text, to Claude and shows decisions and action items in a window you can copy from.
-  It works while listening and after Stop.
+  It works while listening and after Stop. **Draft follow-up** in that window writes a
+  short follow-up email from the summary (not the transcript), which you can copy or
+  open in Mail; in the sample meeting the draft is canned and nothing is sent.
 - **Saved transcripts**, off until you turn them on (Settings > Transcripts): each call
   is written as a timestamped Markdown file every 30 seconds and when you stop, into
   `~/Library/Application Support/Meeting Assistant/Transcripts` or a folder you pick.
@@ -247,6 +249,8 @@ Meeting and saved transcripts. The full policy is in [PRIVACY.md](PRIVACY.md).
 | `Sources/LLM/Profiles.swift` / `AnswerPrompt.swift` | Per-use-case system prompts / the fenced transcript sent as the user message |
 | `Sources/LLM/SummaryPrompt.swift` | The Summarize Meeting prompts and the bounded whole transcript they carry |
 | `Sources/LLM/ModelName.swift` | Short model names ("Haiku 4.5") for the status line |
+| `Sources/LLM/ModelCatalog.swift` | The model list from Anthropic's Models API, cached, with a built-in fallback; effort and fallback rules |
+| `Sources/LLM/FollowUpPrompt.swift` | The follow-up email prompts, canned sample draft and Open in Mail |
 | `Sources/UI/MenuContent.swift` | The menu bar menu and icon |
 | `Sources/UI/OverlayPanel.swift` / `OverlayView.swift` / `OverlayText.swift` | Floating overlay |
 | `Sources/UI/SummaryView.swift` | The meeting summary window |
