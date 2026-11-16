@@ -122,8 +122,8 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 **[Download MeetingAssistant.app.zip](https://github.com/stephenlthorn/meeting-assistant/releases/latest/download/MeetingAssistant.app.zip)**
 (the latest [release](../../releases/latest); every release lists what changed).
 Unreleased changes from `main` are in the **Actions** tab (latest `build` run >
-Artifacts), for testing only. Signed and notarized releases open normally. An ad-hoc signed build needs quarantine cleared before first
-launch:
+Artifacts), for testing only. Every release notes page says how that build was signed.
+A build that is not notarized needs quarantine cleared before first launch:
 
 ```bash
 unzip MeetingAssistant.app.zip
@@ -131,8 +131,17 @@ xattr -dr com.apple.quarantine MeetingAssistant.app
 open MeetingAssistant.app
 ```
 
-An ad-hoc build has a new code identity every release, so macOS asks for Screen
-Recording and Microphone again after each update.
+Releases are signed with a certificate that stays the same from release to release, so
+macOS keeps your Screen Recording and Microphone permissions, and the Keychain access to
+your API key, when you update. (Releases up to and including v0.3.0 were ad-hoc signed and
+had a new code identity every time; updating from one of those asks one last time.) Only
+Apple's notarization removes the first-launch Gatekeeper prompt, and releases are not
+notarized unless the release notes say so.
+
+**Check for Updates...** in the menu looks for a newer release when you choose it, and
+only then: Meeting Assistant never checks in the background. It asks GitHub for the latest
+release and shows whether you are up to date, or the release notes with a **Download**
+button. It sends nothing about you or your calls.
 
 ## Upgrading
 
@@ -260,6 +269,7 @@ Meeting and saved transcripts. The full policy is in [PRIVACY.md](PRIVACY.md).
 | `Config/MeetingAssistant.entitlements` | Hardened-runtime microphone entitlement |
 | `.github/workflows/` | `build.yml` (tests, plus an ad-hoc signed build kept as an artifact) and `release.yml` (the signed release) |
 | `scripts/release-*.sh`, `scripts/install-xcodegen.sh`, `scripts/setup-release-signing.sh` | Release plumbing the workflow delegates to (version, signing mode, release lookup, pinned XcodeGen), and the one-time signing setup |
+| `scripts/make-self-signed-identity.sh`, `scripts/verify-stable-signing-identity.sh` | The stable self-signed signing identity, and a check that it keeps the code identity stable |
 | `docs/plans/` | Roadmaps |
 | `Tests/` | Unit tests (a hostless XCTest bundle over the app sources; only `@main` is left out) |
 
@@ -280,12 +290,36 @@ A release is published from `main` when `VERSION` changes. To cut one:
    pinned to a commit or checksum. A manual run works only from `main`, and its tag
    input must equal `VERSION`.
 
-**Signing is all or nothing.** With all six secrets below set, the release is signed with
-your Developer ID and notarized. With none set, it is ad-hoc signed. Any other
-combination fails before the build, so a half-configured setup never ships by surprise.
+**Signing has three modes, each all or nothing:**
+
+| Mode | Secrets set | Result |
+|------|-------------|--------|
+| ad-hoc | none | New code identity every release; macOS asks for permissions again after each update |
+| signed | the three certificate secrets | Signed with a stable certificate, not notarized: permissions survive updates, Gatekeeper still asks once |
+| notarized | all six | Signed with Developer ID and notarized |
+
+Any other combination fails before the build, so a half-configured setup never ships by
+surprise. The release notes say which mode was used.
+
+The **signed** mode is the free one. macOS keys permissions on the code's designated
+requirement, which for an ad-hoc build is the code hash and so changes every build. A
+certificate, even a self-signed one, makes it `identifier "<bundle id>" and certificate
+leaf = H"<hash>"`, which is the same for every build signed by that certificate. To set it
+up once:
+
+```bash
+scripts/make-self-signed-identity.sh ~/ma-signing      # makes the .p12, prints the identity
+scripts/setup-release-signing.sh --signed ~/ma-signing/MeetingAssistantSelfSigned.p12
+```
+
+Keep the `.p12` safe, and never commit it. Replacing it later gives the app a new identity,
+and macOS asks for permissions once more. `scripts/verify-stable-signing-identity.sh --trust`
+shows the property on your own Mac (two builds, one requirement; ad-hoc builds, two).
+The release run refuses to publish a signed build whose requirement is still tied to the
+code hash.
 
 The secrets live in the repository's **`release` environment**, not in repository-level
-secrets, and reach only the steps that sign and notarize:
+secrets, and reach only the steps that sign and notarize. The first three are all the signed mode needs:
 
 | Secret | Value |
 |--------|-------|
@@ -294,8 +328,8 @@ secrets, and reach only the steps that sign and notarize:
 | `MACOS_SIGNING_IDENTITY` | For example `Developer ID Application: Your Name (TEAMID)` |
 | `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | For notarization (an app-specific password) |
 
-Run `scripts/setup-release-signing.sh path/to/DeveloperID.p12` to store all six in the
-`release` environment with the GitHub CLI. It targets the checkout's `origin`, or the
+Run `scripts/setup-release-signing.sh path/to/DeveloperID.p12` to store all six (or, with
+`--signed`, the first three) in the `release` environment with the GitHub CLI. It targets the checkout's `origin`, or the
 repository you name with `--repo OWNER/NAME`, shows the target and asks you to confirm
 before it writes anything. A missing environment is created limited to `main` before any
 secret is written; an existing one is never modified (and a GitHub error stops the script

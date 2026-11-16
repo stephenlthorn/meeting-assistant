@@ -61,6 +61,8 @@ struct MenuContent: View {
         ForEach(menu.notes, id: \.self) { note in
             Text(note)
         }
+        Button(menu.checkForUpdatesTitle) { Task { await coordinator.checkForUpdates() } }
+            .disabled(!menu.canCheckForUpdates)
         Button("Welcome & Privacy…") { coordinator.showWelcome() }
         Button("Settings…") {
             NSApp.activate()
