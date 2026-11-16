@@ -246,6 +246,36 @@ final class ModelCatalogTests: XCTestCase {
         XCTAssertTrue(log.requests.isEmpty)
     }
 
+    // MARK: - Terms gate (F2)
+
+    func testNoModelListIsFetchedBeforeTheTermsAreAccepted() async {
+        let log = RequestLog()
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"])
+        StubURLProtocol.respond = { request in
+            log.add(request)
+            return Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z")],
+                             hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(secrets: secrets, acceptTerms: false)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertTrue(log.requests.isEmpty, "the key must not leave the Mac before the terms are accepted")
+        XCTAssertEqual(secrets.reads, 0, "and the Keychain is not read for it")
+
+        settings.acceptTerms()
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(log.requests.count, 1)
+    }
+
+    func testTheWelcomeScreenSaysTheModelListUsesTheKey() {
+        let text = WelcomeText.whereYourDataGoes
+
+        XCTAssertTrue(text.contains("list of available models"), text)
+        XCTAssertTrue(text.contains("only your key"), text)
+    }
+
     func testTheStatusLinePrefersTheCatalogDisplayName() {
         XCTAssertEqual(StatusLine.text(status: "Listening (on-device)", listening: .listening,
                                        model: "claude-haiku-5-5", displayName: "Haiku 5.5 Preview"),
@@ -313,10 +343,13 @@ final class ModelCatalogTests: XCTestCase {
     }
 
     private func makeSettings(defaults: UserDefaults? = nil,
-                              secrets: SecretStore = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"])) -> AppSettings {
+                              secrets: SecretStore = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"]),
+                              acceptTerms: Bool = true) -> AppSettings {
         let defaults = defaults ?? freshDefaults()
-        return AppSettings(defaults: defaults, secrets: secrets, environment: [:],
-                           anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"),
-                           modelCatalog: makeCatalog(defaults: defaults))
+        let settings = AppSettings(defaults: defaults, secrets: secrets, environment: [:],
+                                   anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"),
+                                   modelCatalog: makeCatalog(defaults: defaults))
+        if acceptTerms { settings.acceptTerms() }
+        return settings
     }
 }

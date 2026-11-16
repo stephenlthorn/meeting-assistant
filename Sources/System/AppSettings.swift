@@ -241,9 +241,10 @@ final class AppSettings: ObservableObject {
 
     /// Reads the model list with the saved key, at most hourly unless `force`
     /// (a newly saved key). If the fresh list no longer has the saved model,
-    /// the default replaces it and `modelNotice` says so.
+    /// the default replaces it and `modelNotice` says so. Nothing happens before
+    /// the terms are accepted: the key is not even read from the Keychain.
     func refreshModels(force: Bool = false) async {
-        guard apiKeyPresent, let key = resolveAPIKey() else { return }
+        guard hasAcceptedTerms, apiKeyPresent, let key = resolveAPIKey() else { return }
         guard await catalog.refresh(apiKey: key, force: force) else { return }
         objectWillChange.send()
         reconcileModelWithCatalog()
