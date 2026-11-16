@@ -28,11 +28,14 @@ to install and keep, or turns the call into something useful afterwards.
   behind: it offers `claude-sonnet-5` and `claude-opus-5`, and the default is `claude-haiku-4-5`. Read
   the list from the Models API (`GET /v1/models`) when a key is saved. Keep a small built-in fallback,
   and show the display names the API returns. *S.*
+  **Status (v0.4.0).** Done. `ModelCatalog` caches the list hourly, new installs default to `claude-haiku-5-5`, effort follows each model's reported capabilities, and the server-side refusal fallback is sent only to the models that accept it.
 - **Q2. Prompt caching.** The profile prompt and the extra instructions are the same on every request.
   Mark them with `cache_control` so repeated answers cost less and start sooner. This is a prerequisite
-  for N2. *S.*
+  for N5. *S.*
+  **Status (v0.4.0).** Done. `system` is a cached text block, the transcript stays in the user message, and a test pins the cached prefix byte for byte. Haiku 4.5 only caches prompts of 4,096 tokens or more, so the saving shows on current models (512-token minimum).
 - **Q3. Pick the transcription language.** `AnalyzerTranscriber` defaults to `en-US`. Add a Settings
   choice drawn from `SpeechTranscriber.supportedLocales`, plus a matching answer language. *S.*
+  **Status (v0.4.0).** Done, including Deepgram's `language` parameter where nova-3 supports it and an "Answer in" setting that also applies to summaries and follow-up drafts.
 
 ## v0.4 - Launch follow-through
 
@@ -56,6 +59,8 @@ updating, or stop using the app.
 **Done when.** Two consecutive releases install over each other with no new permission or Keychain
 prompt, and the menu offers the newer version. *M.*
 
+**Status (v0.4.0).** Partly done. Releases support three signing modes (ad-hoc, signed with one stable certificate, notarized), `scripts/make-self-signed-identity.sh` creates the certificate, and a release step fails if a signed build still has an ad-hoc identity. Check for Updates is in the menu, manual only. Still open: proving on a real Mac that two builds signed with the self-signed certificate keep their permissions (`scripts/verify-stable-signing-identity.sh --trust` needs a password approval), loading the certificate into the `release` environment, and the Homebrew cask, which waits for notarization because Homebrew expects casks to pass Gatekeeper.
+
 ### N2. Instant cards
 **Problem.** The most useful help on a sales call is the thing you already know but cannot find in two
 seconds: a competitor one-liner, a pricing answer, a security fact. An LLM round trip takes 1.5-3 s and
@@ -66,6 +71,8 @@ overlay at once, with no network and no model. Cards stack, can be dismissed, an
 transcript.
 **Done when.** In a scripted sample call, a competitor's name shows the card in under 100 ms, and a
 near-miss word does not. *M.*
+
+**Status (v0.4.0).** Done. Cards come from Settings or a folder of `.md` files, match whole words on partial results, and never leave the Mac. Their trigger phrases also join the recognition vocabulary.
 
 ### N3. Custom vocabulary
 **Problem.** Product, company and people names are the words recognition gets wrong most often, and they
@@ -80,6 +87,8 @@ are the words that matter on a sales call.
 **Done when.** A synthetic clip that misrecognises a made-up product name comes out right once the name
 is on the list. *S-M.*
 
+**Status (v0.4.0).** Done for SFSpeechRecognizer and Deepgram (`keyterm`). For SpeechAnalyzer the list is set through `AnalysisContext.contextualStrings`, which Apple documents for `DictationTranscriber`; whether `SpeechTranscriber` honours it is not yet verified.
+
 ### N4. Follow-up email
 **Problem.** After a sales call, the next step is the recap email. Summarize Meeting already has the
 decisions and action items.
@@ -87,6 +96,8 @@ decisions and action items.
 transcript, plus the profile, and writes a short email in the user's voice (extra instructions apply).
 Buttons copy it or open it in Mail. No new data flow: it is one more request built from what Summarize
 already sent. *S.*
+
+**Status (v0.4.0).** Done. The draft is built from the summary only, with Copy and Open in Mail, and a canned draft in the sample meeting.
 
 ## v0.5 - Your material, your Mac
 
