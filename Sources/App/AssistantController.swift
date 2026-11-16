@@ -290,7 +290,7 @@ final class AssistantController {
         awaitingSpeechPermission = []
         clearNotices()
         instantCards.useUserCards()
-        settings.cards.reloadFolder(settings.cardsFolder)
+        settings.cards.reloadFolderInBackground(settings.cardsFolder)
         resetTranscriptAndAnswer()
         resetSummary()
         beginArchive()

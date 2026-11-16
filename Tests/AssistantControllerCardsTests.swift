@@ -6,6 +6,25 @@ import XCTest
 final class AssistantControllerCardsTests: XCTestCase {
     private let folder = URL(fileURLWithPath: "/Notes/Calls", isDirectory: true)
 
+    // MARK: - The card folder (F9)
+
+    func testStartDoesNotWaitForASlowCardFolderAndItsCardsFireOnceLoaded() async {
+        let h = makeHarness(cards: [])
+        let load = SlowFolderLoad(cards: [card("Voicemail", "voicemail")])
+        h.settings.cards.folderLoader = { _ in load.run() }
+        h.settings.cardsFolder = folder
+
+        h.controller.start()
+
+        XCTAssertFalse(load.finished, "Start returned while the folder was still being read")
+        XCTAssertEqual(h.controller.listening, .starting)
+        load.release()
+        await eventually { h.settings.cards.folderCards.count == 1 }
+        await startedListening(h)
+        h.transcribers.latest(.them)?.emit("it goes to voicemail", utterance: 0)
+        XCTAssertEqual(h.controller.cards.map(\.title), ["Voicemail"])
+    }
+
     // MARK: - Showing cards
 
     func testATriggerAsAPartialThenAsTheFinalTextShowsTheCardExactlyOnce() async {
@@ -233,6 +252,10 @@ final class AssistantControllerCardsTests: XCTestCase {
                        transcribers: transcribers, answerer: answerer, clock: clock, scheduler: scheduler, files: files)
     }
 
+    private func startedListening(_ h: Harness) async {
+        await eventually { h.controller.listening == .listening && h.systemAudio.events.last != "start" }
+    }
+
     private func startListening(_ h: Harness, file: StaticString = #filePath, line: UInt = #line) async {
         h.controller.start()
         await eventually(file: file, line: line) {
@@ -243,5 +266,27 @@ final class AssistantControllerCardsTests: XCTestCase {
     private func savedText(_ h: Harness) -> String {
         h.files.files.first(where: { !$0.key.lastPathComponent.hasSuffix("-summary.md") })
             .flatMap { String(data: $0.value, encoding: .utf8) } ?? ""
+    }
+}
+
+/// A folder read that blocks until the test lets it go, so a test can tell whether
+/// the caller waited for it. It gives up after a few seconds so a regression fails
+/// instead of hanging.
+private final class SlowFolderLoad: @unchecked Sendable {
+    private let gate = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var done = false
+    private let cards: [Card]
+
+    init(cards: [Card]) { self.cards = cards }
+
+    var finished: Bool { lock.withLock { done } }
+
+    func release() { gate.signal() }
+
+    func run() -> CardFolder.Loaded {
+        _ = gate.wait(timeout: .now() + 3)
+        lock.withLock { done = true }
+        return CardFolder.Loaded(cards: cards)
     }
 }
