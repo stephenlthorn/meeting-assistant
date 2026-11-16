@@ -246,6 +246,131 @@ final class ModelCatalogTests: XCTestCase {
         XCTAssertTrue(log.requests.isEmpty)
     }
 
+    // MARK: - Dated ids (F3)
+
+    func testASavedAliasIsKeptWhenTheCatalogListsItsDatedId() async {
+        let defaults = freshDefaults()
+        defaults.set("claude-haiku-4-5", forKey: "model")
+        StubURLProtocol.respond = { request in
+            Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z"),
+                       Self.item("claude-haiku-4-5-20251001", name: "Claude Haiku 4.5",
+                                 created: "2025-10-01T00:00:00Z", effort: false)],
+                      hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(defaults: defaults)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(settings.model, "claude-haiku-4-5")
+        XCTAssertNil(settings.modelNotice)
+        XCTAssertEqual(settings.modelDisplayName, "Claude Haiku 4.5")
+        XCTAssertEqual(settings.modelSupportsEffort, false)
+    }
+
+    func testThePickerShowsOneRowPerModelWhenTheSavedAliasIsTheListedDatedId() async {
+        let defaults = freshDefaults()
+        defaults.set("claude-haiku-4-5", forKey: "model")
+        StubURLProtocol.respond = { request in
+            Self.page([Self.item("claude-haiku-5-5", name: "Claude Haiku 5.5", created: "2026-08-01T00:00:00Z"),
+                       Self.item("claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", created: "2025-10-01T00:00:00Z")],
+                      hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(defaults: defaults)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(settings.modelOptions.map(\.id), ["claude-haiku-5-5", "claude-haiku-4-5"])
+        XCTAssertEqual(settings.modelOptions.map(\.name), ["Claude Haiku 5.5", "Claude Haiku 4.5"])
+    }
+
+    func testAModelThatIsInNeitherFormIsStillReplacedWithTheNotice() async {
+        let defaults = freshDefaults()
+        defaults.set("claude-sonnet-4-5", forKey: "model")
+        StubURLProtocol.respond = { request in
+            Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z"),
+                       Self.item("claude-haiku-4-5-20251001", created: "2025-10-01T00:00:00Z")],
+                      hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(defaults: defaults)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(settings.model, "claude-haiku-5-5")
+        XCTAssertTrue(settings.modelNotice?.contains("claude-sonnet-4-5") ?? false, settings.modelNotice ?? "nil")
+    }
+
+    func testTheFallbackSetMatchesDatedIdsOfItsModels() {
+        XCTAssertTrue(ServerSideFallback.supports("claude-sonnet-5-5-20261101"))
+        XCTAssertTrue(ServerSideFallback.supports("claude-opus-5-5"))
+        XCTAssertFalse(ServerSideFallback.supports("claude-haiku-5-5-20261101"))
+        XCTAssertFalse(ServerSideFallback.supports("claude-haiku-4-5"))
+    }
+
+    // MARK: - Key replaced (F7)
+
+    func testReplacingTheKeyForcesOneModelListRefreshWithTheNewKey() async throws {
+        let log = RequestLog()
+        StubURLProtocol.respond = { request in
+            log.add(request)
+            return Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z")],
+                             hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings()
+        await settings.refreshModels(force: true)
+        XCTAssertEqual(log.requests.count, 1)
+
+        XCTAssertTrue(settings.setAPIKey("sk-replacement"))
+
+        await eventually(timeout: 2) { log.requests.count == 2 }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(log.requests.count, 2)
+        XCTAssertEqual(log.requests.last?.value(forHTTPHeaderField: "x-api-key"), "sk-replacement")
+    }
+
+    func testSavingAKeyBeforeTheTermsAreAcceptedFetchesNothing() async throws {
+        let log = RequestLog()
+        StubURLProtocol.respond = { request in
+            log.add(request)
+            return Self.page([], hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(acceptTerms: false)
+
+        XCTAssertTrue(settings.setAPIKey("sk-new"))
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertTrue(log.requests.isEmpty)
+    }
+
+    // MARK: - Terms gate (F2)
+
+    func testNoModelListIsFetchedBeforeTheTermsAreAccepted() async {
+        let log = RequestLog()
+        let secrets = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"])
+        StubURLProtocol.respond = { request in
+            log.add(request)
+            return Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z")],
+                             hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(secrets: secrets, acceptTerms: false)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertTrue(log.requests.isEmpty, "the key must not leave the Mac before the terms are accepted")
+        XCTAssertEqual(secrets.reads, 0, "and the Keychain is not read for it")
+
+        settings.acceptTerms()
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(log.requests.count, 1)
+    }
+
+    func testTheWelcomeScreenSaysTheModelListUsesTheKey() {
+        let text = WelcomeText.whereYourDataGoes
+
+        XCTAssertTrue(text.contains("list of available models"), text)
+        XCTAssertTrue(text.contains("only your key"), text)
+    }
+
     func testTheStatusLinePrefersTheCatalogDisplayName() {
         XCTAssertEqual(StatusLine.text(status: "Listening (on-device)", listening: .listening,
                                        model: "claude-haiku-5-5", displayName: "Haiku 5.5 Preview"),
@@ -313,10 +438,13 @@ final class ModelCatalogTests: XCTestCase {
     }
 
     private func makeSettings(defaults: UserDefaults? = nil,
-                              secrets: SecretStore = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"])) -> AppSettings {
+                              secrets: SecretStore = InMemorySecretStore(values: ["anthropic_api_key": "sk-test"]),
+                              acceptTerms: Bool = true) -> AppSettings {
         let defaults = defaults ?? freshDefaults()
-        return AppSettings(defaults: defaults, secrets: secrets, environment: [:],
-                           anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"),
-                           modelCatalog: makeCatalog(defaults: defaults))
+        let settings = AppSettings(defaults: defaults, secrets: secrets, environment: [:],
+                                   anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"),
+                                   modelCatalog: makeCatalog(defaults: defaults))
+        if acceptTerms { settings.acceptTerms() }
+        return settings
     }
 }

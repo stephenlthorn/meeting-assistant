@@ -186,6 +186,21 @@ final class ReleaseWorkflowTests: XCTestCase {
         XCTAssertTrue(sign.text.contains("trap cleanup EXIT"))
     }
 
+    func testAWrongSigningIdentityFailsWithAFriendlyErrorBeforeAnythingIsTrusted() throws {
+        let text = try Workflow("release.yml").step("Sign with certificate").text
+
+        let find = try XCTUnwrap(text.range(of: "security find-certificate"), text)
+        let check = try XCTUnwrap(text.range(of: #"[ ! -s "$PUBLIC_CERTIFICATE" ]"#), "the exported certificate must be checked for content")
+        let trust = try XCTUnwrap(text.range(of: "security add-trusted-cert"), text)
+        XCTAssertLessThan(find.lowerBound, check.lowerBound)
+        XCTAssertLessThan(check.lowerBound, trust.lowerBound, "the check must come before the trust call")
+        let findLine = try XCTUnwrap(text.components(separatedBy: "\n").first { $0.contains("security find-certificate") })
+        XCTAssertTrue(findLine.contains("|| true"), "set -e would stop the step on find-certificate's own failure: \(findLine)")
+        let afterCheck = String(text[check.upperBound..<trust.lowerBound])
+        XCTAssertTrue(afterCheck.contains("::error::"), afterCheck)
+        XCTAssertTrue(afterCheck.contains("MACOS_SIGNING_IDENTITY"), afterCheck)
+    }
+
     func testReleaseNotesDescribeTheSigningModeAndNotarizationOutcomeActuallyUsed() throws {
         let notes = try Workflow("release.yml").step("Write release notes")
 

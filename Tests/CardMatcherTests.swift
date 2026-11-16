@@ -60,6 +60,33 @@ final class CardMatcherTests: XCTestCase {
         XCTAssertEqual(hits("whatever", []), [])
     }
 
+    // MARK: - Languages written without spaces
+
+    func testAJapaneseTriggerInsideASentenceFires() {
+        let cards = [card("j", "価格")]
+        XCTAssertEqual(hits("この製品の価格はいくらですか。", cards), ["j"])
+        XCTAssertEqual(hits("この製品は安いです。", cards), [])
+    }
+
+    func testAMultiWordJapaneseTriggerFires() {
+        XCTAssertEqual(hits("すみません、製品の価格を教えてください。", [card("j", "製品の価格")]), ["j"])
+    }
+
+    func testAChineseTriggerInsideASentenceFires() {
+        let cards = [card("z", "价格")]
+        XCTAssertEqual(hits("我们想了解一下价格方案。", cards), ["z"])
+        XCTAssertEqual(hits("我们想了解一下方案。", cards), [])
+    }
+
+    func testAThaiTriggerInsideASentenceFires() {
+        XCTAssertEqual(hits("สินค้านี้ราคาเท่าไหร่", [card("t", "ราคา")]), ["t"])
+    }
+
+    func testAnEnglishTriggerStillFiresInsideAJapaneseSentence() {
+        XCTAssertEqual(hits("次のAcmeの料金を見ましょう。", [card("a", "Acme")]), ["a"])
+        XCTAssertEqual(hits("Acmevilleの話です。", [card("a", "Acme")]), [])
+    }
+
     func testHundredsOfCardsStillFindTheOneThatMatches() {
         var cards = (0..<600).map { card("c\($0)", "topic\($0) detail") }
         cards.append(card("target", "voicemail"))

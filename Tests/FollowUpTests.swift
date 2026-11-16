@@ -119,6 +119,67 @@ final class AssistantControllerFollowUpTests: XCTestCase {
         XCTAssertTrue(h.controller.followUp.contains("Error:"), h.controller.followUp)
     }
 
+    // MARK: - Using the draft
+
+    func testCopyAndMailAreOffWhileTheDraftIsStillStreaming() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We will ship in May.")
+        await summarize(h, as: "A summary.")
+
+        h.controller.draftFollowUp()
+        h.answerer.streams[1].yield("Subject: Next steps\n\nHi Ma")
+        await eventually { !h.controller.followUp.isEmpty }
+
+        XCTAssertTrue(h.controller.isDraftingFollowUp)
+        XCTAssertFalse(h.controller.canUseFollowUpDraft, "half an email must not be copied or sent")
+    }
+
+    func testCopyAndMailAreOffAfterAFailedDraftAndNeverCarryTheErrorText() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We will ship in May.")
+        await summarize(h, as: "A summary.")
+
+        h.controller.draftFollowUp()
+        h.answerer.streams[1].yield("Hi Maya,")
+        h.answerer.streams[1].finish(throwing: AnthropicError.cutOff)
+        await eventually { !h.controller.isDraftingFollowUp }
+
+        XCTAssertFalse(h.controller.canUseFollowUpDraft)
+        XCTAssertEqual(h.controller.followUpDraft, "Hi Maya,", "the draft field never holds the error")
+        XCTAssertNotNil(h.controller.followUpStatus)
+        XCTAssertTrue(h.controller.followUp.contains("Error:"), "the window still shows what went wrong")
+    }
+
+    func testCopyAndMailAreOnAfterACleanDraft() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We will ship in May.")
+        await summarize(h, as: "A summary.")
+
+        h.controller.draftFollowUp()
+        h.answerer.streams[1].yield("Subject: Next steps\n\nHi Maya,")
+        h.answerer.streams[1].finish()
+        await eventually { !h.controller.isDraftingFollowUp }
+
+        XCTAssertTrue(h.controller.canUseFollowUpDraft)
+        XCTAssertEqual(h.controller.followUpDraft, "Subject: Next steps\n\nHi Maya,")
+        XCTAssertNil(h.controller.followUpStatus)
+    }
+
+    func testTheSampleDraftCanBeCopied() async {
+        let h = makeHarness(acceptTerms: false)
+        h.controller.startSample()
+        await playSample(h, lines: 2)
+        h.controller.summarizeMeeting()
+
+        h.controller.draftFollowUp()
+
+        XCTAssertTrue(h.controller.canUseFollowUpDraft)
+        XCTAssertEqual(h.controller.followUpDraft, SampleMeeting.sampleFollowUp)
+    }
+
     // MARK: - When it is off
 
     func testTheButtonIsOffUntilThereIsASummary() async {
@@ -146,6 +207,34 @@ final class AssistantControllerFollowUpTests: XCTestCase {
         h.answerer.streams[0].finish(throwing: AnthropicError.cutOff)
         await eventually { !h.controller.isSummarizing }
         XCTAssertNotNil(h.controller.followUpBlockedReason, "an error message is not a summary to write from")
+    }
+
+    func testARefusedOrCutOffSummaryLeavesTheFollowUpOffWithAReason() async {
+        for stop in [AnswerStop.refused, .truncated] {
+            let h = makeHarness()
+            await startListening(h)
+            h.transcribers.latest(.them)?.emit("We will ship in May.")
+
+            await summarize(h, as: "(Claude declined to answer this.)", stop: stop)
+
+            XCTAssertNotNil(h.controller.followUpBlockedReason, "\(stop)")
+            XCTAssertTrue(h.controller.followUpBlockedReason?.contains("Summarize") ?? false,
+                          h.controller.followUpBlockedReason ?? "nil")
+            h.controller.draftFollowUp()
+            XCTAssertEqual(h.answerer.requests.count, 1, "no follow-up request for \(stop)")
+        }
+    }
+
+    func testACleanSummaryThatFollowsACutOffOneUnlocksTheFollowUp() async {
+        let h = makeHarness()
+        await startListening(h)
+        h.transcribers.latest(.them)?.emit("We will ship in May.")
+        await summarize(h, as: "Half", stop: .truncated)
+        XCTAssertNotNil(h.controller.followUpBlockedReason)
+
+        await summarize(h, as: "A whole summary.")
+
+        XCTAssertNil(h.controller.followUpBlockedReason)
     }
 
     func testWithoutAnAPIKeyTheButtonIsOffWithAReason() async {
@@ -287,8 +376,9 @@ final class AssistantControllerFollowUpTests: XCTestCase {
     }
 
     /// Runs Summarize Meeting to completion with `text` as the summary (the first request made).
-    private func summarize(_ h: Harness, as text: String) async {
+    private func summarize(_ h: Harness, as text: String, stop: AnswerStop = .complete) async {
         let index = h.answerer.streams.count
+        h.answerer.stops[index] = stop
         h.controller.summarizeMeeting()
         h.answerer.streams[index].yield(text)
         h.answerer.streams[index].finish()

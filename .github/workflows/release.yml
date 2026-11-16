@@ -157,7 +157,11 @@ jobs:
             # A self-signed certificate is not trusted by default, and codesign refuses an
             # untrusted identity. This runner is a throwaway machine, and the trust is
             # removed again when the step ends.
-            security find-certificate -c "$MACOS_SIGNING_IDENTITY" -p "$KEYCHAIN" > "$PUBLIC_CERTIFICATE"
+            security find-certificate -c "$MACOS_SIGNING_IDENTITY" -p "$KEYCHAIN" > "$PUBLIC_CERTIFICATE" || true
+            if [ ! -s "$PUBLIC_CERTIFICATE" ]; then
+              echo "::error::No certificate named '$MACOS_SIGNING_IDENTITY' was found in MACOS_CERTIFICATE_P12. Check the MACOS_SIGNING_IDENTITY secret against the certificate's name."
+              exit 1
+            fi
             sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$PUBLIC_CERTIFICATE"
             TRUSTED=true
           fi

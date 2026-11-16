@@ -116,6 +116,9 @@ final class AppSettings: ObservableObject {
     /// later change in Settings never reaches a call in progress (not even
     /// through a transcriber restart). Nil when not listening.
     @Published private(set) var activeSpeechOptions: SpeechOptions?
+    /// The active cards' trigger phrases as they stood at Start, frozen with the
+    /// speech options so a card edit mid-call never reaches a transcriber restart.
+    private(set) var activeCardTriggers: [String]?
 
     var apiKeyPresent: Bool { apiKeySource.map { $0 != .unreadable } ?? false }
     var hasAcceptedTerms: Bool { acceptedTermsVersion >= Self.termsVersion }
@@ -200,9 +203,15 @@ final class AppSettings: ObservableObject {
 
     var speechSessionActive: Bool { activeSpeechOptions != nil }
 
-    func freezeSpeechOptions() { activeSpeechOptions = speechOptions }
+    func freezeSpeechOptions() {
+        activeSpeechOptions = speechOptions
+        activeCardTriggers = cards.triggerPhrases
+    }
 
-    func releaseSpeechOptions() { activeSpeechOptions = nil }
+    func releaseSpeechOptions() {
+        activeSpeechOptions = nil
+        activeCardTriggers = nil
+    }
 
     /// The sentence that tells Claude which language to answer in, or nil.
     var answerLanguageSentence: String? {
@@ -219,7 +228,11 @@ final class AppSettings: ObservableObject {
     /// when the list does not have it (offline, or a model the user chose earlier),
     /// so the picker never shows a selection it cannot display.
     var modelOptions: [ModelOption] {
-        var options = catalog.models.map { ModelOption(id: $0.id, name: $0.displayName) }
+        var options = catalog.models.map { info in
+            // The saved alias and the API's dated id are one model: one row, tagged with the saved value.
+            let isSavedModel = info.id == model || (catalog.entry(for: model)?.id == info.id)
+            return ModelOption(id: isSavedModel ? model : info.id, name: info.displayName)
+        }
         if !options.contains(where: { $0.id == model }) { options.append(ModelOption(id: model, name: ModelName.short(model))) }
         return options
     }
@@ -232,20 +245,21 @@ final class AppSettings: ObservableObject {
 
     /// Reads the model list with the saved key, at most hourly unless `force`
     /// (a newly saved key). If the fresh list no longer has the saved model,
-    /// the default replaces it and `modelNotice` says so.
+    /// the default replaces it and `modelNotice` says so. Nothing happens before
+    /// the terms are accepted: the key is not even read from the Keychain.
     func refreshModels(force: Bool = false) async {
-        guard apiKeyPresent, let key = resolveAPIKey() else { return }
+        guard hasAcceptedTerms, apiKeyPresent, let key = resolveAPIKey() else { return }
         guard await catalog.refresh(apiKey: key, force: force) else { return }
         objectWillChange.send()
         reconcileModelWithCatalog()
     }
 
     private func reconcileModelWithCatalog() {
-        guard catalog.isFromAPI, !catalog.models.contains(where: { $0.id == model }) else {
+        guard catalog.isFromAPI, catalog.entry(for: model) == nil else {
             modelNotice = nil
             return
         }
-        let replacement = catalog.models.contains(where: { $0.id == Self.defaultModel })
+        let replacement = catalog.entry(for: Self.defaultModel) != nil
             ? Self.defaultModel : (catalog.models.first?.id ?? Self.defaultModel)
         let name = catalog.displayName(for: replacement) ?? ModelName.short(replacement)
         modelNotice = "\(model) is no longer offered by Anthropic, so Meeting Assistant switched to \(name)."
@@ -285,10 +299,22 @@ final class AppSettings: ObservableObject {
     // MARK: - Keys
 
     @discardableResult
-    func setAPIKey(_ key: String) -> Bool { save(key, account: Self.anthropicAccount) }
+    func setAPIKey(_ key: String) -> Bool {
+        let saved = save(key, account: Self.anthropicAccount)
+        if saved { refreshModelsForNewKey() }
+        return saved
+    }
 
     func removeAPIKey() {
         remove(account: Self.anthropicAccount)
+        refreshModelsForNewKey()
+    }
+
+    /// A different key may see a different model list, and the key source does not
+    /// change when one Keychain key replaces another, so the save itself asks again.
+    /// `refreshModels` still waits for the terms.
+    private func refreshModelsForNewKey() {
+        Task { await refreshModels(force: true) }
     }
 
     @discardableResult

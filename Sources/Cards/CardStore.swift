@@ -15,6 +15,10 @@ final class CardStore: ObservableObject {
     /// tell with one comparison that it is stale.
     private(set) var revision = 0
 
+    /// Reads a card folder. A seam so a test can make the read slow.
+    var folderLoader: @Sendable (URL) -> CardFolder.Loaded = { CardFolder.load($0) }
+
+    private var folderLoadToken = 0
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults) {
@@ -54,10 +58,35 @@ final class CardStore: ObservableObject {
         changed()
     }
 
-    /// Reads the folder again (nil clears it). Called when listening starts and
-    /// when Settings opens, so edits made in a notes app are picked up.
+    /// Reads the folder again (nil clears it), on the caller's thread. For Settings,
+    /// which wants the answer for the window it is drawing.
     func reloadFolder(_ folder: URL?) {
-        let loaded = folder.map { CardFolder.load($0) } ?? CardFolder.Loaded()
+        folderLoadToken += 1
+        apply(folder.map(folderLoader) ?? CardFolder.Loaded())
+    }
+
+    /// Reads the folder off the main actor and applies the result when it is in, so a
+    /// slow disk or a big folder never holds up the caller (listening starts at once;
+    /// the folder's cards become active when loaded). A newer reload wins over an
+    /// older one still in flight. Called when listening starts, so edits made in a
+    /// notes app are picked up.
+    @discardableResult
+    func reloadFolderInBackground(_ folder: URL?) -> Task<Void, Never> {
+        folderLoadToken += 1
+        let token = folderLoadToken
+        guard let folder else {
+            apply(CardFolder.Loaded())
+            return Task {}
+        }
+        let load = folderLoader
+        return Task { [weak self] in
+            let loaded = await Task.detached(priority: .userInitiated) { load(folder) }.value
+            guard let self, self.folderLoadToken == token else { return }
+            self.apply(loaded)
+        }
+    }
+
+    private func apply(_ loaded: CardFolder.Loaded) {
         guard loaded.cards != folderCards || loaded.skipped != folderSkipped || loaded.folderError != folderError else {
             return
         }

@@ -40,4 +40,63 @@ final class CardVocabularyWiringTests: XCTestCase {
 
         XCTAssertEqual(transcriber.vocabulary.first, "Slate")
     }
+
+    // MARK: - Triggers stay on the Mac
+
+    func testDeepgramNeverHearsCardTriggers() throws {
+        let settings = makeTestSettings(for: self, environment: ["DEEPGRAM_API_KEY": "dg-key"])
+        settings.useCloudSTT = true
+        settings.acceptCloudAudio()
+        settings.vocabularyText = "Slate"
+        settings.cards.add(Card(title: "Acme", triggers: ["Acme Cloud"], body: "One-liner"))
+
+        let transcriber = try XCTUnwrap(TranscriberFactory.makeForSession(settings: settings) as? CloudTranscriber)
+
+        XCTAssertEqual(transcriber.vocabulary, ["Slate"])
+    }
+
+    func testAppleServerModeNeverHearsCardTriggers() throws {
+        let settings = makeTestSettings(for: self)
+        settings.acceptServerSpeech()
+        settings.cards.add(Card(title: "Acme", triggers: ["Acme Cloud"], body: "One-liner"))
+
+        let transcriber = try XCTUnwrap(TranscriberFactory.makeForSession(settings: settings) as? LegacySpeechTranscriber)
+
+        XCTAssertFalse(transcriber.vocabulary.contains("Acme Cloud"))
+    }
+
+    func testTheNewerOnDeviceEngineHearsCardTriggers() throws {
+        guard #available(macOS 26, *) else { throw XCTSkip("SpeechAnalyzer needs macOS 26") }
+        TranscriberFactory.analyzerAvailable = true
+        let settings = makeTestSettings(for: self)
+        settings.acceptServerSpeech()
+        settings.cards.add(Card(title: "Acme", triggers: ["Acme Cloud"], body: "One-liner"))
+
+        let transcriber = try XCTUnwrap(TranscriberFactory.makeForSession(settings: settings) as? AnalyzerTranscriber)
+
+        XCTAssertTrue(transcriber.vocabulary.contains("Acme Cloud"))
+    }
+
+    func testCardEditsAfterStartNeverReachARestartedTranscriber() throws {
+        let settings = makeTestSettings(for: self)
+        settings.cards.add(Card(title: "Acme", triggers: ["Acme Cloud"], body: "One-liner"))
+        settings.freezeSpeechOptions()
+
+        settings.cards.add(Card(title: "Beta", triggers: ["Beta Cloud"], body: "One-liner"))
+        let restarted = try XCTUnwrap(TranscriberFactory.makeForSession(settings: settings) as? LegacySpeechTranscriber)
+
+        XCTAssertTrue(restarted.vocabulary.contains("Acme Cloud"))
+        XCTAssertFalse(restarted.vocabulary.contains("Beta Cloud"))
+    }
+
+    func testStoppingForgetsTheSnapshotSoTheNextSessionSeesNewCards() throws {
+        let settings = makeTestSettings(for: self)
+        settings.freezeSpeechOptions()
+        settings.releaseSpeechOptions()
+        settings.cards.add(Card(title: "Beta", triggers: ["Beta Cloud"], body: "One-liner"))
+
+        let next = try XCTUnwrap(TranscriberFactory.makeForSession(settings: settings) as? LegacySpeechTranscriber)
+
+        XCTAssertTrue(next.vocabulary.contains("Beta Cloud"))
+    }
 }
