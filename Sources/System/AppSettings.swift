@@ -84,6 +84,14 @@ final class AppSettings: ObservableObject {
     @Published private(set) var apiKeySource: KeySource?
     @Published private(set) var deepgramKeySource: KeySource?
 
+    // MARK: - v0.4 cards
+    /// The user's instant cards, kept on this Mac only.
+    let cards: CardStore
+    /// Off until the user turns it on: "You" lines can also fire a card.
+    @Published var cardsMatchYou: Bool { didSet { defaults.set(cardsMatchYou, forKey: "cards.matchYou") } }
+    /// A folder of `.md` files read as more cards; nil when none is chosen.
+    @Published var cardsFolder: URL? { didSet { defaults.set(cardsFolder?.path, forKey: "cards.folder") } }
+
     var apiKeyPresent: Bool { apiKeySource.map { $0 != .unreadable } ?? false }
     var hasAcceptedTerms: Bool { acceptedTermsVersion >= Self.termsVersion }
 
@@ -139,6 +147,11 @@ final class AppSettings: ObservableObject {
         captureAppBundleID = defaults.string(forKey: "captureAppBundleID").flatMap { $0.isEmpty ? nil : $0 }
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
         serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
+        // MARK: - v0.4 cards
+        cards = CardStore(defaults: defaults)
+        cardsMatchYou = defaults.bool(forKey: "cards.matchYou")
+        cardsFolder = defaults.string(forKey: "cards.folder").flatMap { $0.isEmpty ? nil : $0 }
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
         refreshKeySources()
     }
 

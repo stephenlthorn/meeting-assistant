@@ -18,8 +18,22 @@ struct TranscriptMarkdown {
         return "# Meeting transcript\n\nStarted: \(when)\n\n"
     }
 
+    /// Not a real utterance number: marks a turn that stands for a card shown
+    /// during the call, so it travels through the archive in order with the
+    /// spoken lines.
+    static let cardUtterance = Int.min
+
+    static func cardTurn(title: String, at time: Date) -> Transcript.Turn {
+        Transcript.Turn(speaker: .them, utterance: cardUtterance, startedAt: time, text: title,
+                        isFinal: true, isEcho: false, updatedAt: time)
+    }
+
     /// One turn as a list item, so each stays on its own line when rendered.
+    /// A card shown is a quote line instead, so it reads as a note, not speech.
     func line(for turn: Transcript.Turn) -> String {
+        if turn.utterance == Self.cardUtterance {
+            return "> Card shown: " + turn.text.split(whereSeparator: \.isNewline).joined(separator: " ") + "\n"
+        }
         let t = parts(turn.startedAt)
         let clock = String(format: "%02d:%02d:%02d", t.hour, t.minute, t.second)
         let text = turn.text.split(whereSeparator: \.isNewline).joined(separator: " ")

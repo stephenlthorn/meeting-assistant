@@ -120,6 +120,8 @@ struct SettingsView: View {
                 }
             }
 
+            CardsSection(settings: settings)
+
             Section("Extra instructions") {
                 TextEditor(text: $settings.extraInstructions)
                     .frame(minHeight: 70)

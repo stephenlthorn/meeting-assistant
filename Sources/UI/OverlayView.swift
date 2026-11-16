@@ -16,6 +16,7 @@ struct OverlayView: View {
             Divider()
             TranscriptSection(controller: controller)
             Divider()
+            CardsView(controller: controller)
             AnswerSection(controller: controller, settings: settings)
             Spacer(minLength: 0)
         }
