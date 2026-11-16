@@ -101,7 +101,10 @@ final class AssistantController {
     /// Shown with the summary when it does not cover the whole call.
     private(set) var summaryNote: String?
     private(set) var isSummarizing = false
-///
+    /// Instant cards on screen, newest first (at most `CardDeck.displayLimit`).
+    private(set) var cards: [Card] = []
+    /// Cards waiting behind the ones shown.
+    private(set) var hiddenCardCount = 0
     /// Per-side loudness for the overlay's level indicator.
     let levels = CaptureLevels()
 
@@ -184,6 +187,7 @@ final class AssistantController {
     @ObservationIgnored private var summaryProblem: Problem?
     @ObservationIgnored private var questionWakeScheduled = false
     @ObservationIgnored private var sampleAnswersShown = 0
+    @ObservationIgnored private var instantCards = InstantCards()
 
     init(settings: AppSettings,
          systemAudio: SystemAudioCapturing,
@@ -265,6 +269,8 @@ final class AssistantController {
         themRecovery += 1
         awaitingSpeechPermission = []
         clearNotices()
+        instantCards.useUserCards()
+        settings.cards.reloadFolder(settings.cardsFolder)
         resetTranscriptAndAnswer()
         resetSummary()
         beginArchive()
@@ -953,17 +959,44 @@ final class AssistantController {
         answerNote = nil
         questions.clear()
         isAnswering = false
+        instantCards.clear()
+        publishCards()
     }
 
     private func receive(_ segment: TranscriptSegment, from speaker: Speaker, isLive: Bool) {
         feedArchive(segment, from: speaker)
         guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
+        if isLive { showCards(for: segment.text, from: speaker) }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
         if finished?.speaker == .you { youTurnsFinished += 1 }
         guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
         questionAsked(finished.text)
+    }
+
+    // MARK: - Instant cards
+
+    func dismissCard(id: String) {
+        instantCards.dismiss(id: id)
+        publishCards()
+    }
+
+    /// Runs on every update, partial ones included, so a card appears as the
+    /// words do: no network, no model. A card shown is also logged in the saved
+    /// transcript at that point in the call.
+    private func showCards(for text: String, from speaker: Speaker) {
+        guard speaker == .them || settings.cardsMatchYou else { return }
+        let shown = instantCards.hear(text, store: settings.cards, at: now())
+        guard !shown.isEmpty else { return }
+        publishCards()
+        guard let archive, settings.saveTranscripts else { return }
+        archive.append(shown.map { TranscriptMarkdown.cardTurn(title: $0.title, at: now()) })
+    }
+
+    private func publishCards() {
+        cards = instantCards.displayed
+        hiddenCardCount = instantCards.hiddenCount
     }
 
     // MARK: - Saved transcript
@@ -1320,6 +1353,7 @@ final class AssistantController {
         clearNotices()
         flushArchive()
         endArchive()
+        instantCards.useSampleCards(SampleMeeting.cards)
         resetTranscriptAndAnswer()
         resetSummary()
         sessionStartedAt = now()
@@ -1339,6 +1373,7 @@ final class AssistantController {
         let segment = TranscriptSegment(utterance: index, text: line.text, isFinal: true)
         let finished = transcript.apply(segment, from: line.speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
+        showCards(for: line.text, from: line.speaker)
         if let finished, finished.speaker == .them, QuestionDetector.looksLikeQuestion(finished.text) {
             answerNow()
         }
