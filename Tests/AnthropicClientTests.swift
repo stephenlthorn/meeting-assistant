@@ -125,6 +125,35 @@ final class AnthropicClientTests: XCTestCase {
         XCTAssertEqual(text, "(Claude declined to answer this.)")
     }
 
+    func testTheEventStreamReportsHowTheReplyStopped() async throws {
+        let cases: [(reason: String, expected: AnswerStop)] = [
+            ("end_turn", .complete), ("max_tokens", .truncated), ("refusal", .refused), ("pause_turn", .other),
+        ]
+        for (reason, expected) in cases {
+            stub(status: 200, sse: [
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+                #"{"type":"message_delta","delta":{"stop_reason":"\#(reason)"}}"#,
+                #"{"type":"message_stop"}"#,
+            ])
+            var events: [AnswerEvent] = []
+
+            for try await event in client().streamEvents(request(model: "claude-haiku-4-5")) { events.append(event) }
+
+            XCTAssertEqual(events.last, .stopped(expected), reason)
+        }
+    }
+
+    func testTheEventStreamKeepsTheVisibleNoteTextTheSame() async throws {
+        stub(status: 200, sse: [#"{"type":"message_delta","delta":{"stop_reason":"refusal"}}"#])
+        var text = ""
+
+        for try await event in client().streamEvents(request(model: "claude-sonnet-5")) {
+            if case .text(let chunk) = event { text += chunk }
+        }
+
+        XCTAssertEqual(text, "(Claude declined to answer this.)")
+    }
+
     func testAnHTTPErrorEndsTheStreamWithAReadableMessage() async {
         StubURLProtocol.respond = { request in
             (HTTPURLResponse(url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!,

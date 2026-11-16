@@ -107,6 +107,8 @@ final class AssistantController {
     private(set) var hiddenCardCount = 0
     /// The summary finished cleanly (or is the canned sample one), so a follow-up can be written from it.
     private(set) var summaryIsFinal = false
+    /// The summary ended without error but not whole (declined, or cut off at the length limit).
+    private(set) var summaryEndedEarly = false
     /// The follow-up email draft, streamed in under the summary.
     private(set) var followUp = ""
     private(set) var isDraftingFollowUp = false
@@ -1288,20 +1290,24 @@ final class AssistantController {
         summaryNote = input.isPartial ? partialSummaryNote(trimmed: source.isPartial) : nil
         summary = ""
         isSummarizing = true
-        let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
+        let stream = answerer.streamEvents(AnswerRequest(apiKey: apiKey, model: settings.model,
                                                    system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions,
                                                                            languageSentence: inSample ? nil : settings.answerLanguageSentence),
                                                    user: SummaryPrompt.user(input),
                                                    supportsEffort: settings.modelSupportsEffort))
         summaryTask = Task { [weak self] in
             do {
-                for try await chunk in stream {
+                var stop = AnswerStop.complete
+                for try await event in stream {
                     guard let self, self.summaryRequest == current else { return }
-                    self.summary += chunk
+                    switch event {
+                    case .text(let chunk): self.summary += chunk
+                    case .stopped(let reason): stop = reason
+                    }
                 }
-                self?.finishSummary(current, error: nil)
+                self?.finishSummary(current, error: nil, stop: stop)
             } catch {
-                self?.finishSummary(current, error: error)
+                self?.finishSummary(current, error: error, stop: nil)
             }
         }
     }
@@ -1323,7 +1329,7 @@ final class AssistantController {
         return settings.saveTranscripts ? note : note + " Turn on Save transcripts in Settings to summarize a long call in full."
     }
 
-    private func finishSummary(_ request: Int, error: Error?) {
+    private func finishSummary(_ request: Int, error: Error?, stop: AnswerStop?) {
         guard request == summaryRequest else { return }
         isSummarizing = false
         if let error {
@@ -1332,7 +1338,9 @@ final class AssistantController {
             summary = summary.isEmpty ? message : summary + "\n\n" + message
             return
         }
-        summaryIsFinal = true
+        // A refusal or length-limit note is text too, but not a summary to write an email from.
+        summaryIsFinal = stop == .complete
+        summaryEndedEarly = stop != .complete
         saveSummaryNextToTranscript()
     }
 
@@ -1361,6 +1369,9 @@ final class AssistantController {
         if listening != .sample {
             if !settings.hasAcceptedTerms { return "Agree to the privacy terms first." }
             if !settings.apiKeyPresent { return "Add an Anthropic API key in Settings first." }
+        }
+        if summaryEndedEarly, !isSummarizing {
+            return "The summary was declined or cut off. Summarize the meeting again first."
         }
         guard summaryIsFinal, !summary.isEmpty, !isSummarizing else { return "Summarize the meeting first." }
         return nil
@@ -1419,6 +1430,7 @@ final class AssistantController {
         followUp = ""
         isDraftingFollowUp = false
         summaryIsFinal = false
+        summaryEndedEarly = false
     }
 
     // MARK: - Sample meeting

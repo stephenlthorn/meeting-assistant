@@ -159,12 +159,31 @@ final class FakeMicrophone: MicrophoneCapturing {
 final class FakeAnswerer: AnswerStreaming {
     private(set) var requests: [AnswerRequest] = []
     private(set) var streams: [AsyncThrowingStream<String, Error>.Continuation] = []
+    /// How the stream at an index stops when it finishes without an error (default: complete).
+    var stops: [Int: AnswerStop] = [:]
 
     func stream(_ request: AnswerRequest) -> AsyncThrowingStream<String, Error> {
         requests.append(request)
         let (stream, continuation) = AsyncThrowingStream<String, Error>.makeStream()
         streams.append(continuation)
         return stream
+    }
+
+    func streamEvents(_ request: AnswerRequest) -> AsyncThrowingStream<AnswerEvent, Error> {
+        let index = streams.count
+        let source = stream(request)
+        return AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                do {
+                    for try await chunk in source { continuation.yield(.text(chunk)) }
+                    continuation.yield(.stopped(stops[index] ?? .complete))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 }
 
