@@ -1199,6 +1199,63 @@ private struct FakeGitHub {
     }
 }
 
+final class ReleaseSigningModeTests: XCTestCase {
+    private static let signing = ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"]
+    private static let notarization = ["APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"]
+
+    private func decide(setting names: [String]) throws -> Shell.Outcome {
+        var env: [String: String] = [:]
+        for name in Self.signing + Self.notarization { env["HAVE_" + name] = names.contains(name) ? "true" : "false" }
+        return try Shell.runScript("release-check-signing.sh", env: env)
+    }
+
+    func testNoSecretsMeansAnAdHocBuild() throws {
+        let result = try decide(setting: [])
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "ad-hoc")
+    }
+
+    func testTheThreeCertificateSecretsMeanASignedBuild() throws {
+        let result = try decide(setting: Self.signing)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "signed")
+    }
+
+    func testAllSixSecretsMeanANotarizedBuild() throws {
+        let result = try decide(setting: Self.signing + Self.notarization)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "notarized")
+    }
+
+    func testAnyPartialCertificateSetFailsNamingWhatIsMissing() throws {
+        for count in 1...2 {
+            let result = try decide(setting: Array(Self.signing.prefix(count)))
+
+            XCTAssertNotEqual(result.status, 0, "\(count) of 3 certificate secrets must not pass")
+            XCTAssertNil(result.outputs["mode"], "a failed check leaves no mode for later steps")
+            XCTAssertTrue(result.output.contains(Self.signing[2]), result.output)
+        }
+    }
+
+    func testNotarizationSecretsWithoutTheCertificateFail() throws {
+        let result = try decide(setting: Self.notarization)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertNil(result.outputs["mode"])
+    }
+
+    func testACertificateWithOnlySomeNotarizationSecretsFails() throws {
+        let result = try decide(setting: Self.signing + ["APPLE_ID"])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertNil(result.outputs["mode"])
+        XCTAssertTrue(result.output.contains("APPLE_TEAM_ID"), result.output)
+    }
+}
+
 private enum Shell {
     struct Outcome {
         let status: Int32
