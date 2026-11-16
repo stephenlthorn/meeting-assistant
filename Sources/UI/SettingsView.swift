@@ -198,9 +198,6 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 480, height: 720)
         .task { await settings.refreshModels() }
-        .onChange(of: settings.apiKeySource) { _, _ in
-            Task { await settings.refreshModels(force: true) }
-        }
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { _ in
             runningApps = Self.runningBundleIDs()
         }

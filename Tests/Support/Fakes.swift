@@ -218,6 +218,15 @@ func silentBuffer() -> AVAudioPCMBuffer {
     return buffer
 }
 
+/// A model catalog whose requests never leave the process: they reach the stub, which
+/// refuses the connection unless a test installed a response.
+@MainActor
+func offlineModelCatalog(defaults: UserDefaults) -> ModelCatalog {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [StubURLProtocol.self]
+    return ModelCatalog(defaults: defaults, session: URLSession(configuration: configuration))
+}
+
 /// Settings over throwaway defaults and an in-memory Keychain.
 @MainActor
 func makeTestSettings(for testCase: XCTestCase,
@@ -228,7 +237,8 @@ func makeTestSettings(for testCase: XCTestCase,
     let defaults = UserDefaults(suiteName: suite)!
     testCase.addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
     let settings = AppSettings(defaults: defaults, secrets: secrets, environment: environment,
-                               anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"))
+                               anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"),
+                               modelCatalog: offlineModelCatalog(defaults: defaults))
     if acceptTerms { settings.acceptTerms() }
     return settings
 }

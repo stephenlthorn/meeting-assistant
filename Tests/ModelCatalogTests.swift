@@ -306,6 +306,41 @@ final class ModelCatalogTests: XCTestCase {
         XCTAssertFalse(ServerSideFallback.supports("claude-haiku-4-5"))
     }
 
+    // MARK: - Key replaced (F7)
+
+    func testReplacingTheKeyForcesOneModelListRefreshWithTheNewKey() async throws {
+        let log = RequestLog()
+        StubURLProtocol.respond = { request in
+            log.add(request)
+            return Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z")],
+                             hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings()
+        await settings.refreshModels(force: true)
+        XCTAssertEqual(log.requests.count, 1)
+
+        XCTAssertTrue(settings.setAPIKey("sk-replacement"))
+
+        await eventually(timeout: 2) { log.requests.count == 2 }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(log.requests.count, 2)
+        XCTAssertEqual(log.requests.last?.value(forHTTPHeaderField: "x-api-key"), "sk-replacement")
+    }
+
+    func testSavingAKeyBeforeTheTermsAreAcceptedFetchesNothing() async throws {
+        let log = RequestLog()
+        StubURLProtocol.respond = { request in
+            log.add(request)
+            return Self.page([], hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(acceptTerms: false)
+
+        XCTAssertTrue(settings.setAPIKey("sk-new"))
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertTrue(log.requests.isEmpty)
+    }
+
     // MARK: - Terms gate (F2)
 
     func testNoModelListIsFetchedBeforeTheTermsAreAccepted() async {

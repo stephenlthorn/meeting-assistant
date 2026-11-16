@@ -299,10 +299,22 @@ final class AppSettings: ObservableObject {
     // MARK: - Keys
 
     @discardableResult
-    func setAPIKey(_ key: String) -> Bool { save(key, account: Self.anthropicAccount) }
+    func setAPIKey(_ key: String) -> Bool {
+        let saved = save(key, account: Self.anthropicAccount)
+        if saved { refreshModelsForNewKey() }
+        return saved
+    }
 
     func removeAPIKey() {
         remove(account: Self.anthropicAccount)
+        refreshModelsForNewKey()
+    }
+
+    /// A different key may see a different model list, and the key source does not
+    /// change when one Keychain key replaces another, so the save itself asks again.
+    /// `refreshModels` still waits for the terms.
+    private func refreshModelsForNewKey() {
+        Task { await refreshModels(force: true) }
     }
 
     @discardableResult
