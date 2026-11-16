@@ -15,13 +15,15 @@ struct MenuState: Equatable {
     let canSummarize: Bool
     let canCopySummary: Bool
     let canClearTranscript: Bool
+    let checkForUpdatesTitle: String
+    let canCheckForUpdates: Bool
     /// The System Settings panes that would fix what the overlay lists as problems.
     let privacyFixes: [PrivacyPane]
     /// Lines under the actions: a shortcut that could not be registered, a missing API key.
     let notes: [String]
 
     @MainActor
-    init(controller: AssistantController, settings: AppSettings, hotKeyProblem: String?) {
+    init(controller: AssistantController, settings: AppSettings, hotKeyProblem: String?, isCheckingForUpdates: Bool = false) {
         let hasTranscript = !controller.transcriptDisplay.isEmpty
         statusLine = StatusLine.text(status: controller.status, listening: controller.listening, model: settings.model,
                                     displayName: settings.modelDisplayName)
@@ -39,6 +41,8 @@ struct MenuState: Equatable {
         canSummarize = hasTranscript && !controller.isSummarizing
         canCopySummary = !controller.summary.isEmpty
         canClearTranscript = hasTranscript || !controller.answer.isEmpty
+        checkForUpdatesTitle = isCheckingForUpdates ? "Checking for Updates…" : "Check for Updates…"
+        canCheckForUpdates = !isCheckingForUpdates
         privacyFixes = controller.problems.compactMap(\.fix).reduce(into: []) { fixes, pane in
             if !fixes.contains(pane) { fixes.append(pane) }
         }

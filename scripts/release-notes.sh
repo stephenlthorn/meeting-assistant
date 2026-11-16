@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Prints the GitHub release notes for the signing mode and notarization outcome that
-# were actually used, so users get the right launch instructions.
+# were actually used, so users get the right launch instructions and know what an
+# update will and will not ask of them.
 #
-# Usage: scripts/release-notes.sh <developer-id|ad-hoc> <true|false|empty>
+# Usage: scripts/release-notes.sh <ad-hoc|signed|notarized> <true|false|empty>
 #
 # The second argument is whether notarization succeeded (the workflow passes the
-# notarize step's output, which is empty when the step did not run).
+# notarize step's output, which is empty when the step did not run). Only a
+# notarized build may claim it.
 # shellcheck disable=SC2016  # the backticks are literal Markdown, not command substitution
 set -euo pipefail
 
-MODE="${1:?Usage: $0 <developer-id|ad-hoc> <notarized>}"
+MODE="${1:?Usage: $0 <ad-hoc|signed|notarized> <notarized>}"
 NOTARIZED="${2:-}"
 
 GATEKEEPER_STEPS='Download `MeetingAssistant.app.zip`, then before first launch:
@@ -21,15 +23,23 @@ open MeetingAssistant.app
 ```'
 
 case "$MODE:$NOTARIZED" in
-  developer-id:true)
-    echo 'Signed and notarized macOS build of Meeting Assistant. Unzip `MeetingAssistant.app.zip` and open the app.'
+  notarized:true)
+    echo 'Signed and notarized macOS build of Meeting Assistant. Unzip `MeetingAssistant.app.zip` and open the app. The signature stays the same across releases, so your permissions carry over when you update.'
     ;;
-  developer-id:*)
-    echo 'Developer ID signed macOS build of Meeting Assistant (not notarized).'
+  notarized:*)
+    echo "A notarized build must report that notarization succeeded" >&2
+    exit 1
+    ;;
+  signed:true)
+    echo "A signed-only build cannot be notarized" >&2
+    exit 1
+    ;;
+  signed:*)
+    echo 'Signed macOS build of Meeting Assistant (not notarized).'
     echo
     echo "$GATEKEEPER_STEPS"
     echo
-    echo 'macOS Gatekeeper warns about unnotarized apps on first launch. The Developer ID signature keeps the Screen Recording and Microphone permissions across updates.'
+    echo 'macOS Gatekeeper still asks once on first launch, because the app is not notarized. This build is signed with a certificate that stays the same from release to release, so macOS keeps your Screen Recording and Microphone permissions and the Keychain access to your API key when you update. If you are updating from an earlier ad-hoc release, macOS asks one last time.'
     ;;
   ad-hoc:true)
     echo "An ad-hoc signed build cannot be notarized" >&2

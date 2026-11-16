@@ -23,6 +23,12 @@ protocol SummaryPresenting: AnyObject {
     func show()
 }
 
+/// Shows what Check for Updates found, with its Download and Release page buttons.
+@MainActor
+protocol UpdatePresenting {
+    func show(_ result: UpdateCheckResult)
+}
+
 @MainActor
 protocol ClipboardWriting {
     func copy(_ text: String)
@@ -58,6 +64,9 @@ final class AppCoordinator {
     private let summary: SummaryPresenting
     private let dialogs: TranscriptDialogs
     private let clipboard: ClipboardWriting
+    private let updates: UpdateChecking
+    private let updateWindow: UpdatePresenting
+    private(set) var isCheckingForUpdates = false
     private var resumeAfterTerms: (() -> Void)?
     private var subscriptions: Set<AnyCancellable> = []
 
@@ -68,7 +77,9 @@ final class AppCoordinator {
          welcome: WelcomePresenting,
          summary: SummaryPresenting,
          dialogs: TranscriptDialogs,
-         clipboard: ClipboardWriting) {
+         clipboard: ClipboardWriting,
+         updates: UpdateChecking = UpdateChecker(),
+         updateWindow: UpdatePresenting = UpdateAlert()) {
         self.settings = settings
         self.controller = controller
         self.hotKeys = hotKeys
@@ -77,13 +88,16 @@ final class AppCoordinator {
         self.summary = summary
         self.dialogs = dialogs
         self.clipboard = clipboard
+        self.updates = updates
+        self.updateWindow = updateWindow
         welcome.onAgree = { [weak self] in self?.acceptTerms() }
         welcome.onTrySample = { [weak self] in self?.trySample() }
     }
 
     /// What the menu shows now. Read it inside a view body to have the view follow it.
     var menu: MenuState {
-        MenuState(controller: controller, settings: settings, hotKeyProblem: hotKeys.problem)
+        MenuState(controller: controller, settings: settings, hotKeyProblem: hotKeys.problem,
+                  isCheckingForUpdates: isCheckingForUpdates)
     }
 
     // MARK: - Launch and quit
@@ -193,6 +207,16 @@ final class AppCoordinator {
     func chooseTranscriptFolder() {
         guard let url = dialogs.chooseTranscriptFolder(startingAt: settings.transcriptFolder) else { return }
         settings.transcriptFolder = url
+    }
+
+    /// Check for Updates...: the one time the app contacts GitHub, and only because the user asked.
+    /// A second click while a check is running does nothing.
+    func checkForUpdates() async {
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        let result = await updates.check()
+        isCheckingForUpdates = false
+        updateWindow.show(result)
     }
 
     private func copy(_ text: String) {

@@ -1,8 +1,14 @@
 #!/bin/bash
-# Stores the Developer ID signing and notarization secrets that the release
-# workflow uses in the "release" environment of this project's GitHub repository.
+# Stores the signing secrets that the release workflow uses in the "release"
+# environment of this project's GitHub repository.
 #
-# Usage: scripts/setup-release-signing.sh [--repo OWNER/NAME] path/to/DeveloperID.p12
+# Usage: scripts/setup-release-signing.sh [--signed] [--repo OWNER/NAME] path/to/identity.p12
+#
+# By default it stores all six secrets (Developer ID signing plus notarization). With
+# --signed it stores only the three certificate secrets, for a signed build that is not
+# notarized: use it with the self-signed identity from scripts/make-self-signed-identity.sh
+# so every release keeps the same code identity and macOS keeps the app's permissions
+# across updates.
 #
 # The target repository comes from the origin remote of the checkout this script
 # lives in (not from the directory you run it in), or from --repo. It is shown and
@@ -12,17 +18,19 @@
 # keeps a build of another branch from reading them: a missing environment is created
 # limited to main, and an existing one is left exactly as configured.
 #
-# Export the .p12 from Keychain Access (My Certificates > "Developer ID
-# Application: ..." > Export). Create the app-specific password at
+# For the full setup, export the .p12 from Keychain Access (My Certificates >
+# "Developer ID Application: ..." > Export). Create the app-specific password at
 # appleid.apple.com under Sign-In and Security. Never commit the .p12.
 set -euo pipefail
 
-usage() { echo "Usage: $0 [--repo OWNER/NAME] path/to/DeveloperID.p12" >&2; exit 1; }
+usage() { echo "Usage: $0 [--signed] [--repo OWNER/NAME] path/to/identity.p12" >&2; exit 1; }
 
 REPO=""
 P12=""
+SIGNED_ONLY=false
 while [ $# -gt 0 ]; do
   case "$1" in
+    --signed) SIGNED_ONLY=true; shift ;;
     --repo) [ $# -ge 2 ] || usage; REPO="$2"; shift 2 ;;
     -*) usage ;;
     *) [ -z "$P12" ] || usage; P12="$1"; shift ;;
@@ -43,7 +51,13 @@ if [ -z "$REPO" ]; then
 fi
 printf '%s' "$REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { echo "--repo must look like OWNER/NAME" >&2; exit 1; }
 
+if [ "$SIGNED_ONLY" = true ]; then
+  KIND="the three certificate secrets (signed, not notarized)"
+else
+  KIND="all six signing and notarization secrets"
+fi
 echo "Target repository: $REPO (environment: release)"
+echo "Will write $KIND."
 read -rp "Write the signing secrets to $REPO? [y/N] " CONFIRM || CONFIRM=""
 case "$CONFIRM" in
   y|Y|yes|YES) ;;
@@ -73,20 +87,31 @@ else
 fi
 
 read -rsp "Password for $P12: " P12_PASSWORD; echo
-read -rp "Signing identity (e.g. Developer ID Application: Your Name (TEAMID)): " IDENTITY
-read -rp "Apple ID email (for notarization): " APPLE_ID
-read -rp "Team ID: " TEAM_ID
-read -rsp "App-specific password: " APP_PASSWORD; echo
+if [ "$SIGNED_ONLY" = true ]; then
+  read -rp "Signing identity (the name printed by make-self-signed-identity.sh): " IDENTITY
+else
+  read -rp "Signing identity (e.g. Developer ID Application: Your Name (TEAMID)): " IDENTITY
+  read -rp "Apple ID email (for notarization): " APPLE_ID
+  read -rp "Team ID: " TEAM_ID
+  read -rsp "App-specific password: " APP_PASSWORD; echo
+fi
 
 base64 -i "$P12" | gh secret set MACOS_CERTIFICATE_P12 --repo "$REPO" --env release
 printf '%s' "$P12_PASSWORD" | gh secret set MACOS_CERTIFICATE_PASSWORD --repo "$REPO" --env release
 printf '%s' "$IDENTITY" | gh secret set MACOS_SIGNING_IDENTITY --repo "$REPO" --env release
-printf '%s' "$APPLE_ID" | gh secret set APPLE_ID --repo "$REPO" --env release
-printf '%s' "$TEAM_ID" | gh secret set APPLE_TEAM_ID --repo "$REPO" --env release
-printf '%s' "$APP_PASSWORD" | gh secret set APPLE_APP_PASSWORD --repo "$REPO" --env release
+if [ "$SIGNED_ONLY" = false ]; then
+  printf '%s' "$APPLE_ID" | gh secret set APPLE_ID --repo "$REPO" --env release
+  printf '%s' "$TEAM_ID" | gh secret set APPLE_TEAM_ID --repo "$REPO" --env release
+  printf '%s' "$APP_PASSWORD" | gh secret set APPLE_APP_PASSWORD --repo "$REPO" --env release
+fi
 
+if [ "$SIGNED_ONLY" = true ]; then
+  RESULT="a signed (not notarized) release"
+else
+  RESULT="a signed, notarized release"
+fi
 if [ "$CREATED" = true ]; then
-  echo "Done. The release environment only accepts deployments from main. Bump VERSION on main to publish a signed, notarized release."
+  echo "Done. The release environment only accepts deployments from main. Bump VERSION on main to publish $RESULT."
 else
   echo "Done. The release environment already existed, so its protection rules were left as they are."
   echo "Next: in $REPO > Settings > Environments > release, check that deployment branches are limited to main."
