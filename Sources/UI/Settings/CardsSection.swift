@@ -96,7 +96,7 @@ struct CardsSection: View {
 }
 
 enum CardsText {
-    static let help = "When the other side says a trigger phrase, its card appears in the overlay at once, with no network and no model. Cards are stored on this Mac only and never sent anywhere. In a card folder, each .md file is one card: the first '# Heading' is the title, a line 'Triggers: a, b, c' lists the phrases, and the rest is the text. The folder is read again when listening starts and when this window opens."
+    static let help = "When the other side says a trigger phrase, its card appears in the overlay at once, with no network and no model. Cards are stored on this Mac only and never sent anywhere; their trigger phrases help on-device speech recognition only, never Deepgram or Apple's speech servers. In a card folder, each .md file is one card: the first '# Heading' is the title, a line 'Triggers: a, b, c' lists the phrases, and the rest is the text. The folder is read again when listening starts and when this window opens."
 }
 
 /// A card being edited, with its triggers as one comma-separated line.

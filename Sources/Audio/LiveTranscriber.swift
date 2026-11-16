@@ -81,17 +81,33 @@ enum TranscriberFactory {
     /// The locales SFSpeechRecognizer can transcribe. Tests replace it.
     @MainActor static var legacySupportedLocales: () -> [String] = SpeechLanguage.legacySupportedIdentifiers
 
+    /// The transcriber a listening session uses. Instant cards fire on recognized text,
+    /// so their trigger phrases join the vocabulary behind the user's own terms, but
+    /// only for recognition that runs on this Mac: card text never leaves it, so
+    /// Deepgram and Apple's speech servers never see a trigger. The triggers are the
+    /// ones frozen at Start, so edits during a call do not reach a restart.
+    @MainActor
+    static func makeForSession(settings: AppSettings) -> LiveTranscriber {
+        let triggers = settings.activeCardTriggers ?? settings.cards.triggerPhrases
+        return make(settings: settings, extraVocabulary: recognitionStaysOnTheMac(settings) ? triggers : [])
+    }
+
+    /// Whether the backend `make` would build recognizes speech without any network:
+    /// SpeechAnalyzer always, SFSpeechRecognizer only when the user has not allowed
+    /// Apple's servers (it may then use them whenever the Mac lacks the language).
+    @MainActor
+    private static func recognitionStaysOnTheMac(_ settings: AppSettings) -> Bool {
+        switch plan(for: settings) {
+        case .deepgram: return false
+        case .analyzer: return true
+        case .legacy(let allowServerRecognition): return !allowServerRecognition
+        }
+    }
+
     /// Builds the backend with the language and vocabulary the session was
     /// started with (`AppSettings.activeSpeechOptions`, else the saved choices).
     /// `extraVocabulary` is for features that bring their own terms; the user's
     /// own terms win the 100-phrase cap.
-    /// The transcriber a listening session uses: instant cards fire on recognized text,
-    /// so their trigger phrases join the vocabulary behind the user's own terms.
-    @MainActor
-    static func makeForSession(settings: AppSettings) -> LiveTranscriber {
-        make(settings: settings, extraVocabulary: settings.cards.triggerPhrases)
-    }
-
     @MainActor
     static func make(settings: AppSettings, extraVocabulary: [String] = []) -> LiveTranscriber {
         let options = settings.activeSpeechOptions ?? settings.speechOptions

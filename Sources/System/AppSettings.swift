@@ -116,6 +116,9 @@ final class AppSettings: ObservableObject {
     /// later change in Settings never reaches a call in progress (not even
     /// through a transcriber restart). Nil when not listening.
     @Published private(set) var activeSpeechOptions: SpeechOptions?
+    /// The active cards' trigger phrases as they stood at Start, frozen with the
+    /// speech options so a card edit mid-call never reaches a transcriber restart.
+    private(set) var activeCardTriggers: [String]?
 
     var apiKeyPresent: Bool { apiKeySource.map { $0 != .unreadable } ?? false }
     var hasAcceptedTerms: Bool { acceptedTermsVersion >= Self.termsVersion }
@@ -200,9 +203,15 @@ final class AppSettings: ObservableObject {
 
     var speechSessionActive: Bool { activeSpeechOptions != nil }
 
-    func freezeSpeechOptions() { activeSpeechOptions = speechOptions }
+    func freezeSpeechOptions() {
+        activeSpeechOptions = speechOptions
+        activeCardTriggers = cards.triggerPhrases
+    }
 
-    func releaseSpeechOptions() { activeSpeechOptions = nil }
+    func releaseSpeechOptions() {
+        activeSpeechOptions = nil
+        activeCardTriggers = nil
+    }
 
     /// The sentence that tells Claude which language to answer in, or nil.
     var answerLanguageSentence: String? {
