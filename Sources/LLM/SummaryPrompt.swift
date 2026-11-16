@@ -11,7 +11,8 @@ struct SummaryInput: Equatable {
     /// The start of the meeting is missing, because it was trimmed or cut for length.
     let isPartial: Bool
 
-    init(transcript: String, isPartial: Bool, maxCharacters: Int = SummaryInput.defaultMaxCharacters) {
+    init(transcript rawTranscript: String, isPartial: Bool, maxCharacters: Int = SummaryInput.defaultMaxCharacters) {
+        let transcript = Self.withoutCardLines(rawTranscript)
         guard transcript.count > maxCharacters else {
             self.transcript = transcript
             self.isPartial = isPartial
@@ -24,6 +25,14 @@ struct SummaryInput: Equatable {
             self.transcript = String(window.suffix(maxCharacters))
         }
         self.isPartial = true
+    }
+
+    /// Cards shown during the call are logged in the saved file but stay on this Mac.
+    private static func withoutCardLines(_ transcript: String) -> String {
+        guard transcript.contains(TranscriptMarkdown.cardLinePrefix) else { return transcript }
+        return transcript.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.hasPrefix(TranscriptMarkdown.cardLinePrefix) }
+            .joined(separator: "\n")
     }
 }
 

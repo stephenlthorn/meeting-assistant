@@ -6,11 +6,11 @@ import Foundation
 /// The summary was written by a model from untrusted call audio, so it is fenced
 /// in `<summary>` tags like the transcript is, and the system prompt calls it data.
 enum FollowUpPrompt {
-    static func system(profile: Profile, extraInstructions: String) -> String {
+    static func system(profile: Profile, extraInstructions: String, languageSentence: String? = nil) -> String {
         let extra = extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prompt = base + "\n\n" + profile.followUpFocus
-        guard !extra.isEmpty else { return prompt }
-        return prompt + "\n\nAdditional instructions from the user:\n" + extra
+        let focused = base + "\n\n" + profile.followUpFocus
+        let prompt = extra.isEmpty ? focused : focused + "\n\nAdditional instructions from the user:\n" + extra
+        return AnswerPrompt.system(prompt, languageSentence: languageSentence)
     }
 
     static func user(summary: String) -> String {

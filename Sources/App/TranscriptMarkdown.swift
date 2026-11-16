@@ -28,11 +28,15 @@ struct TranscriptMarkdown {
                         isFinal: true, isEcho: false, updatedAt: time)
     }
 
+    /// How a shown card is logged. Summarize Meeting reads the saved file and drops
+    /// these lines: a card is the user's own note, not something said on the call.
+    static let cardLinePrefix = "> Card shown: "
+
     /// One turn as a list item, so each stays on its own line when rendered.
     /// A card shown is a quote line instead, so it reads as a note, not speech.
     func line(for turn: Transcript.Turn) -> String {
         if turn.utterance == Self.cardUtterance {
-            return "> Card shown: " + turn.text.split(whereSeparator: \.isNewline).joined(separator: " ") + "\n"
+            return Self.cardLinePrefix + turn.text.split(whereSeparator: \.isNewline).joined(separator: " ") + "\n"
         }
         let t = parts(turn.startedAt)
         let clock = String(format: "%02d:%02d:%02d", t.hour, t.minute, t.second)

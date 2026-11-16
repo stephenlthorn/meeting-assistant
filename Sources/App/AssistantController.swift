@@ -1388,7 +1388,8 @@ final class AssistantController {
         isDraftingFollowUp = true
         let stream = answerer.stream(AnswerRequest(
             apiKey: apiKey, model: settings.model,
-            system: FollowUpPrompt.system(profile: settings.profile, extraInstructions: settings.extraInstructions),
+            system: FollowUpPrompt.system(profile: settings.profile, extraInstructions: settings.extraInstructions,
+                                          languageSentence: settings.answerLanguageSentence),
             user: FollowUpPrompt.user(summary: summary),
             supportsEffort: settings.modelSupportsEffort))
         followUpTask = Task { [weak self] in
