@@ -120,6 +120,9 @@ struct SettingsView: View {
                 }
             }
 
+            LanguageSection(settings: settings)
+            VocabularySection(settings: settings)
+
             Section("Extra instructions") {
                 TextEditor(text: $settings.extraInstructions)
                     .frame(minHeight: 70)

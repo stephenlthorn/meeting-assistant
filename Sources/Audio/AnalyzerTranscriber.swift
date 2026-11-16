@@ -47,6 +47,12 @@ final class AnalyzerTranscriber: LiveTranscriber {
     var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
+    /// The locale the user chose (nil for Automatic). Whether this Mac supports
+    /// it is decided when the pipeline is built, since that needs an async query.
+    let requestedLocaleIdentifier: String?
+    /// The custom vocabulary given to the analyzer as contextual strings.
+    let vocabulary: [String]
+
     private let makePipeline: AnalyzerPipelineFactory
     private let schedule: (TimeInterval, @escaping () -> Void) -> Void
     private let drainTimeout: TimeInterval
@@ -65,18 +71,23 @@ final class AnalyzerTranscriber: LiveTranscriber {
     private var converter: AVAudioConverter?
 
     init(makePipeline: @escaping AnalyzerPipelineFactory,
+         requestedLocaleIdentifier: String? = nil,
+         vocabulary: [String] = [],
          schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
          drainTimeout: TimeInterval = AnalyzerTranscriber.defaultDrainTimeout) {
+        self.requestedLocaleIdentifier = requestedLocaleIdentifier
+        self.vocabulary = vocabulary
         self.makePipeline = makePipeline
         self.schedule = schedule
         self.drainTimeout = drainTimeout
     }
 
     @available(macOS 26, *)
-    convenience init(localeIdentifier: String = "en-US") {
+    convenience init(localeIdentifier: String? = nil, vocabulary: [String] = []) {
         self.init(makePipeline: { onProgress in
-            try await SpeechAnalyzerPipeline.make(localeIdentifier: localeIdentifier, onProgress: onProgress)
-        })
+            try await SpeechAnalyzerPipeline.make(localeIdentifier: localeIdentifier, vocabulary: vocabulary,
+                                                  onProgress: onProgress)
+        }, requestedLocaleIdentifier: localeIdentifier, vocabulary: vocabulary)
     }
 
     /// SpeechAnalyzer runs fully on-device and does not use the Speech Recognition
@@ -145,6 +156,13 @@ final class AnalyzerTranscriber: LiveTranscriber {
         } catch {
             notify(nil)
             guard isCurrent(run) else { return }
+            if case AnalyzerSetupError.modelDownloadFailed = error {
+                // Retried with backoff, but said at once: waiting for the third
+                // failure would leave the user with no transcript and no reason.
+                report(error.localizedDescription)
+                failed(error.localizedDescription, retryable: true, run: run, alreadyReported: true)
+                return
+            }
             failed("SpeechAnalyzer setup failed: \(error.localizedDescription)",
                    retryable: !(error is AnalyzerSetupError), run: run)
             return
@@ -175,7 +193,7 @@ final class AnalyzerTranscriber: LiveTranscriber {
         }
     }
 
-    private func failed(_ message: String, retryable: Bool, run: Int) {
+    private func failed(_ message: String, retryable: Bool, run: Int, alreadyReported: Bool = false) {
         let count = lock.withLock { () -> Int in
             failures += 1
             return failures
@@ -184,7 +202,7 @@ final class AnalyzerTranscriber: LiveTranscriber {
             fatal(message)
             return
         }
-        if count == Self.failuresBeforeReporting { report(message) }
+        if count == Self.failuresBeforeReporting && !alreadyReported { report(message) }
         let delay = min(Self.maximumBackoff, pow(2, Double(count - 1)))
         schedule(delay) { [weak self] in
             guard let self, self.isCurrent(run) else { return }
@@ -266,11 +284,15 @@ final class AnalyzerTranscriber: LiveTranscriber {
 
 enum AnalyzerSetupError: LocalizedError {
     case unsupportedLocale, noAudioFormat
+    case modelDownloadFailed(language: String, reason: String)
 
     var errorDescription: String? {
         switch self {
         case .unsupportedLocale: "SpeechAnalyzer has no model for this language."
         case .noAudioFormat: "No compatible audio format for SpeechAnalyzer."
+        case .modelDownloadFailed(let language, let reason):
+            "Couldn't download the on-device speech model for \(language): \(reason) "
+                + "Connect to the internet and start listening again, or pick another language in Settings."
         }
     }
 }
@@ -297,27 +319,55 @@ final class SpeechAnalyzerPipeline: AnalyzerPipeline {
         self.input = input
     }
 
-    static func make(localeIdentifier: String,
+    /// Contextual strings for the analyzer. Apple documents `.general` contextual
+    /// strings for `DictationTranscriber`; this app uses `SpeechTranscriber`, and
+    /// whether that module honours them is unverified, so setting them is a
+    /// harmless best effort until a real-audio check says otherwise.
+    static func analysisContext(vocabulary: [String]) -> AnalysisContext? {
+        guard !vocabulary.isEmpty else { return nil }
+        let context = AnalysisContext()
+        context.contextualStrings[.general] = vocabulary
+        return context
+    }
+
+    static func make(localeIdentifier: String?,
+                     vocabulary: [String] = [],
                      onProgress: @escaping (String?) -> Void) async throws -> AnalyzerPipeline {
-        let wanted = Locale(identifier: localeIdentifier).identifier(.bcp47)
         let supported = await SpeechTranscriber.supportedLocales
-        guard let locale = supported.first(where: { $0.identifier(.bcp47) == wanted })
-                ?? supported.first(where: { $0.identifier(.bcp47).hasPrefix("en") }) else {
+        let resolution = SpeechLanguage.resolve(saved: localeIdentifier,
+                                                supported: supported.map(\.identifier))
+        guard let locale = supported.first(where: { SpeechLanguage.canonical($0.identifier) == resolution.identifier }) else {
             throw AnalyzerSetupError.unsupportedLocale
         }
+        // The fallback notice stays up while the session runs; a download notice
+        // replaces it and then gives it back.
+        let languageNotice = resolution.notice
+        if let languageNotice { onProgress(languageNotice) }
 
         let transcriber = SpeechTranscriber(locale: locale,
                                             transcriptionOptions: [],
                                             reportingOptions: [.volatileResults],
                                             attributeOptions: [])
         if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
-            onProgress("Downloading the on-device speech model…")
-            defer { onProgress(nil) }
-            try await request.downloadAndInstall()
+            let name = SpeechLanguage.displayName(resolution.identifier)
+            onProgress("Downloading the on-device speech model for \(name)…")
+            do {
+                try await request.downloadAndInstall()
+            } catch is CancellationError {
+                onProgress(nil)
+                throw CancellationError()
+            } catch {
+                onProgress(nil)
+                throw AnalyzerSetupError.modelDownloadFailed(language: name, reason: error.localizedDescription)
+            }
+            onProgress(languageNotice)
         }
         try Task.checkCancellation()
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
+        if let context = analysisContext(vocabulary: vocabulary) {
+            try await analyzer.setContext(context)
+        }
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
             throw AnalyzerSetupError.noAudioFormat
         }

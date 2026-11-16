@@ -33,10 +33,10 @@ struct SummaryInput: Equatable {
 /// answer it carries the whole call, not recent excerpts, which is why the
 /// welcome screen says so.
 enum SummaryPrompt {
-    static func system(extraInstructions: String) -> String {
+    static func system(extraInstructions: String, languageSentence: String? = nil) -> String {
         let extra = extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !extra.isEmpty else { return base }
-        return base + "\n\nAdditional instructions from the user:\n" + extra
+        let prompt = extra.isEmpty ? base : base + "\n\nAdditional instructions from the user:\n" + extra
+        return AnswerPrompt.system(prompt, languageSentence: languageSentence)
     }
 
     static func user(_ input: SummaryInput) -> String {
