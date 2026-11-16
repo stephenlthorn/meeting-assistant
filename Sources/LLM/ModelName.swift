@@ -8,12 +8,24 @@ enum ModelName {
     static func short(_ id: String) -> String {
         let prefix = "claude-"
         guard id.hasPrefix(prefix) else { return id }
-        var parts = id.dropFirst(prefix.count).split(separator: "-").map(String.init)
-        if let last = parts.last, isSnapshotDate(last) { parts.removeLast() }
+        var parts = alias(id).dropFirst(prefix.count).split(separator: "-").map(String.init)
         guard let family = parts.first, !family.isEmpty, family.allSatisfy(\.isLetter) else { return id }
         let version = parts.dropFirst()
         guard !version.isEmpty, version.allSatisfy(isVersionNumber) else { return id }
         return family.capitalized + " " + version.joined(separator: ".")
+    }
+
+    /// The id without its trailing `-YYYYMMDD` snapshot date: the Models API lists
+    /// older models by dated id ("claude-haiku-4-5-20251001") while people, and
+    /// this app's saved settings, use the alias ("claude-haiku-4-5").
+    static func alias(_ id: String) -> String {
+        guard let dash = id.lastIndex(of: "-"), isSnapshotDate(String(id[id.index(after: dash)...])) else { return id }
+        return String(id[..<dash])
+    }
+
+    /// Whether two ids name the same model: equal, or equal once the dates are dropped.
+    static func sameModel(_ a: String, _ b: String) -> Bool {
+        a == b || alias(a) == alias(b)
     }
 
     /// "Claude Haiku 5.5" as "Haiku 5.5", for the status line.

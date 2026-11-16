@@ -59,13 +59,19 @@ final class ModelCatalog {
         }
     }
 
+    /// The entry for a saved id: the exact id first, else the same model under its
+    /// alias or dated id, since the API lists older models by dated id.
+    func entry(for id: String) -> ModelInfo? {
+        models.first(where: { $0.id == id }) ?? models.first(where: { ModelName.sameModel($0.id, id) })
+    }
+
     func displayName(for id: String) -> String? {
-        models.first(where: { $0.id == id })?.displayName
+        entry(for: id)?.displayName
     }
 
     /// Whether `effort: low` is safe to send, or nil when the model is not in the list.
     func supportsEffort(_ id: String) -> Bool? {
-        models.first(where: { $0.id == id })?.acceptsLowEffort
+        entry(for: id)?.acceptsLowEffort
     }
 
     /// Asks the API for the list unless it did within the last hour (`force` skips
@@ -156,7 +162,7 @@ enum ServerSideFallback {
         "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5-2",
     ]
 
-    static func supports(_ model: String) -> Bool { models.contains(model) }
+    static func supports(_ model: String) -> Bool { models.contains(ModelName.alias(model)) }
 }
 
 /// Whether to send `effort: low` when the catalog has no capability for the model.

@@ -228,7 +228,11 @@ final class AppSettings: ObservableObject {
     /// when the list does not have it (offline, or a model the user chose earlier),
     /// so the picker never shows a selection it cannot display.
     var modelOptions: [ModelOption] {
-        var options = catalog.models.map { ModelOption(id: $0.id, name: $0.displayName) }
+        var options = catalog.models.map { info in
+            // The saved alias and the API's dated id are one model: one row, tagged with the saved value.
+            let isSavedModel = info.id == model || (catalog.entry(for: model)?.id == info.id)
+            return ModelOption(id: isSavedModel ? model : info.id, name: info.displayName)
+        }
         if !options.contains(where: { $0.id == model }) { options.append(ModelOption(id: model, name: ModelName.short(model))) }
         return options
     }
@@ -251,11 +255,11 @@ final class AppSettings: ObservableObject {
     }
 
     private func reconcileModelWithCatalog() {
-        guard catalog.isFromAPI, !catalog.models.contains(where: { $0.id == model }) else {
+        guard catalog.isFromAPI, catalog.entry(for: model) == nil else {
             modelNotice = nil
             return
         }
-        let replacement = catalog.models.contains(where: { $0.id == Self.defaultModel })
+        let replacement = catalog.entry(for: Self.defaultModel) != nil
             ? Self.defaultModel : (catalog.models.first?.id ?? Self.defaultModel)
         let name = catalog.displayName(for: replacement) ?? ModelName.short(replacement)
         modelNotice = "\(model) is no longer offered by Anthropic, so Meeting Assistant switched to \(name)."

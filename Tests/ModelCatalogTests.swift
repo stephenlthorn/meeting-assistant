@@ -246,6 +246,66 @@ final class ModelCatalogTests: XCTestCase {
         XCTAssertTrue(log.requests.isEmpty)
     }
 
+    // MARK: - Dated ids (F3)
+
+    func testASavedAliasIsKeptWhenTheCatalogListsItsDatedId() async {
+        let defaults = freshDefaults()
+        defaults.set("claude-haiku-4-5", forKey: "model")
+        StubURLProtocol.respond = { request in
+            Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z"),
+                       Self.item("claude-haiku-4-5-20251001", name: "Claude Haiku 4.5",
+                                 created: "2025-10-01T00:00:00Z", effort: false)],
+                      hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(defaults: defaults)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(settings.model, "claude-haiku-4-5")
+        XCTAssertNil(settings.modelNotice)
+        XCTAssertEqual(settings.modelDisplayName, "Claude Haiku 4.5")
+        XCTAssertEqual(settings.modelSupportsEffort, false)
+    }
+
+    func testThePickerShowsOneRowPerModelWhenTheSavedAliasIsTheListedDatedId() async {
+        let defaults = freshDefaults()
+        defaults.set("claude-haiku-4-5", forKey: "model")
+        StubURLProtocol.respond = { request in
+            Self.page([Self.item("claude-haiku-5-5", name: "Claude Haiku 5.5", created: "2026-08-01T00:00:00Z"),
+                       Self.item("claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", created: "2025-10-01T00:00:00Z")],
+                      hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(defaults: defaults)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(settings.modelOptions.map(\.id), ["claude-haiku-5-5", "claude-haiku-4-5"])
+        XCTAssertEqual(settings.modelOptions.map(\.name), ["Claude Haiku 5.5", "Claude Haiku 4.5"])
+    }
+
+    func testAModelThatIsInNeitherFormIsStillReplacedWithTheNotice() async {
+        let defaults = freshDefaults()
+        defaults.set("claude-sonnet-4-5", forKey: "model")
+        StubURLProtocol.respond = { request in
+            Self.page([Self.item("claude-haiku-5-5", created: "2026-08-01T00:00:00Z"),
+                       Self.item("claude-haiku-4-5-20251001", created: "2025-10-01T00:00:00Z")],
+                      hasMore: false, lastID: "x", for: request)
+        }
+        let settings = makeSettings(defaults: defaults)
+
+        await settings.refreshModels(force: true)
+
+        XCTAssertEqual(settings.model, "claude-haiku-5-5")
+        XCTAssertTrue(settings.modelNotice?.contains("claude-sonnet-4-5") ?? false, settings.modelNotice ?? "nil")
+    }
+
+    func testTheFallbackSetMatchesDatedIdsOfItsModels() {
+        XCTAssertTrue(ServerSideFallback.supports("claude-sonnet-5-5-20261101"))
+        XCTAssertTrue(ServerSideFallback.supports("claude-opus-5-5"))
+        XCTAssertFalse(ServerSideFallback.supports("claude-haiku-5-5-20261101"))
+        XCTAssertFalse(ServerSideFallback.supports("claude-haiku-4-5"))
+    }
+
     // MARK: - Terms gate (F2)
 
     func testNoModelListIsFetchedBeforeTheTermsAreAccepted() async {
