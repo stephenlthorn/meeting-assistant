@@ -78,16 +78,30 @@ enum TranscriberFactory {
         return analyzerAvailable ? .analyzer : .legacy(allowServerRecognition: settings.serverSpeechAccepted)
     }
 
+    /// The locales SFSpeechRecognizer can transcribe. Tests replace it.
+    @MainActor static var legacySupportedLocales: () -> [String] = SpeechLanguage.legacySupportedIdentifiers
+
+    /// Builds the backend with the language and vocabulary the session was
+    /// started with (`AppSettings.activeSpeechOptions`, else the saved choices).
+    /// `extraVocabulary` is for features that bring their own terms; the user's
+    /// own terms win the 100-phrase cap.
     @MainActor
-    static func make(settings: AppSettings, localeIdentifier: String = "en-US") -> LiveTranscriber {
+    static func make(settings: AppSettings, extraVocabulary: [String] = []) -> LiveTranscriber {
+        let options = settings.activeSpeechOptions ?? settings.speechOptions
+        let vocabulary = Vocabulary.effective(user: options.vocabulary, extra: extraVocabulary)
         if settings.sendsAudioToDeepgram, let key = settings.resolveDeepgramKey() {
-            return CloudTranscriber(apiKey: key, localeIdentifier: localeIdentifier)
+            return CloudTranscriber(apiKey: key,
+                                    localeIdentifier: SpeechLanguage.deepgramIdentifier(saved: options.localeIdentifier),
+                                    vocabulary: vocabulary)
         }
         // Past this point Deepgram is out, including when its key could not be read.
         if analyzerAvailable, #available(macOS 26, *) {
-            return AnalyzerTranscriber(localeIdentifier: localeIdentifier)
+            return AnalyzerTranscriber(localeIdentifier: options.localeIdentifier, vocabulary: vocabulary)
         }
-        return LegacySpeechTranscriber(localeIdentifier: localeIdentifier,
+        let resolution = SpeechLanguage.resolve(saved: options.localeIdentifier, supported: legacySupportedLocales())
+        return LegacySpeechTranscriber(localeIdentifier: resolution.identifier,
+                                       vocabulary: vocabulary,
+                                       languageNotice: resolution.notice,
                                        allowServerRecognition: settings.serverSpeechAccepted)
     }
 }

@@ -310,6 +310,7 @@ final class AssistantController {
         session += 1
         tearDown()
         listening = .idle
+        settings.releaseSpeechOptions()
         status = endStatus
         questions.clear()
         flushArchive()
@@ -1150,7 +1151,8 @@ final class AssistantController {
         } else if let apiKey = settings.resolveAPIKey() {
             // The sample is not the user's call, so their own instructions stay out of it.
             stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: inSample ? settings.profile.systemPrompt : settings.systemPrompt,
+                                                   system: AnswerPrompt.system(inSample ? settings.profile.systemPrompt : settings.systemPrompt,
+                                                                       languageSentence: inSample ? nil : settings.answerLanguageSentence),
                                                    user: Self.userPrompt(context)))
         } else if inSample {
             stream = nextSampleAnswer()
@@ -1277,7 +1279,8 @@ final class AssistantController {
         summary = ""
         isSummarizing = true
         let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions),
+                                                   system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions,
+                                                                           languageSentence: inSample ? nil : settings.answerLanguageSentence),
                                                    user: SummaryPrompt.user(input)))
         summaryTask = Task { [weak self] in
             do {
@@ -1419,6 +1422,7 @@ final class AssistantController {
     /// mid-call, and remembers which backend this session is about to use.
     private func beginPrivacySession() {
         settings.loadKeysForListening()
+        settings.freezeSpeechOptions()
         activePlan = TranscriberFactory.plan(for: settings)
         observeSettings()
     }

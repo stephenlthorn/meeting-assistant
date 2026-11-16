@@ -65,6 +65,17 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 - On-device STT: SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14-15. If a
   14-15 Mac can't transcribe your language on-device, nothing is transcribed
   unless you separately allow Apple's speech servers in Settings.
+- **Call language.** Pick the language calls are transcribed in (Settings, Language);
+  it defaults to your Mac's language when supported, otherwise English (US). A language
+  whose on-device model isn't installed is downloaded when you next start listening,
+  and the overlay says so (or says why it couldn't). "Answer in" sets the language of
+  answers and summaries; the default follows the call. Changes apply at the next Start.
+  Deepgram is told the language only for the languages it documents for its nova-3
+  model; for any other it assumes English, and Settings says so.
+- **Custom vocabulary.** One phrase per line (up to 100, one or two words each work
+  best) of names, products and jargon for the recognizer to favour, used by every
+  backend. With Deepgram on, the phrases are sent to Deepgram with the audio. Whether
+  macOS 26's SpeechAnalyzer honours them for its `SpeechTranscriber` is unverified.
 - Optional **Deepgram** cloud STT for the hardest audio, off until you confirm
   sending it audio. It keeps the stream alive through silences and reconnects if
   the connection drops.
@@ -241,6 +252,8 @@ Meeting and saved transcripts. The full policy is in [PRIVACY.md](PRIVACY.md).
 | `Sources/Audio/AnalyzerTranscriber.swift` | macOS 26+ SpeechAnalyzer backend |
 | `Sources/Audio/LegacySpeechTranscriber.swift` | macOS 14-15 SFSpeechRecognizer backend |
 | `Sources/Audio/CloudTranscriber.swift` | Optional Deepgram cloud STT (WebSocket) |
+| `Sources/Audio/SpeechLanguage.swift` | Call-language choice, fallback, Deepgram language mapping, answer-language sentence |
+| `Sources/Transcript/Vocabulary.swift` | Custom vocabulary: normalising, the 100-phrase cap, merging extra terms |
 | `Sources/Transcript/Transcript.swift` | Merged, speaker-labeled transcript, bounded for long calls |
 | `Sources/Transcript/QuestionDetector.swift` / `EchoDetector.swift` | Auto-answer trigger / echo suppression |
 | `Sources/Transcript/QuestionQueue.swift` | Keeps the newest question that arrives while an answer is streaming |

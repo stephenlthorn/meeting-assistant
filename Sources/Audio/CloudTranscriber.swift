@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import os
 
 /// A WebSocket connection, so tests can play the server.
 protocol WebSocketConnection: AnyObject {
@@ -41,8 +42,16 @@ final class CloudTranscriber: LiveTranscriber {
     var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
+    /// The longest connection URL: keyterms are query items, and a very long
+    /// list would make the request too big for the server to accept.
+    static let maximumURLLength = 2000
+
+    /// The language this connection was built for.
+    let localeIdentifier: String
+    /// The custom vocabulary, sent as one `keyterm` query item per phrase.
+    let vocabulary: [String]
+
     private let apiKey: String
-    private let localeIdentifier: String
     private let drainTimeout: TimeInterval
     private let connect: (URLRequest) -> WebSocketConnection
     private let queue: DispatchQueue
@@ -71,7 +80,8 @@ final class CloudTranscriber: LiveTranscriber {
     private var converter: AVAudioConverter?
 
     init(apiKey: String,
-         localeIdentifier: String = "en-US",
+         localeIdentifier: String = SpeechLanguage.fallbackIdentifier,
+         vocabulary: [String] = [],
          connect: @escaping (URLRequest) -> WebSocketConnection = URLSessionWebSocketConnection.connect,
          queue: DispatchQueue = DispatchQueue(label: "meetingassistant.deepgram"),
          now: @escaping () -> Date = Date.init,
@@ -79,6 +89,7 @@ final class CloudTranscriber: LiveTranscriber {
          drainTimeout: TimeInterval = CloudTranscriber.defaultDrainTimeout) {
         self.apiKey = apiKey
         self.localeIdentifier = localeIdentifier
+        self.vocabulary = vocabulary
         self.drainTimeout = drainTimeout
         self.connect = connect
         self.queue = queue
@@ -104,6 +115,7 @@ final class CloudTranscriber: LiveTranscriber {
             sessionEpoch = epoch
             running = true
             failures = 0
+            if let languageNotice { notify(languageNotice) }
             openConnection()
             scheduleKeepAlive()
         }
@@ -135,7 +147,7 @@ final class CloudTranscriber: LiveTranscriber {
             draining = false
             if reconnecting {
                 reconnecting = false
-                notify(nil)
+                notify(languageNotice)
             }
             finishOpenUtterance()
             connection?.close()
@@ -187,7 +199,7 @@ final class CloudTranscriber: LiveTranscriber {
                 failures = 0
                 if reconnecting {
                     reconnecting = false
-                    notify(nil)
+                    notify(languageNotice)
                 }
             }
             handle(message)
@@ -254,7 +266,7 @@ final class CloudTranscriber: LiveTranscriber {
         running = false
         if reconnecting {
             reconnecting = false
-            notify(nil)
+            notify(languageNotice)
         }
         fatal(message)
     }
@@ -279,23 +291,64 @@ final class CloudTranscriber: LiveTranscriber {
         scheduleKeepAlive()
     }
 
+    /// Deepgram cannot be told about this language, so it will assume English.
+    /// Stays on screen for the whole session, since the cost is wrong words.
+    private var languageNotice: String? {
+        guard SpeechLanguage.deepgramLanguage(for: localeIdentifier) == nil else { return nil }
+        return "Deepgram has no setting for \(SpeechLanguage.displayName(localeIdentifier)), so it will assume English. "
+            + "Turn off Deepgram in Settings to use on-device speech instead."
+    }
+
     private func makeRequest() -> URLRequest {
-        var components = URLComponents(string: "wss://api.deepgram.com/v1/listen")!
-        components.queryItems = [
-            URLQueryItem(name: "model", value: "nova-3"),
-            URLQueryItem(name: "encoding", value: "linear16"),
-            URLQueryItem(name: "sample_rate", value: "16000"),
-            URLQueryItem(name: "channels", value: "1"),
-            URLQueryItem(name: "interim_results", value: "true"),
-            URLQueryItem(name: "smart_format", value: "true"),
-            URLQueryItem(name: "punctuate", value: "true"),
-            URLQueryItem(name: "utterance_end_ms", value: "1000"),
-            URLQueryItem(name: "language", value: localeIdentifier),
-        ]
-        var request = URLRequest(url: components.url!)
+        let built = Self.listenURL(localeIdentifier: localeIdentifier, vocabulary: vocabulary)
+        if built.droppedKeyterms > 0 {
+            Self.log.notice("Vocabulary too long for the Deepgram URL: dropped \(built.droppedKeyterms) of \(self.vocabulary.count) phrases")
+        }
+        var request = URLRequest(url: built.url)
         request.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
         return request
     }
+
+    private static let log = Logger(subsystem: AppSettings.bundleID, category: "speech")
+
+    /// The streaming URL. `language` is sent only for a language Deepgram's
+    /// nova-3 is known to take; otherwise its default applies. Keyterms are
+    /// added in order while the URL stays within `maximumURLLength`, and the
+    /// count of those that did not fit is returned so the caller can log it.
+    static func listenURL(localeIdentifier: String, vocabulary: [String]) -> (url: URL, droppedKeyterms: Int) {
+        var items = [
+            "model=nova-3",
+            "encoding=linear16",
+            "sample_rate=16000",
+            "channels=1",
+            "interim_results=true",
+            "smart_format=true",
+            "punctuate=true",
+            "utterance_end_ms=1000",
+        ]
+        if let language = SpeechLanguage.deepgramLanguage(for: localeIdentifier) {
+            items.append("language=\(encode(language))")
+        }
+        let base = "wss://api.deepgram.com/v1/listen"
+        var length = base.count + 1 + items.joined(separator: "&").count
+        var kept = 0
+        for phrase in vocabulary {
+            let item = "keyterm=\(encode(phrase))"
+            guard length + 1 + item.count <= maximumURLLength else { break }
+            items.append(item)
+            length += 1 + item.count
+            kept += 1
+        }
+        return (URL(string: base + "?" + items.joined(separator: "&"))!, vocabulary.count - kept)
+    }
+
+    /// Percent-encodes everything but unreserved characters: `+` and `&` inside
+    /// a phrase must not be read as separators or spaces.
+    private static func encode(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
+    }
+
+    private static let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
     // MARK: - Results
 

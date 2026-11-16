@@ -91,6 +91,24 @@ final class AppSettings: ObservableObject {
     @Published var cardsMatchYou: Bool { didSet { defaults.set(cardsMatchYou, forKey: "cards.matchYou") } }
     /// A folder of `.md` files read as more cards; nil when none is chosen.
     @Published var cardsFolder: URL? { didSet { defaults.set(cardsFolder?.path, forKey: "cards.folder") } }
+    // MARK: - v0.4 speech
+    /// The language calls are transcribed in, as a locale identifier; nil is
+    /// Automatic (the current locale when supported, else English). Read when
+    /// listening starts, so a change applies at the next Start.
+    @Published var speechLocaleIdentifier: String? {
+        didSet { Self.store(speechLocaleIdentifier, in: defaults, forKey: "speech.locale") }
+    }
+    /// The language answers and summaries are written in, as a language code; nil
+    /// is "Same as the call language".
+    @Published var answerLanguage: String? {
+        didSet { Self.store(answerLanguage, in: defaults, forKey: "speech.answerLanguage") }
+    }
+    /// The vocabulary as typed: one phrase per line. `vocabulary` is the cleaned list.
+    @Published var vocabularyText: String { didSet { defaults.set(vocabularyText, forKey: "speech.vocabulary") } }
+    /// What the running listening session was started with, frozen at Start so a
+    /// later change in Settings never reaches a call in progress (not even
+    /// through a transcriber restart). Nil when not listening.
+    @Published private(set) var activeSpeechOptions: SpeechOptions?
 
     var apiKeyPresent: Bool { apiKeySource.map { $0 != .unreadable } ?? false }
     var hasAcceptedTerms: Bool { acceptedTermsVersion >= Self.termsVersion }
@@ -152,6 +170,10 @@ final class AppSettings: ObservableObject {
         cardsMatchYou = defaults.bool(forKey: "cards.matchYou")
         cardsFolder = defaults.string(forKey: "cards.folder").flatMap { $0.isEmpty ? nil : $0 }
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        // MARK: - v0.4 speech
+        speechLocaleIdentifier = defaults.string(forKey: "speech.locale").flatMap { $0.isEmpty ? nil : $0 }
+        answerLanguage = defaults.string(forKey: "speech.answerLanguage").flatMap { $0.isEmpty ? nil : $0 }
+        vocabularyText = defaults.string(forKey: "speech.vocabulary") ?? ""
         refreshKeySources()
     }
 
@@ -160,6 +182,26 @@ final class AppSettings: ObservableObject {
         let extra = extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !extra.isEmpty else { return profile.systemPrompt }
         return profile.systemPrompt + "\n\nAdditional instructions from the user:\n" + extra
+    }
+
+    // MARK: - v0.4 speech
+    var vocabulary: [String] { Vocabulary.normalize(vocabularyText) }
+
+    var speechOptions: SpeechOptions { SpeechOptions(localeIdentifier: speechLocaleIdentifier, vocabulary: vocabulary) }
+
+    var speechSessionActive: Bool { activeSpeechOptions != nil }
+
+    func freezeSpeechOptions() { activeSpeechOptions = speechOptions }
+
+    func releaseSpeechOptions() { activeSpeechOptions = nil }
+
+    /// The sentence that tells Claude which language to answer in, or nil.
+    var answerLanguageSentence: String? {
+        SpeechLanguage.answerSentence(answerLanguage: answerLanguage, callLocale: speechLocaleIdentifier)
+    }
+
+    private static func store(_ value: String?, in defaults: UserDefaults, forKey key: String) {
+        if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
     }
 
     // MARK: - Consent
@@ -312,4 +354,11 @@ final class AppSettings: ObservableObject {
         }
         return trimmed
     }
+}
+
+/// What a listening session needs from the speech settings, as saved: the
+/// locale the user chose (nil for Automatic) and the cleaned vocabulary.
+struct SpeechOptions: Equatable {
+    var localeIdentifier: String?
+    var vocabulary: [String]
 }
