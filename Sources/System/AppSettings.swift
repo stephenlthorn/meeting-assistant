@@ -51,7 +51,14 @@ final class AppSettings: ObservableObject {
     /// `cloudAudioAccepted`, which is the user's consent and is never copied.
     private static let preferenceKeys = ["model", "profile", "extraInstructions", "autoAnswer"]
 
-    let availableModels = ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5"]
+    // MARK: - v0.4 llm
+    /// What a new install starts on. Someone who already chose a model keeps it.
+    static let defaultModel = "claude-haiku-5-5"
+
+    /// Where the model list comes from (Models API, cached, with a built-in fallback).
+    let catalog: ModelCatalog
+    /// Said in Settings when a fetched list no longer has the saved model and the default took its place.
+    @Published private(set) var modelNotice: String?
 
     @Published var model: String { didSet { defaults.set(model, forKey: "model") } }
     @Published var profile: Profile { didSet { defaults.set(profile.rawValue, forKey: "profile") } }
@@ -84,6 +91,35 @@ final class AppSettings: ObservableObject {
     @Published private(set) var apiKeySource: KeySource?
     @Published private(set) var deepgramKeySource: KeySource?
 
+    // MARK: - v0.4 cards
+    /// The user's instant cards, kept on this Mac only.
+    let cards: CardStore
+    /// Off until the user turns it on: "You" lines can also fire a card.
+    @Published var cardsMatchYou: Bool { didSet { defaults.set(cardsMatchYou, forKey: "cards.matchYou") } }
+    /// A folder of `.md` files read as more cards; nil when none is chosen.
+    @Published var cardsFolder: URL? { didSet { defaults.set(cardsFolder?.path, forKey: "cards.folder") } }
+    // MARK: - v0.4 speech
+    /// The language calls are transcribed in, as a locale identifier; nil is
+    /// Automatic (the current locale when supported, else English). Read when
+    /// listening starts, so a change applies at the next Start.
+    @Published var speechLocaleIdentifier: String? {
+        didSet { Self.store(speechLocaleIdentifier, in: defaults, forKey: "speech.locale") }
+    }
+    /// The language answers and summaries are written in, as a language code; nil
+    /// is "Same as the call language".
+    @Published var answerLanguage: String? {
+        didSet { Self.store(answerLanguage, in: defaults, forKey: "speech.answerLanguage") }
+    }
+    /// The vocabulary as typed: one phrase per line. `vocabulary` is the cleaned list.
+    @Published var vocabularyText: String { didSet { defaults.set(vocabularyText, forKey: "speech.vocabulary") } }
+    /// What the running listening session was started with, frozen at Start so a
+    /// later change in Settings never reaches a call in progress (not even
+    /// through a transcriber restart). Nil when not listening.
+    @Published private(set) var activeSpeechOptions: SpeechOptions?
+    /// The active cards' trigger phrases as they stood at Start, frozen with the
+    /// speech options so a card edit mid-call never reaches a transcriber restart.
+    private(set) var activeCardTriggers: [String]?
+
     var apiKeyPresent: Bool { apiKeySource.map { $0 != .unreadable } ?? false }
     var hasAcceptedTerms: Bool { acceptedTermsVersion >= Self.termsVersion }
 
@@ -114,13 +150,13 @@ final class AppSettings: ObservableObject {
     private var unreadableAccounts: Set<String> = []
 
     init(defaults: UserDefaults, secrets: SecretStore, environment: [String: String], anthropicKeyFile: URL,
-         iCloud: ICloudFolderCheck = .onDisk()) {
+         iCloud: ICloudFolderCheck = .onDisk(), modelCatalog: ModelCatalog? = nil) {
         self.defaults = defaults
         self.secrets = secrets
         self.environment = environment
         self.anthropicKeyFile = anthropicKeyFile
         self.iCloud = iCloud
-        model = defaults.string(forKey: "model") ?? "claude-haiku-4-5"
+        model = defaults.string(forKey: "model") ?? Self.defaultModel
         profile = defaults.string(forKey: "profile").flatMap(Profile.init(rawValue:)) ?? .general
         extraInstructions = defaults.string(forKey: "extraInstructions") ?? ""
         autoAnswer = defaults.bool(forKey: "autoAnswer")
@@ -139,6 +175,17 @@ final class AppSettings: ObservableObject {
         captureAppBundleID = defaults.string(forKey: "captureAppBundleID").flatMap { $0.isEmpty ? nil : $0 }
         acceptedTermsVersion = defaults.integer(forKey: "acceptedTermsVersion")
         serverSpeechAccepted = defaults.bool(forKey: "serverSpeechAccepted")
+        // MARK: - v0.4 cards
+        cards = CardStore(defaults: defaults)
+        cardsMatchYou = defaults.bool(forKey: "cards.matchYou")
+        cardsFolder = defaults.string(forKey: "cards.folder").flatMap { $0.isEmpty ? nil : $0 }
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        // MARK: - v0.4 speech
+        speechLocaleIdentifier = defaults.string(forKey: "speech.locale").flatMap { $0.isEmpty ? nil : $0 }
+        answerLanguage = defaults.string(forKey: "speech.answerLanguage").flatMap { $0.isEmpty ? nil : $0 }
+        vocabularyText = defaults.string(forKey: "speech.vocabulary") ?? ""
+        // MARK: - v0.4 llm
+        catalog = modelCatalog ?? ModelCatalog(defaults: defaults)
         refreshKeySources()
     }
 
@@ -147,6 +194,76 @@ final class AppSettings: ObservableObject {
         let extra = extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !extra.isEmpty else { return profile.systemPrompt }
         return profile.systemPrompt + "\n\nAdditional instructions from the user:\n" + extra
+    }
+
+    // MARK: - v0.4 speech
+    var vocabulary: [String] { Vocabulary.normalize(vocabularyText) }
+
+    var speechOptions: SpeechOptions { SpeechOptions(localeIdentifier: speechLocaleIdentifier, vocabulary: vocabulary) }
+
+    var speechSessionActive: Bool { activeSpeechOptions != nil }
+
+    func freezeSpeechOptions() {
+        activeSpeechOptions = speechOptions
+        activeCardTriggers = cards.triggerPhrases
+    }
+
+    func releaseSpeechOptions() {
+        activeSpeechOptions = nil
+        activeCardTriggers = nil
+    }
+
+    /// The sentence that tells Claude which language to answer in, or nil.
+    var answerLanguageSentence: String? {
+        SpeechLanguage.answerSentence(answerLanguage: answerLanguage, callLocale: speechLocaleIdentifier)
+    }
+
+    private static func store(_ value: String?, in defaults: UserDefaults, forKey key: String) {
+        if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+    }
+
+    // MARK: - v0.4 llm
+
+    /// The picker's choices, newest first: the catalog's names, plus the saved model
+    /// when the list does not have it (offline, or a model the user chose earlier),
+    /// so the picker never shows a selection it cannot display.
+    var modelOptions: [ModelOption] {
+        var options = catalog.models.map { info in
+            // The saved alias and the API's dated id are one model: one row, tagged with the saved value.
+            let isSavedModel = info.id == model || (catalog.entry(for: model)?.id == info.id)
+            return ModelOption(id: isSavedModel ? model : info.id, name: info.displayName)
+        }
+        if !options.contains(where: { $0.id == model }) { options.append(ModelOption(id: model, name: ModelName.short(model))) }
+        return options
+    }
+
+    /// The catalog's name for the model in use, when it has one, for the status line.
+    var modelDisplayName: String? { catalog.displayName(for: model) }
+
+    /// Whether the chosen model takes `effort: low`, or nil when the catalog does not know it.
+    var modelSupportsEffort: Bool? { catalog.supportsEffort(model) }
+
+    /// Reads the model list with the saved key, at most hourly unless `force`
+    /// (a newly saved key). If the fresh list no longer has the saved model,
+    /// the default replaces it and `modelNotice` says so. Nothing happens before
+    /// the terms are accepted: the key is not even read from the Keychain.
+    func refreshModels(force: Bool = false) async {
+        guard hasAcceptedTerms, apiKeyPresent, let key = resolveAPIKey() else { return }
+        guard await catalog.refresh(apiKey: key, force: force) else { return }
+        objectWillChange.send()
+        reconcileModelWithCatalog()
+    }
+
+    private func reconcileModelWithCatalog() {
+        guard catalog.isFromAPI, catalog.entry(for: model) == nil else {
+            modelNotice = nil
+            return
+        }
+        let replacement = catalog.entry(for: Self.defaultModel) != nil
+            ? Self.defaultModel : (catalog.models.first?.id ?? Self.defaultModel)
+        let name = catalog.displayName(for: replacement) ?? ModelName.short(replacement)
+        modelNotice = "\(model) is no longer offered by Anthropic, so Meeting Assistant switched to \(name)."
+        model = replacement
     }
 
     // MARK: - Consent
@@ -182,10 +299,22 @@ final class AppSettings: ObservableObject {
     // MARK: - Keys
 
     @discardableResult
-    func setAPIKey(_ key: String) -> Bool { save(key, account: Self.anthropicAccount) }
+    func setAPIKey(_ key: String) -> Bool {
+        let saved = save(key, account: Self.anthropicAccount)
+        if saved { refreshModelsForNewKey() }
+        return saved
+    }
 
     func removeAPIKey() {
         remove(account: Self.anthropicAccount)
+        refreshModelsForNewKey()
+    }
+
+    /// A different key may see a different model list, and the key source does not
+    /// change when one Keychain key replaces another, so the save itself asks again.
+    /// `refreshModels` still waits for the terms.
+    private func refreshModelsForNewKey() {
+        Task { await refreshModels(force: true) }
     }
 
     @discardableResult
@@ -299,4 +428,11 @@ final class AppSettings: ObservableObject {
         }
         return trimmed
     }
+}
+
+/// What a listening session needs from the speech settings, as saved: the
+/// locale the user chose (nil for Automatic) and the cleaned vocabulary.
+struct SpeechOptions: Equatable {
+    var localeIdentifier: String?
+    var vocabulary: [String]
 }

@@ -375,7 +375,7 @@ final class AppCoordinatorTests: XCTestCase {
 
         await startListening(h)
 
-        XCTAssertEqual(h.coordinator.menu.statusLine, "Listening (on-device) - Haiku 4.5")
+        XCTAssertEqual(h.coordinator.menu.statusLine, "Listening (on-device) - Haiku 5.5")
     }
 
     func testTheStatusLineFollowsABackendThatSendsAudioElsewhereAndAModelChange() async {

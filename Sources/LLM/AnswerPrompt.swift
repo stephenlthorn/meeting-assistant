@@ -5,6 +5,13 @@ import Foundation
 /// and the fence cannot be closed from inside it; the system prompt tells the
 /// model that everything inside is data, never instructions.
 enum AnswerPrompt {
+    /// The system prompt with the answer-language sentence (for example
+    /// "Answer in German.") added when there is one.
+    static func system(_ base: String, languageSentence: String?) -> String {
+        guard let languageSentence else { return base }
+        return base + "\n\n" + languageSentence
+    }
+
     static func user(transcript: String) -> String {
         """
         Live conversation transcript so far (You = me, Them = the other participants):

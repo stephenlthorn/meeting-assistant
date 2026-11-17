@@ -141,3 +141,51 @@ struct AppKitTranscriptDialogs: TranscriptDialogs {
         NSWorkspace.shared.open(target)
     }
 }
+
+/// The Check for Updates result as a standard alert. Download opens the release's .app.zip in the
+/// browser; Meeting Assistant never downloads or installs anything itself.
+@MainActor
+struct UpdateAlert: UpdatePresenting {
+    nonisolated init() {}
+
+    func show(_ result: UpdateCheckResult) {
+        let alert = NSAlert()
+        alert.messageText = result.headline
+        switch result {
+        case let .upToDate(version):
+            alert.informativeText = "Meeting Assistant \(version) is the latest release."
+            alert.addButton(withTitle: "OK")
+        case let .failed(message):
+            alert.informativeText = message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+        case let .available(update):
+            alert.informativeText = update.notes.isEmpty ? "This release has no notes." : "What's new:"
+            if !update.notes.isEmpty { alert.accessoryView = Self.notesView(update.notes) }
+            alert.addButton(withTitle: "Download")
+            alert.addButton(withTitle: "Release Page")
+            alert.addButton(withTitle: "Not Now")
+        }
+        NSApp.activate()
+        let response = alert.runModal()
+        guard case let .available(update) = result else { return }
+        switch response {
+        case .alertFirstButtonReturn: NSWorkspace.shared.open(update.downloadURL)
+        case .alertSecondButtonReturn: NSWorkspace.shared.open(update.releasePage)
+        default: break
+        }
+    }
+
+    private static func notesView(_ notes: String) -> NSView {
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 380, height: 160))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let text = NSTextView(frame: scroll.bounds)
+        text.string = notes
+        text.isEditable = false
+        text.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        text.autoresizingMask = [.width]
+        scroll.documentView = text
+        return scroll
+    }
+}

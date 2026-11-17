@@ -5,10 +5,14 @@ name: release
 # app's MARKETING_VERSION and its build number all derive from it, and the build fails
 # if they would disagree.
 #
-# Signing is all or nothing. With every Developer ID and notarization secret set the
-# app is signed and notarized; with none it is ad-hoc signed; any other combination
-# fails before the build. The secrets live in the "release" environment and reach only
-# the steps that sign and notarize, never the tests, the build or third-party actions.
+# There are three signing modes, each all or nothing (scripts/release-check-signing.sh):
+#   ad-hoc     no secrets
+#   signed     the three certificate secrets; a stable identity, not notarized, so macOS
+#              keeps the app's permissions across updates and Gatekeeper still asks once
+#   notarized  all six secrets; signed with Developer ID and notarized
+# Any other combination fails before the build. The secrets live in the "release"
+# environment and reach only the steps that sign and notarize, never the tests, the
+# build or third-party actions.
 on:
   push:
     branches: [main]
@@ -122,25 +126,53 @@ jobs:
             exit 1
           fi
 
-      - name: Sign with Developer ID
-        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode == 'developer-id'
+      - name: Sign with certificate
+        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode != 'ad-hoc'
         env:
+          SIGNING_MODE: ${{ steps.signing.outputs.mode }}
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
           CERTIFICATE="$RUNNER_TEMP/certificate.p12"
+          PUBLIC_CERTIFICATE="$RUNNER_TEMP/certificate.pem"
+          TRUSTED=false
+          cleanup() {
+            if [ "$TRUSTED" = true ]; then sudo security remove-trusted-cert -d "$PUBLIC_CERTIFICATE" || true; fi
+            rm -f "$CERTIFICATE" "$PUBLIC_CERTIFICATE"
+            security delete-keychain "$KEYCHAIN" || true
+          }
           # Later steps, including third-party actions, must not find the key on this runner.
-          trap 'rm -f "$CERTIFICATE"; security delete-keychain "$KEYCHAIN" || true' EXIT
+          trap cleanup EXIT
           echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERTIFICATE"
           security create-keychain -p "" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "" "$KEYCHAIN"
           security import "$CERTIFICATE" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          codesign --force --options runtime --timestamp \
+          identity_is_valid() { security find-identity -v -p codesigning "$KEYCHAIN" | grep -qF "\"$MACOS_SIGNING_IDENTITY\""; }
+          if ! identity_is_valid; then
+            # A self-signed certificate is not trusted by default, and codesign refuses an
+            # untrusted identity. This runner is a throwaway machine, and the trust is
+            # removed again when the step ends.
+            security find-certificate -c "$MACOS_SIGNING_IDENTITY" -p "$KEYCHAIN" > "$PUBLIC_CERTIFICATE" || true
+            if [ ! -s "$PUBLIC_CERTIFICATE" ]; then
+              echo "::error::No certificate named '$MACOS_SIGNING_IDENTITY' was found in MACOS_CERTIFICATE_P12. Check the MACOS_SIGNING_IDENTITY secret against the certificate's name."
+              exit 1
+            fi
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$PUBLIC_CERTIFICATE"
+            TRUSTED=true
+          fi
+          if ! identity_is_valid; then
+            echo "::error::codesign cannot use the signing identity '$MACOS_SIGNING_IDENTITY'. Check MACOS_SIGNING_IDENTITY against the certificate in MACOS_CERTIFICATE_P12."
+            exit 1
+          fi
+          # Apple's timestamp server only matters for a notarized build.
+          TIMESTAMP="--timestamp=none"
+          if [ "$SIGNING_MODE" = notarized ]; then TIMESTAMP="--timestamp"; fi
+          codesign --force --options runtime "$TIMESTAMP" \
             --entitlements Config/MeetingAssistant.entitlements \
             --sign "$MACOS_SIGNING_IDENTITY" "$APP"
 
@@ -152,13 +184,25 @@ jobs:
         if: steps.existing.outputs.exists != 'true'
         run: codesign --verify --strict --verbose=2 "$APP"
 
+      - name: Verify stable code identity
+        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode != 'ad-hoc'
+        run: |
+          # macOS keys permissions on this requirement. A cdhash in it would change with
+          # every build and bring back the permission prompts after each update.
+          REQUIREMENT="$(codesign -d -r- "$APP" 2>&1 | sed -n 's/^#* *designated => //p')"
+          echo "designated requirement: $REQUIREMENT"
+          if [ -z "$REQUIREMENT" ] || printf '%s' "$REQUIREMENT" | grep -q cdhash; then
+            echo "::error::The signed app's designated requirement is tied to the code hash, so permissions would not survive updates"
+            exit 1
+          fi
+
       - name: Package .app
         if: steps.existing.outputs.exists != 'true'
         run: ditto -c -k --sequesterRsrc --keepParent "$APP" MeetingAssistant.app.zip
 
       - name: Notarize
         id: notarize
-        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode == 'developer-id'
+        if: steps.existing.outputs.exists != 'true' && steps.signing.outputs.mode == 'notarized'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}

@@ -54,6 +54,13 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     var onFatal: (@MainActor (String) -> Void)?
     var onNotice: (@MainActor (String?) -> Void)?
 
+    /// The locale this transcriber was built for, after falling back from an unsupported choice.
+    let localeIdentifier: String
+    /// The custom vocabulary handed to the recognizer as contextual strings.
+    let vocabulary: [String]
+    /// Said when listening starts: the chosen language was not available and another is in use.
+    let languageNotice: String?
+
     private let engine: SpeechRecognitionEngine
     private let allowServerRecognition: Bool
     private let queue: DispatchQueue
@@ -76,19 +83,27 @@ final class LegacySpeechTranscriber: LiveTranscriber {
     private var usesAppleServers: Bool { allowServerRecognition && !engine.supportsOnDeviceRecognition }
 
     init(engine: SpeechRecognitionEngine,
+         localeIdentifier: String = SpeechLanguage.fallbackIdentifier,
+         vocabulary: [String] = [],
+         languageNotice: String? = nil,
          queue: DispatchQueue = DispatchQueue(label: "meetingassistant.speech"),
          now: @escaping () -> Date = Date.init,
          schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = runAfter,
          allowServerRecognition: Bool = false) {
         self.allowServerRecognition = allowServerRecognition
         self.engine = engine
+        self.localeIdentifier = localeIdentifier
+        self.vocabulary = vocabulary
+        self.languageNotice = languageNotice
         self.queue = queue
         self.now = now
         self.schedule = schedule
     }
 
-    convenience init(localeIdentifier: String = "en-US", allowServerRecognition: Bool = false) {
-        self.init(engine: AppleSpeechEngine(localeIdentifier: localeIdentifier),
+    convenience init(localeIdentifier: String = SpeechLanguage.fallbackIdentifier, vocabulary: [String] = [],
+                     languageNotice: String? = nil, allowServerRecognition: Bool = false) {
+        self.init(engine: AppleSpeechEngine(localeIdentifier: localeIdentifier, vocabulary: vocabulary),
+                  localeIdentifier: localeIdentifier, vocabulary: vocabulary, languageNotice: languageNotice,
                   allowServerRecognition: allowServerRecognition)
     }
 
@@ -116,6 +131,7 @@ final class LegacySpeechTranscriber: LiveTranscriber {
             sessionEpoch = epoch
             running = true
             consecutiveFailures = 0
+            if let languageNotice { notify(languageNotice) }
             beginSession()
         }
     }
@@ -254,9 +270,11 @@ final class LegacySpeechTranscriber: LiveTranscriber {
 /// SFSpeechRecognizer behind SpeechRecognitionEngine.
 final class AppleSpeechEngine: SpeechRecognitionEngine {
     private let recognizer: SFSpeechRecognizer?
+    private let vocabulary: [String]
 
-    init(localeIdentifier: String) {
+    init(localeIdentifier: String, vocabulary: [String] = []) {
         recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeIdentifier))
+        self.vocabulary = vocabulary
     }
 
     var isAvailable: Bool { recognizer?.isAvailable ?? false }
@@ -268,8 +286,9 @@ final class AppleSpeechEngine: SpeechRecognitionEngine {
         }
     }
 
-    static func makeRequest(onDevice: Bool) -> SFSpeechAudioBufferRecognitionRequest {
+    static func makeRequest(onDevice: Bool, vocabulary: [String] = []) -> SFSpeechAudioBufferRecognitionRequest {
         let request = SFSpeechAudioBufferRecognitionRequest()
+        request.contextualStrings = vocabulary
         request.shouldReportPartialResults = true
         request.addsPunctuation = true
         request.requiresOnDeviceRecognition = onDevice
@@ -278,7 +297,7 @@ final class AppleSpeechEngine: SpeechRecognitionEngine {
 
     func startSession(onResult: @escaping (String, Bool) -> Void,
                       onError: @escaping (Error) -> Void) -> SpeechRecognitionSession {
-        let request = Self.makeRequest(onDevice: supportsOnDeviceRecognition)
+        let request = Self.makeRequest(onDevice: supportsOnDeviceRecognition, vocabulary: vocabulary)
         let task = recognizer?.recognitionTask(with: request) { result, error in
             if let result { onResult(result.bestTranscription.formattedString, result.isFinal) }
             if let error { onError(error) }

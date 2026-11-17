@@ -65,6 +65,17 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 - On-device STT: SpeechAnalyzer on macOS 26+, SFSpeechRecognizer on 14-15. If a
   14-15 Mac can't transcribe your language on-device, nothing is transcribed
   unless you separately allow Apple's speech servers in Settings.
+- **Call language.** Pick the language calls are transcribed in (Settings, Language);
+  it defaults to your Mac's language when supported, otherwise English (US). A language
+  whose on-device model isn't installed is downloaded when you next start listening,
+  and the overlay says so (or says why it couldn't). "Answer in" sets the language of
+  answers and summaries; the default follows the call. Changes apply at the next Start.
+  Deepgram is told the language only for the languages it documents for its nova-3
+  model; for any other it assumes English, and Settings says so.
+- **Custom vocabulary.** One phrase per line (up to 100, one or two words each work
+  best) of names, products and jargon for the recognizer to favour, used by every
+  backend. With Deepgram on, the phrases are sent to Deepgram with the audio. Whether
+  macOS 26's SpeechAnalyzer honours them for its `SpeechTranscriber` is unverified.
 - Optional **Deepgram** cloud STT for the hardest audio, off until you confirm
   sending it audio. It keeps the stream alive through silences and reconnects if
   the connection drops.
@@ -77,12 +88,15 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
   backend and the Claude model, for example `Listening (on-device) - Haiku 4.5`, in
   the overlay and at the top of the menu.
 - Live Claude answers streamed into the overlay, with a copy button.
+- **Instant cards** (Settings > Instant cards): write a short note with trigger phrases, or point at a folder of `.md` files (the first `# Heading` is the title, a `Triggers: a, b, c` line lists the phrases, the rest is the text). When the other side says a trigger, the card appears in the overlay at once, even before they finish the sentence, with no network and no model. Matching ignores case and punctuation and wants whole words, so "Acme" matches "Acme's" but not "Acmeville", and it also works in languages written without spaces, such as Japanese, Chinese and Thai. A card can be dismissed, stays away for a minute once shown, and is cleared by Clear Transcript. With saving on, each card shown is logged in the transcript as a `> Card shown:` line. Cards stay on this Mac. Trigger phrases also help on-device speech recognition spell your terms, but they are never given to Deepgram or to Apple's speech servers. "Try a Sample Meeting" shows two sample cards.
 - **Auto-answer** when the other side asks a question. It never interrupts an answer
   in progress: a question asked meanwhile waits and is answered afterwards if it is
   still recent (30 seconds), otherwise it is skipped with a note under the answer.
 - **Summarize Meeting** (menu bar icon): sends the whole transcript, fenced as untrusted
   text, to Claude and shows decisions and action items in a window you can copy from.
-  It works while listening and after Stop.
+  It works while listening and after Stop. **Draft follow-up** in that window writes a
+  short follow-up email from the summary (not the transcript), which you can copy or
+  open in Mail; in the sample meeting the draft is canned and nothing is sent.
 - **Saved transcripts**, off until you turn them on (Settings > Transcripts): each call
   is written as a timestamped Markdown file every 30 seconds and when you stop, into
   `~/Library/Application Support/Meeting Assistant/Transcripts` or a folder you pick.
@@ -122,8 +136,8 @@ microphone (AVAudioEngine)       -> "You"  transcriber -/
 **[Download MeetingAssistant.app.zip](https://github.com/stephenlthorn/meeting-assistant/releases/latest/download/MeetingAssistant.app.zip)**
 (the latest [release](../../releases/latest); every release lists what changed).
 Unreleased changes from `main` are in the **Actions** tab (latest `build` run >
-Artifacts), for testing only. Signed and notarized releases open normally. An ad-hoc signed build needs quarantine cleared before first
-launch:
+Artifacts), for testing only. Every release notes page says how that build was signed.
+A build that is not notarized needs quarantine cleared before first launch:
 
 ```bash
 unzip MeetingAssistant.app.zip
@@ -131,8 +145,17 @@ xattr -dr com.apple.quarantine MeetingAssistant.app
 open MeetingAssistant.app
 ```
 
-An ad-hoc build has a new code identity every release, so macOS asks for Screen
-Recording and Microphone again after each update.
+Releases are signed with a certificate that stays the same from release to release, so
+macOS keeps your Screen Recording and Microphone permissions, and the Keychain access to
+your API key, when you update. (Releases up to and including v0.3.0 were ad-hoc signed and
+had a new code identity every time; updating from one of those asks one last time.) Only
+Apple's notarization removes the first-launch Gatekeeper prompt, and releases are not
+notarized unless the release notes say so.
+
+**Check for Updates...** in the menu looks for a newer release when you choose it, and
+only then: Meeting Assistant never checks in the background. It asks GitHub for the latest
+release and shows whether you are up to date, or the release notes with a **Download**
+button. It sends nothing about you or your calls.
 
 ## Upgrading
 
@@ -240,6 +263,8 @@ Meeting and saved transcripts. The full policy is in [PRIVACY.md](PRIVACY.md).
 | `Sources/Audio/AnalyzerTranscriber.swift` | macOS 26+ SpeechAnalyzer backend |
 | `Sources/Audio/LegacySpeechTranscriber.swift` | macOS 14-15 SFSpeechRecognizer backend |
 | `Sources/Audio/CloudTranscriber.swift` | Optional Deepgram cloud STT (WebSocket) |
+| `Sources/Audio/SpeechLanguage.swift` | Call-language choice, fallback, Deepgram language mapping, answer-language sentence |
+| `Sources/Transcript/Vocabulary.swift` | Custom vocabulary: normalising, the 100-phrase cap, merging extra terms |
 | `Sources/Transcript/Transcript.swift` | Merged, speaker-labeled transcript, bounded for long calls |
 | `Sources/Transcript/QuestionDetector.swift` / `EchoDetector.swift` | Auto-answer trigger / echo suppression |
 | `Sources/Transcript/QuestionQueue.swift` | Keeps the newest question that arrives while an answer is streaming |
@@ -247,6 +272,8 @@ Meeting and saved transcripts. The full policy is in [PRIVACY.md](PRIVACY.md).
 | `Sources/LLM/Profiles.swift` / `AnswerPrompt.swift` | Per-use-case system prompts / the fenced transcript sent as the user message |
 | `Sources/LLM/SummaryPrompt.swift` | The Summarize Meeting prompts and the bounded whole transcript they carry |
 | `Sources/LLM/ModelName.swift` | Short model names ("Haiku 4.5") for the status line |
+| `Sources/LLM/ModelCatalog.swift` | The model list from Anthropic's Models API, cached, with a built-in fallback; effort and fallback rules |
+| `Sources/LLM/FollowUpPrompt.swift` | The follow-up email prompts, canned sample draft and Open in Mail |
 | `Sources/UI/MenuContent.swift` | The menu bar menu and icon |
 | `Sources/UI/OverlayPanel.swift` / `OverlayView.swift` / `OverlayText.swift` | Floating overlay |
 | `Sources/UI/SummaryView.swift` | The meeting summary window |
@@ -260,6 +287,7 @@ Meeting and saved transcripts. The full policy is in [PRIVACY.md](PRIVACY.md).
 | `Config/MeetingAssistant.entitlements` | Hardened-runtime microphone entitlement |
 | `.github/workflows/` | `build.yml` (tests, plus an ad-hoc signed build kept as an artifact) and `release.yml` (the signed release) |
 | `scripts/release-*.sh`, `scripts/install-xcodegen.sh`, `scripts/setup-release-signing.sh` | Release plumbing the workflow delegates to (version, signing mode, release lookup, pinned XcodeGen), and the one-time signing setup |
+| `scripts/make-self-signed-identity.sh`, `scripts/verify-stable-signing-identity.sh` | The stable self-signed signing identity, and a check that it keeps the code identity stable |
 | `docs/plans/` | Roadmaps |
 | `Tests/` | Unit tests (a hostless XCTest bundle over the app sources; only `@main` is left out) |
 
@@ -280,12 +308,36 @@ A release is published from `main` when `VERSION` changes. To cut one:
    pinned to a commit or checksum. A manual run works only from `main`, and its tag
    input must equal `VERSION`.
 
-**Signing is all or nothing.** With all six secrets below set, the release is signed with
-your Developer ID and notarized. With none set, it is ad-hoc signed. Any other
-combination fails before the build, so a half-configured setup never ships by surprise.
+**Signing has three modes, each all or nothing:**
+
+| Mode | Secrets set | Result |
+|------|-------------|--------|
+| ad-hoc | none | New code identity every release; macOS asks for permissions again after each update |
+| signed | the three certificate secrets | Signed with a stable certificate, not notarized: permissions survive updates, Gatekeeper still asks once |
+| notarized | all six | Signed with Developer ID and notarized |
+
+Any other combination fails before the build, so a half-configured setup never ships by
+surprise. The release notes say which mode was used.
+
+The **signed** mode is the free one. macOS keys permissions on the code's designated
+requirement, which for an ad-hoc build is the code hash and so changes every build. A
+certificate, even a self-signed one, makes it `identifier "<bundle id>" and certificate
+leaf = H"<hash>"`, which is the same for every build signed by that certificate. To set it
+up once:
+
+```bash
+scripts/make-self-signed-identity.sh ~/ma-signing      # makes the .p12, prints the identity
+scripts/setup-release-signing.sh --signed ~/ma-signing/MeetingAssistantSelfSigned.p12
+```
+
+Keep the `.p12` safe, and never commit it. Replacing it later gives the app a new identity,
+and macOS asks for permissions once more. `scripts/verify-stable-signing-identity.sh --trust`
+shows the property on your own Mac (two builds, one requirement; ad-hoc builds, two).
+The release run refuses to publish a signed build whose requirement is still tied to the
+code hash.
 
 The secrets live in the repository's **`release` environment**, not in repository-level
-secrets, and reach only the steps that sign and notarize:
+secrets, and reach only the steps that sign and notarize. The first three are all the signed mode needs:
 
 | Secret | Value |
 |--------|-------|
@@ -294,8 +346,8 @@ secrets, and reach only the steps that sign and notarize:
 | `MACOS_SIGNING_IDENTITY` | For example `Developer ID Application: Your Name (TEAMID)` |
 | `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | For notarization (an app-specific password) |
 
-Run `scripts/setup-release-signing.sh path/to/DeveloperID.p12` to store all six in the
-`release` environment with the GitHub CLI. It targets the checkout's `origin`, or the
+Run `scripts/setup-release-signing.sh path/to/DeveloperID.p12` to store all six (or, with
+`--signed`, the first three) in the `release` environment with the GitHub CLI. It targets the checkout's `origin`, or the
 repository you name with `--repo OWNER/NAME`, shows the target and asks you to confirm
 before it writes anything. A missing environment is created limited to `main` before any
 secret is written; an existing one is never modified (and a GitHub error stops the script

@@ -21,7 +21,8 @@ final class AnthropicClientTests: XCTestCase {
         XCTAssertEqual(body["model"] as? String, "claude-sonnet-5")
         XCTAssertEqual(body["stream"] as? Bool, true)
         XCTAssertEqual(body["max_tokens"] as? Int, 4096)
-        XCTAssertEqual(body["system"] as? String, "Be brief.")
+        let system = try XCTUnwrap(body["system"] as? [[String: Any]])
+        XCTAssertEqual(system.first?["text"] as? String, "Be brief.")
         let messages = try XCTUnwrap(body["messages"] as? [[String: String]])
         XCTAssertEqual(messages, [["role": "user", "content": "Transcript here"]])
         XCTAssertEqual((body["output_config"] as? [String: String])?["effort"], "low")
@@ -120,6 +121,35 @@ final class AnthropicClientTests: XCTestCase {
         stub(status: 200, sse: [#"{"type":"message_delta","delta":{"stop_reason":"refusal"}}"#])
 
         let text = try await collect(client().stream(request(model: "claude-sonnet-5")))
+
+        XCTAssertEqual(text, "(Claude declined to answer this.)")
+    }
+
+    func testTheEventStreamReportsHowTheReplyStopped() async throws {
+        let cases: [(reason: String, expected: AnswerStop)] = [
+            ("end_turn", .complete), ("max_tokens", .truncated), ("refusal", .refused), ("pause_turn", .other),
+        ]
+        for (reason, expected) in cases {
+            stub(status: 200, sse: [
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+                #"{"type":"message_delta","delta":{"stop_reason":"\#(reason)"}}"#,
+                #"{"type":"message_stop"}"#,
+            ])
+            var events: [AnswerEvent] = []
+
+            for try await event in client().streamEvents(request(model: "claude-haiku-4-5")) { events.append(event) }
+
+            XCTAssertEqual(events.last, .stopped(expected), reason)
+        }
+    }
+
+    func testTheEventStreamKeepsTheVisibleNoteTextTheSame() async throws {
+        stub(status: 200, sse: [#"{"type":"message_delta","delta":{"stop_reason":"refusal"}}"#])
+        var text = ""
+
+        for try await event in client().streamEvents(request(model: "claude-sonnet-5")) {
+            if case .text(let chunk) = event { text += chunk }
+        }
 
         XCTAssertEqual(text, "(Claude declined to answer this.)")
     }

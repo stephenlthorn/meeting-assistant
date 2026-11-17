@@ -6,7 +6,7 @@ final class AppSettingsTests: XCTestCase {
     func testNothingSavedMeansFastModelGeneralProfileAndManualAnswers() {
         let settings = makeSettings()
 
-        XCTAssertEqual(settings.model, "claude-haiku-4-5")
+        XCTAssertEqual(settings.model, "claude-haiku-5-5")
         XCTAssertEqual(settings.profile, .general)
         XCTAssertFalse(settings.autoAnswer)
         XCTAssertFalse(settings.useCloudSTT)
@@ -485,7 +485,8 @@ final class AppSettingsTests: XCTestCase {
                               secrets: SecretStore = InMemorySecretStore(),
                               environment: [String: String] = [:],
                               keyFile: URL = URL(fileURLWithPath: "/nonexistent/anthropic_key")) -> AppSettings {
-        AppSettings(defaults: defaults ?? freshDefaults(), secrets: secrets,
-                    environment: environment, anthropicKeyFile: keyFile)
+        let defaults = defaults ?? freshDefaults()
+        return AppSettings(defaults: defaults, secrets: secrets, environment: environment, anthropicKeyFile: keyFile,
+                           modelCatalog: offlineModelCatalog(defaults: defaults))
     }
 }

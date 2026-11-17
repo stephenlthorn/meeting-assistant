@@ -3,14 +3,61 @@ import Foundation
 struct AnswerRequest: Equatable, Sendable {
     let apiKey: String
     let model: String
+    /// The stable part of the prompt (profile and extra instructions). Sent as a
+    /// cached block; anything that changes per request belongs in `user`.
     let system: String
     let user: String
+    /// Whether the model takes `effort: low`, from the model catalog; nil when unknown.
+    var supportsEffort: Bool? = nil
+}
+
+/// How a reply that ended without an error stopped. Only `complete` is a whole
+/// answer; the others end with a note in the text ("declined", "cut off") that a
+/// reader of the text alone would take for part of the answer.
+enum AnswerStop: Equatable, Sendable {
+    /// `end_turn`: Claude finished.
+    case complete
+    /// `refusal`: Claude declined to answer.
+    case refused
+    /// `max_tokens`: the reply hit the length limit.
+    case truncated
+    /// Any other stop reason (a stop sequence, a pause): not a whole answer to build on.
+    case other
+}
+
+enum AnswerEvent: Equatable, Sendable {
+    case text(String)
+    /// The last event of a stream that did not fail.
+    case stopped(AnswerStop)
 }
 
 /// Streams an answer as text chunks, in order. Cancelling the consuming task
 /// cancels the underlying request.
 protocol AnswerStreaming {
     func stream(_ request: AnswerRequest) -> AsyncThrowingStream<String, Error>
+    /// The same stream with its ending made explicit, for a caller that builds on
+    /// the result (a follow-up needs a whole summary, not a refusal note). The
+    /// text is exactly what `stream` yields, notes included.
+    func streamEvents(_ request: AnswerRequest) -> AsyncThrowingStream<AnswerEvent, Error>
+}
+
+extension AnswerStreaming {
+    /// For a streamer that cannot tell how it stopped: whatever ends cleanly counts as complete.
+    func streamEvents(_ request: AnswerRequest) -> AsyncThrowingStream<AnswerEvent, Error> {
+        let source = stream(request)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await chunk in source { continuation.yield(.text(chunk)) }
+                    continuation.yield(.stopped(.complete))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 /// A failure worded for the overlay: what happened and what to do about it.
@@ -80,6 +127,9 @@ enum AnthropicStreamEvent: Equatable {
             return .failure(message: error?["message"] as? String ?? "stream error",
                             isOverloaded: error?["type"] as? String == "overloaded_error")
         default:
+            // `content_block_start` (including the server-side `fallback` block and any
+            // block type added later) and unknown events carry no text: skipped, so the
+            // text deltas around them are still yielded.
             return nil
         }
     }
@@ -150,18 +200,41 @@ struct AnthropicClient: AnswerStreaming {
             "model": request.model,
             "max_tokens": maxTokens,
             "stream": true,
-            "system": request.system,
+            // One block, cached: the prefix is the same for every request in a session.
+            // Prefixes under the model's minimum silently do not cache, which is fine.
+            "system": [["type": "text", "text": request.system, "cache_control": ["type": "ephemeral"]]],
             "messages": [["role": "user", "content": request.user]],
         ]
-        // Effort is accepted by Opus and Sonnet but rejected by Haiku 4.5.
-        if !request.model.contains("haiku") {
+        // Whether a model takes effort is a fact about that model, so the catalog's
+        // capability wins; the rule only covers a model the catalog has not described.
+        if request.supportsEffort ?? EffortRule.conservativeDefault(for: request.model) {
             body["output_config"] = ["effort": "low"]
         }
-        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body)
+        if ServerSideFallback.supports(request.model) {
+            urlRequest.setValue(ServerSideFallback.betaHeader, forHTTPHeaderField: "anthropic-beta")
+            body["fallbacks"] = "default"
+        }
+        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
         return urlRequest
     }
 
     func stream(_ request: AnswerRequest) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await event in streamEvents(request) {
+                        if case .text(let text) = event { continuation.yield(text) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func streamEvents(_ request: AnswerRequest) -> AsyncThrowingStream<AnswerEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -175,7 +248,7 @@ struct AnthropicClient: AnswerStreaming {
         }
     }
 
-    private func run(_ request: AnswerRequest, emit: (String) -> Void) async throws {
+    private func run(_ request: AnswerRequest, emit: (AnswerEvent) -> Void) async throws {
         guard !request.apiKey.isEmpty else { throw AnthropicError.missingKey }
         var retries = 0
         while true {
@@ -194,7 +267,7 @@ struct AnthropicClient: AnswerStreaming {
     }
 
     /// One request. Throws `RetryableFailure` only before any text was emitted.
-    private func attempt(_ request: AnswerRequest, emit: (String) -> Void) async throws {
+    private func attempt(_ request: AnswerRequest, emit: (AnswerEvent) -> Void) async throws {
         let (bytes, response) = try await session.bytes(for: Self.makeURLRequest(for: request))
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard http.statusCode == 200 else {
@@ -206,18 +279,24 @@ struct AnthropicClient: AnswerStreaming {
         }
         var wroteText = false
         var finished = false
+        var stop = AnswerStop.complete
         for try await line in bytes.lines {
             switch AnthropicStreamEvent.parse(line: line) {
             case .text(let text):
-                emit(text)
+                emit(.text(text))
                 wroteText = true
             case .stop(reason: "max_tokens"):
-                emit((wroteText ? "\n\n" : "") + Self.cutOffNote)
+                emit(.text((wroteText ? "\n\n" : "") + Self.cutOffNote))
+                stop = .truncated
                 finished = true
             case .stop(reason: "refusal"):
-                emit((wroteText ? "\n\n" : "") + Self.refusalNote)
+                emit(.text((wroteText ? "\n\n" : "") + Self.refusalNote))
+                stop = .refused
                 finished = true
-            case .stop, .finished:
+            case .stop(reason: let reason):
+                stop = reason == "end_turn" ? .complete : .other
+                finished = true
+            case .finished:
                 finished = true
             case .failure(let message, let isOverloaded):
                 let error = AnthropicError.midStream(message)
@@ -228,6 +307,7 @@ struct AnthropicClient: AnswerStreaming {
             }
         }
         guard finished else { throw AnthropicError.cutOff }
+        emit(.stopped(stop))
     }
 
     private static func retryAfter(in response: HTTPURLResponse) -> TimeInterval? {

@@ -16,6 +16,7 @@ struct OverlayView: View {
             Divider()
             TranscriptSection(controller: controller)
             Divider()
+            CardsView(controller: controller)
             AnswerSection(controller: controller, settings: settings)
             Spacer(minLength: 0)
         }
@@ -36,7 +37,8 @@ private struct OverlayHeader: View {
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
             VStack(alignment: .leading, spacing: 1) {
-                Text(StatusLine.text(status: controller.status, listening: controller.listening, model: settings.model))
+                Text(StatusLine.text(status: controller.status, listening: controller.listening, model: settings.model,
+                                     displayName: settings.modelDisplayName))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let notice = controller.notice {

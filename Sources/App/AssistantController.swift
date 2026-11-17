@@ -101,7 +101,28 @@ final class AssistantController {
     /// Shown with the summary when it does not cover the whole call.
     private(set) var summaryNote: String?
     private(set) var isSummarizing = false
-///
+    /// Instant cards on screen, newest first (at most `CardDeck.displayLimit`).
+    private(set) var cards: [Card] = []
+    /// Cards waiting behind the ones shown.
+    private(set) var hiddenCardCount = 0
+    /// The summary finished cleanly (or is the canned sample one), so a follow-up can be written from it.
+    private(set) var summaryIsFinal = false
+    /// The summary ended without error but not whole (declined, or cut off at the length limit).
+    private(set) var summaryEndedEarly = false
+    /// The follow-up email draft, streamed in under the summary.
+    /// The draft alone, without any error or status line: what Copy draft and Open in Mail act on.
+    private(set) var followUpDraft = ""
+    /// Why the draft is not whole (an error, or a missing key), kept apart so it is never copied or mailed.
+    private(set) var followUpStatus: String?
+    /// What the window shows: the draft, then the status under it.
+    var followUp: String {
+        guard let followUpStatus else { return followUpDraft }
+        return followUpDraft.isEmpty ? followUpStatus : followUpDraft + "\n\n" + followUpStatus
+    }
+    /// Whether the draft is whole and clean enough to copy or put in an email: not while
+    /// it is still streaming, and not after an error left half of it.
+    var canUseFollowUpDraft: Bool { !followUpDraft.isEmpty && followUpStatus == nil && !isDraftingFollowUp }
+    private(set) var isDraftingFollowUp = false
     /// Per-side loudness for the overlay's level indicator.
     let levels = CaptureLevels()
 
@@ -181,9 +202,12 @@ final class AssistantController {
     @ObservationIgnored private var youTurnsFinished = 0
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
     @ObservationIgnored private var summaryRequest = 0
+    @ObservationIgnored private var followUpTask: Task<Void, Never>?
+    @ObservationIgnored private var followUpRequest = 0
     @ObservationIgnored private var summaryProblem: Problem?
     @ObservationIgnored private var questionWakeScheduled = false
     @ObservationIgnored private var sampleAnswersShown = 0
+    @ObservationIgnored private var instantCards = InstantCards()
 
     init(settings: AppSettings,
          systemAudio: SystemAudioCapturing,
@@ -238,7 +262,7 @@ final class AssistantController {
         AssistantController(settings: settings,
                             systemAudio: SystemAudioCapture(),
                             microphone: MicCapture(),
-                            makeTranscriber: { _ in TranscriberFactory.make(settings: settings) },
+                            makeTranscriber: { _ in TranscriberFactory.makeForSession(settings: settings) },
                             answerer: AnthropicClient())
     }
 
@@ -265,6 +289,8 @@ final class AssistantController {
         themRecovery += 1
         awaitingSpeechPermission = []
         clearNotices()
+        instantCards.useUserCards()
+        settings.cards.reloadFolderInBackground(settings.cardsFolder)
         resetTranscriptAndAnswer()
         resetSummary()
         beginArchive()
@@ -304,6 +330,7 @@ final class AssistantController {
         session += 1
         tearDown()
         listening = .idle
+        settings.releaseSpeechOptions()
         status = endStatus
         questions.clear()
         flushArchive()
@@ -953,17 +980,44 @@ final class AssistantController {
         answerNote = nil
         questions.clear()
         isAnswering = false
+        instantCards.clear()
+        publishCards()
     }
 
     private func receive(_ segment: TranscriptSegment, from speaker: Speaker, isLive: Bool) {
         feedArchive(segment, from: speaker)
         guard segment.utterance > (clearedThrough[speaker] ?? .min) else { return }
+        if isLive { showCards(for: segment.text, from: speaker) }
         let finished = transcript.apply(segment, from: speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
         if finished?.speaker == .you { youTurnsFinished += 1 }
         guard isLive, let finished, finished.speaker == .them,
               QuestionDetector.looksLikeQuestion(finished.text) else { return }
         questionAsked(finished.text)
+    }
+
+    // MARK: - Instant cards
+
+    func dismissCard(id: String) {
+        instantCards.dismiss(id: id)
+        publishCards()
+    }
+
+    /// Runs on every update, partial ones included, so a card appears as the
+    /// words do: no network, no model. A card shown is also logged in the saved
+    /// transcript at that point in the call.
+    private func showCards(for text: String, from speaker: Speaker) {
+        guard speaker == .them || settings.cardsMatchYou else { return }
+        let shown = instantCards.hear(text, store: settings.cards, at: now())
+        guard !shown.isEmpty else { return }
+        publishCards()
+        guard let archive, settings.saveTranscripts else { return }
+        archive.append(shown.map { TranscriptMarkdown.cardTurn(title: $0.title, at: now()) })
+    }
+
+    private func publishCards() {
+        cards = instantCards.displayed
+        hiddenCardCount = instantCards.hiddenCount
     }
 
     // MARK: - Saved transcript
@@ -1117,8 +1171,10 @@ final class AssistantController {
         } else if let apiKey = settings.resolveAPIKey() {
             // The sample is not the user's call, so their own instructions stay out of it.
             stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: inSample ? settings.profile.systemPrompt : settings.systemPrompt,
-                                                   user: Self.userPrompt(context)))
+                                                   system: AnswerPrompt.system(inSample ? settings.profile.systemPrompt : settings.systemPrompt,
+                                                                       languageSentence: inSample ? nil : settings.answerLanguageSentence),
+                                                   user: Self.userPrompt(context),
+                                                   supportsEffort: settings.modelSupportsEffort))
         } else if inSample {
             stream = nextSampleAnswer()
         } else {
@@ -1223,6 +1279,7 @@ final class AssistantController {
         summaryRequest += 1
         let current = summaryRequest
         summaryNote = nil
+        resetFollowUp()
         guard !transcript.isEmpty else {
             summary = "No transcript yet. Start listening first."
             isSummarizing = false
@@ -1230,6 +1287,7 @@ final class AssistantController {
         }
         if inSample && !settings.hasAcceptedTerms {
             summary = SampleMeeting.sampleSummary
+            summaryIsFinal = true
             isSummarizing = false
             return
         }
@@ -1243,18 +1301,24 @@ final class AssistantController {
         summaryNote = input.isPartial ? partialSummaryNote(trimmed: source.isPartial) : nil
         summary = ""
         isSummarizing = true
-        let stream = answerer.stream(AnswerRequest(apiKey: apiKey, model: settings.model,
-                                                   system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions),
-                                                   user: SummaryPrompt.user(input)))
+        let stream = answerer.streamEvents(AnswerRequest(apiKey: apiKey, model: settings.model,
+                                                   system: SummaryPrompt.system(extraInstructions: inSample ? "" : settings.extraInstructions,
+                                                                           languageSentence: inSample ? nil : settings.answerLanguageSentence),
+                                                   user: SummaryPrompt.user(input),
+                                                   supportsEffort: settings.modelSupportsEffort))
         summaryTask = Task { [weak self] in
             do {
-                for try await chunk in stream {
+                var stop = AnswerStop.complete
+                for try await event in stream {
                     guard let self, self.summaryRequest == current else { return }
-                    self.summary += chunk
+                    switch event {
+                    case .text(let chunk): self.summary += chunk
+                    case .stopped(let reason): stop = reason
+                    }
                 }
-                self?.finishSummary(current, error: nil)
+                self?.finishSummary(current, error: nil, stop: stop)
             } catch {
-                self?.finishSummary(current, error: error)
+                self?.finishSummary(current, error: error, stop: nil)
             }
         }
     }
@@ -1276,7 +1340,7 @@ final class AssistantController {
         return settings.saveTranscripts ? note : note + " Turn on Save transcripts in Settings to summarize a long call in full."
     }
 
-    private func finishSummary(_ request: Int, error: Error?) {
+    private func finishSummary(_ request: Int, error: Error?, stop: AnswerStop?) {
         guard request == summaryRequest else { return }
         isSummarizing = false
         if let error {
@@ -1285,6 +1349,9 @@ final class AssistantController {
             summary = summary.isEmpty ? message : summary + "\n\n" + message
             return
         }
+        // A refusal or length-limit note is text too, but not a summary to write an email from.
+        summaryIsFinal = stop == .complete
+        summaryEndedEarly = stop != .complete
         saveSummaryNextToTranscript()
     }
 
@@ -1301,7 +1368,83 @@ final class AssistantController {
         summary = ""
         summaryNote = nil
         isSummarizing = false
+        resetFollowUp()
         showProblem(nil, saving: "summary", in: &summaryProblem)
+    }
+
+    // MARK: - Follow-up email
+
+    /// Why "Draft follow-up" is off, or nil when it can run. The sample meeting
+    /// needs neither terms nor a key because its draft is canned.
+    var followUpBlockedReason: String? {
+        if listening != .sample {
+            if !settings.hasAcceptedTerms { return "Agree to the privacy terms first." }
+            if !settings.apiKeyPresent { return "Add an Anthropic API key in Settings first." }
+        }
+        if summaryEndedEarly, !isSummarizing {
+            return "The summary was declined or cut off. Summarize the meeting again first."
+        }
+        guard summaryIsFinal, !summary.isEmpty, !isSummarizing else { return "Summarize the meeting first." }
+        return nil
+    }
+
+    /// One request built from the summary (not the transcript), which Summarize
+    /// Meeting already sent. In the sample meeting a canned draft appears and
+    /// nothing is sent anywhere.
+    func draftFollowUp() {
+        guard followUpBlockedReason == nil else { return }
+        followUpTask?.cancel()
+        followUpRequest += 1
+        let current = followUpRequest
+        if listening == .sample {
+            followUpDraft = SampleMeeting.sampleFollowUp
+            followUpStatus = nil
+            isDraftingFollowUp = false
+            return
+        }
+        guard let apiKey = settings.resolveAPIKey() else {
+            followUpDraft = ""
+            followUpStatus = missingKeyMessage
+            isDraftingFollowUp = false
+            return
+        }
+        followUpDraft = ""
+        followUpStatus = nil
+        isDraftingFollowUp = true
+        let stream = answerer.stream(AnswerRequest(
+            apiKey: apiKey, model: settings.model,
+            system: FollowUpPrompt.system(profile: settings.profile, extraInstructions: settings.extraInstructions,
+                                          languageSentence: settings.answerLanguageSentence),
+            user: FollowUpPrompt.user(summary: summary),
+            supportsEffort: settings.modelSupportsEffort))
+        followUpTask = Task { [weak self] in
+            do {
+                for try await chunk in stream {
+                    guard let self, self.followUpRequest == current else { return }
+                    self.followUpDraft += chunk
+                }
+                self?.finishFollowUp(current, error: nil)
+            } catch {
+                self?.finishFollowUp(current, error: error)
+            }
+        }
+    }
+
+    private func finishFollowUp(_ request: Int, error: Error?) {
+        guard request == followUpRequest else { return }
+        isDraftingFollowUp = false
+        guard let error, !(error is CancellationError) else { return }
+        followUpStatus = "Error: \(error.localizedDescription)"
+    }
+
+    private func resetFollowUp() {
+        followUpTask?.cancel()
+        followUpRequest += 1
+        followUpDraft = ""
+        followUpStatus = nil
+        isDraftingFollowUp = false
+        summaryIsFinal = false
+        summaryEndedEarly = false
     }
 
     // MARK: - Sample meeting
@@ -1320,6 +1463,7 @@ final class AssistantController {
         clearNotices()
         flushArchive()
         endArchive()
+        instantCards.useSampleCards(SampleMeeting.cards)
         resetTranscriptAndAnswer()
         resetSummary()
         sessionStartedAt = now()
@@ -1339,6 +1483,7 @@ final class AssistantController {
         let segment = TranscriptSegment(utterance: index, text: line.text, isFinal: true)
         let finished = transcript.apply(segment, from: line.speaker, at: now())
         transcriptDisplay = transcript.tail(maxCharacters: Self.displayCharacters)
+        showCards(for: line.text, from: line.speaker)
         if let finished, finished.speaker == .them, QuestionDetector.looksLikeQuestion(finished.text) {
             answerNow()
         }
@@ -1384,6 +1529,7 @@ final class AssistantController {
     /// mid-call, and remembers which backend this session is about to use.
     private func beginPrivacySession() {
         settings.loadKeysForListening()
+        settings.freezeSpeechOptions()
         activePlan = TranscriberFactory.plan(for: settings)
         observeSettings()
     }

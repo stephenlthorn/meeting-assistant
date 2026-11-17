@@ -22,6 +22,18 @@ enum SampleMeeting {
         Line(speaker: .them, text: "And how long would a rollout across all twelve offices take?"),
     ]
 
+    /// Cards for the scripted call, triggered by words "Them" says in `lines`.
+    /// They live here, not in the user's cards, so the sample works with no setup
+    /// and leaves nothing behind.
+    static let cards = [
+        Card(id: "sample:voicemail", title: "Missed calls (sample card)",
+             triggers: ["voicemail"],
+             body: "Sample card: the one-liner you wrote for this moment.\n- Callers who hit voicemail rarely call back\n- A text within a minute keeps them"),
+        Card(id: "sample:rollout", title: "Rollout (sample card)",
+             triggers: ["rollout"],
+             body: "Sample card: a fact you would not want to fumble.\n- Pilot one office first\n- Then add offices in batches"),
+    ]
+
     static let sampleAnswerIntro = "Sample answer (add your Anthropic API key in Settings for live answers from Claude):\n"
 
     /// Stand-ins for Claude's answers when no API key is set, one per question.

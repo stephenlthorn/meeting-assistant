@@ -11,7 +11,8 @@ struct SummaryInput: Equatable {
     /// The start of the meeting is missing, because it was trimmed or cut for length.
     let isPartial: Bool
 
-    init(transcript: String, isPartial: Bool, maxCharacters: Int = SummaryInput.defaultMaxCharacters) {
+    init(transcript rawTranscript: String, isPartial: Bool, maxCharacters: Int = SummaryInput.defaultMaxCharacters) {
+        let transcript = Self.withoutCardLines(rawTranscript)
         guard transcript.count > maxCharacters else {
             self.transcript = transcript
             self.isPartial = isPartial
@@ -25,6 +26,14 @@ struct SummaryInput: Equatable {
         }
         self.isPartial = true
     }
+
+    /// Cards shown during the call are logged in the saved file but stay on this Mac.
+    private static func withoutCardLines(_ transcript: String) -> String {
+        guard transcript.contains(TranscriptMarkdown.cardLinePrefix) else { return transcript }
+        return transcript.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.hasPrefix(TranscriptMarkdown.cardLinePrefix) }
+            .joined(separator: "\n")
+    }
 }
 
 /// The prompts for Summarize Meeting. Like an answer, the summary request fences
@@ -33,10 +42,10 @@ struct SummaryInput: Equatable {
 /// answer it carries the whole call, not recent excerpts, which is why the
 /// welcome screen says so.
 enum SummaryPrompt {
-    static func system(extraInstructions: String) -> String {
+    static func system(extraInstructions: String, languageSentence: String? = nil) -> String {
         let extra = extraInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !extra.isEmpty else { return base }
-        return base + "\n\nAdditional instructions from the user:\n" + extra
+        let prompt = extra.isEmpty ? base : base + "\n\nAdditional instructions from the user:\n" + extra
+        return AnswerPrompt.system(prompt, languageSentence: languageSentence)
     }
 
     static func user(_ input: SummaryInput) -> String {

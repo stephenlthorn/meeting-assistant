@@ -20,7 +20,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     func testEachSecretReachesOnlyTheStepThatNeedsIt() throws {
         let release = try Workflow("release.yml")
 
-        let sign = try release.step("Sign with Developer ID")
+        let sign = try release.step("Sign with certificate")
         let notarize = try release.step("Notarize")
         XCTAssertEqual(Set(sign.secretValues), Set(signingSecrets))
         XCTAssertEqual(Set(notarize.secretValues), Set(notarizationSecrets))
@@ -157,11 +157,48 @@ final class ReleaseWorkflowTests: XCTestCase {
     func testSigningAndNotarizationFollowTheCheckedMode() throws {
         let release = try Workflow("release.yml")
 
-        XCTAssertTrue(try release.step("Sign with Developer ID").condition?.contains("steps.signing.outputs.mode == 'developer-id'") == true)
-        XCTAssertTrue(try release.step("Notarize").condition?.contains("steps.signing.outputs.mode == 'developer-id'") == true)
+        XCTAssertTrue(try release.step("Sign with certificate").condition?.contains("steps.signing.outputs.mode != 'ad-hoc'") == true,
+                      "signed and notarized builds both sign with the certificate")
+        XCTAssertTrue(try release.step("Notarize").condition?.contains("steps.signing.outputs.mode == 'notarized'") == true,
+                      "only the notarized mode has the Apple credentials to notarize")
         let adHoc = try release.step("Ad-hoc sign")
         XCTAssertTrue(adHoc.condition?.contains("steps.signing.outputs.mode == 'ad-hoc'") == true)
         XCTAssertFalse(adHoc.text.contains("env.MACOS_CERTIFICATE_P12"))
+    }
+
+    func testASignedBuildMustCarryACertificateTiedRequirementBeforeItIsPackaged() throws {
+        let release = try Workflow("release.yml")
+
+        let verify = try release.step("Verify stable code identity")
+        XCTAssertTrue(verify.condition?.contains("steps.signing.outputs.mode != 'ad-hoc'") == true)
+        XCTAssertTrue(verify.text.contains("codesign -d -r-"), verify.text)
+        XCTAssertTrue(verify.text.contains("cdhash"), "a requirement tied to the code hash changes every build")
+        XCTAssertLessThan(try release.indexOfStep("Sign with certificate"), try release.indexOfStep("Verify stable code identity"))
+        XCTAssertLessThan(try release.indexOfStep("Verify stable code identity"), try release.indexOfStep("Package .app"))
+    }
+
+    func testSelfSignedCertificatesAreTrustedOnlyOnTheRunnerAndOnlyWhenCodesignWouldRefuseThem() throws {
+        let sign = try Workflow("release.yml").step("Sign with certificate")
+
+        XCTAssertTrue(sign.text.contains("identity_is_valid"), "trust is added only if the identity is not already valid")
+        XCTAssertTrue(sign.text.contains("add-trusted-cert"), sign.text)
+        XCTAssertTrue(sign.text.contains("remove-trusted-cert"), "the trust must not outlive the step")
+        XCTAssertTrue(sign.text.contains("trap cleanup EXIT"))
+    }
+
+    func testAWrongSigningIdentityFailsWithAFriendlyErrorBeforeAnythingIsTrusted() throws {
+        let text = try Workflow("release.yml").step("Sign with certificate").text
+
+        let find = try XCTUnwrap(text.range(of: "security find-certificate"), text)
+        let check = try XCTUnwrap(text.range(of: #"[ ! -s "$PUBLIC_CERTIFICATE" ]"#), "the exported certificate must be checked for content")
+        let trust = try XCTUnwrap(text.range(of: "security add-trusted-cert"), text)
+        XCTAssertLessThan(find.lowerBound, check.lowerBound)
+        XCTAssertLessThan(check.lowerBound, trust.lowerBound, "the check must come before the trust call")
+        let findLine = try XCTUnwrap(text.components(separatedBy: "\n").first { $0.contains("security find-certificate") })
+        XCTAssertTrue(findLine.contains("|| true"), "set -e would stop the step on find-certificate's own failure: \(findLine)")
+        let afterCheck = String(text[check.upperBound..<trust.lowerBound])
+        XCTAssertTrue(afterCheck.contains("::error::"), afterCheck)
+        XCTAssertTrue(afterCheck.contains("MACOS_SIGNING_IDENTITY"), afterCheck)
     }
 
     func testReleaseNotesDescribeTheSigningModeAndNotarizationOutcomeActuallyUsed() throws {
@@ -175,7 +212,7 @@ final class ReleaseWorkflowTests: XCTestCase {
     func testReleaseNeverRebuildsAnExistingTag() throws {
         let release = try Workflow("release.yml")
 
-        for name in ["Check signing secrets", "Build (Release)", "Sign with Developer ID", "Notarize", "Publish release"] {
+        for name in ["Check signing secrets", "Build (Release)", "Sign with certificate", "Notarize", "Publish release"] {
             XCTAssertTrue(try release.step(name).condition?.contains("steps.existing.outputs.exists != 'true'") == true, name)
         }
     }
@@ -282,11 +319,34 @@ final class ReleaseScriptTests: XCTestCase {
         return try Shell.runScript("release-check-signing.sh", env: env)
     }
 
+    private let certificateSecrets = ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"]
+    private let appleSecrets = ["APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"]
+
     func testEverySigningAndNotarizationSecretMeansSignAndNotarize() throws {
         let result = try checkSigning(present: allSecrets)
 
         XCTAssertEqual(result.status, 0, result.output)
-        XCTAssertEqual(result.outputs["mode"], "developer-id")
+        XCTAssertEqual(result.outputs["mode"], "notarized")
+    }
+
+    func testTheThreeCertificateSecretsAloneMeanSignedButNotNotarized() throws {
+        let result = try checkSigning(present: certificateSecrets)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "signed")
+    }
+
+    func testASignedSetupMissingACertificateSecretFailsNamingOnlyTheMissingOnes() throws {
+        for missing in certificateSecrets {
+            let result = try checkSigning(present: certificateSecrets.filter { $0 != missing })
+
+            XCTAssertNotEqual(result.status, 0, "Without \(missing) the configuration is partial")
+            XCTAssertNil(result.outputs["mode"])
+            XCTAssertTrue(result.output.contains(missing), result.output)
+            for present in certificateSecrets where present != missing {
+                XCTAssertFalse(result.output.contains(present), "\(present) is set and should not be named: \(result.output)")
+            }
+        }
     }
 
     func testNoSecretsMeansAnAdHocBuild() throws {
@@ -296,15 +356,16 @@ final class ReleaseScriptTests: XCTestCase {
         XCTAssertEqual(result.outputs["mode"], "ad-hoc")
     }
 
-    func testCertificateWithoutNotarizationSecretsFailsNamingTheMissingOnes() throws {
-        let result = try checkSigning(present: ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"])
+    func testCertificateWithSomeButNotAllNotarizationSecretsFailsNamingTheMissingOnes() throws {
+        let result = try checkSigning(present: certificateSecrets + ["APPLE_ID"])
 
         XCTAssertNotEqual(result.status, 0)
         XCTAssertNil(result.outputs["mode"])
-        for missing in ["APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"] {
+        for missing in ["APPLE_TEAM_ID", "APPLE_APP_PASSWORD"] {
             XCTAssertTrue(result.output.contains(missing), "\(missing) should be named: \(result.output)")
         }
         XCTAssertFalse(result.output.contains("MACOS_CERTIFICATE_P12"), "Only the missing secrets should be named")
+        XCTAssertFalse(result.output.contains("APPLE_ID"), "Only the missing secrets should be named")
     }
 
     func testNotarizationSecretsWithoutACertificateFailsNamingTheMissingOnes() throws {
@@ -332,7 +393,7 @@ final class ReleaseScriptTests: XCTestCase {
     }
 
     func testNotarizedReleasesAreDescribedAsSignedAndNotarized() throws {
-        let result = try notes(mode: "developer-id", notarized: "true")
+        let result = try notes(mode: "notarized", notarized: "true")
 
         XCTAssertEqual(result.status, 0, result.output)
         XCTAssertTrue(result.output.contains("Signed and notarized"))
@@ -340,14 +401,22 @@ final class ReleaseScriptTests: XCTestCase {
         XCTAssertFalse(result.output.contains("xattr"))
     }
 
-    func testDeveloperIDBuildsThatSkippedNotarizationAreNotCalledAdHoc() throws {
-        let result = try notes(mode: "developer-id", notarized: "")
+    func testSignedBuildsAreNotCalledAdHocAndPromisePermissionsSurviveUpdates() throws {
+        let result = try notes(mode: "signed", notarized: "")
 
         XCTAssertEqual(result.status, 0, result.output)
-        XCTAssertTrue(result.output.contains("Developer ID"))
+        XCTAssertTrue(result.output.contains("Signed macOS build"), result.output)
         XCTAssertTrue(result.output.contains("not notarized"))
-        XCTAssertFalse(result.output.localizedCaseInsensitiveContains("ad-hoc"))
+        XCTAssertTrue(result.output.contains("Gatekeeper still asks once"), result.output)
+        XCTAssertTrue(result.output.contains("keeps your Screen Recording and Microphone permissions"), result.output)
+        XCTAssertFalse(result.output.localizedCaseInsensitiveContains("again after each"))
         XCTAssertTrue(result.output.contains("xattr -dr com.apple.quarantine"), "Users still need the Gatekeeper workaround")
+    }
+
+    func testOnlyANotarizedModeThatReportedSuccessCanClaimNotarization() throws {
+        XCTAssertNotEqual(try notes(mode: "notarized", notarized: "").status, 0, "the notarize step did not report success")
+        XCTAssertNotEqual(try notes(mode: "signed", notarized: "true").status, 0)
+        XCTAssertNotEqual(try notes(mode: "developer-id", notarized: "").status, 0, "the old mode name is gone")
     }
 
     func testAdHocReleasesCarryTheLaunchInstructions() throws {
@@ -356,7 +425,7 @@ final class ReleaseScriptTests: XCTestCase {
         XCTAssertEqual(result.status, 0, result.output)
         XCTAssertTrue(result.output.contains("Ad-hoc signed"))
         XCTAssertTrue(result.output.contains("xattr -dr com.apple.quarantine MeetingAssistant.app"))
-        XCTAssertFalse(result.output.contains("Developer ID"))
+        XCTAssertFalse(result.output.contains("Signed macOS build"))
     }
 
     func testAnAdHocBuildCanNeverBeDescribedAsNotarized() throws {
@@ -366,7 +435,8 @@ final class ReleaseScriptTests: XCTestCase {
     }
 
     func testTheScriptsTheWorkflowsCallAreExecutable() throws {
-        for name in ["release-resolve-version.sh", "release-check-signing.sh", "release-exists.sh", "release-notes.sh", "setup-release-signing.sh", "install-xcodegen.sh"] {
+        for name in ["release-resolve-version.sh", "release-check-signing.sh", "release-exists.sh", "release-notes.sh", "setup-release-signing.sh", "install-xcodegen.sh",
+                     "make-self-signed-identity.sh", "verify-stable-signing-identity.sh"] {
             XCTAssertTrue(FileManager.default.isExecutableFile(atPath: Repo.url("scripts/\(name)").path), name)
         }
     }
@@ -683,6 +753,31 @@ final class SigningSetupScriptTests: XCTestCase {
                         "APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"])
     }
 
+    func testSignedModeWritesOnlyTheThreeCertificateSecretsAndAsksNothingAboutNotarization() throws {
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git")
+
+        let result = try run(setup, args: ["--signed", "key.p12"], typing: ["y", "p12-password", "Meeting Assistant Self-Signed"])
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(Set(setup.secretWrites.compactMap { $0.split(separator: " ").dropFirst(3).first.map(String.init) }),
+                       ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"])
+        XCTAssertEqual(setup.secretWrites.count, 3)
+        XCTAssertTrue(setup.secretWrites.allSatisfy { $0.contains("--repo acme/widgets") && $0.contains("--env release") }, setup.secretWrites.joined(separator: "\n"))
+        XCTAssertTrue(result.output.contains("three certificate secrets"), result.output)
+    }
+
+    func testSignedModeStillConfirmsFirstAndCreatesTheEnvironmentLimitedToMain() throws {
+        let declined = try makeSetup(origin: "git@github.com:acme/widgets.git")
+        _ = try run(declined, args: ["--signed", "key.p12"], typing: ["n", "p12-password", "Name"])
+        XCTAssertTrue(declined.ghCalls.isEmpty, "nothing may be written without confirmation: \(declined.ghCalls)")
+
+        let setup = try makeSetup(origin: "git@github.com:acme/widgets.git", environment: .missing)
+        _ = try run(setup, args: ["--signed", "key.p12"], typing: ["y", "p12-password", "Name"])
+        let policy = try XCTUnwrap(setup.ghCalls.firstIndex { $0.contains("deployment-branch-policies") }, setup.ghCalls.joined(separator: "\n"))
+        let firstSecret = try XCTUnwrap(setup.ghCalls.firstIndex { $0.hasPrefix("gh secret set") })
+        XCTAssertLessThan(policy, firstSecret)
+    }
+
     func testItUnderstandsHTTPSOriginsWithCredentialsAndTrailingSlashes() throws {
         for origin in ["https://github.com/acme/widgets", "https://github.com/acme/widgets/", "https://github.com/acme/widgets.git",
                        "https://x-access-token:abc@github.com/acme/widgets.git", "ssh://git@github.com/acme/widgets.git"] {
@@ -825,6 +920,160 @@ final class SigningSetupScriptTests: XCTestCase {
     }
 }
 
+// MARK: - Self-signed identity
+
+final class SelfSignedIdentityScriptTests: XCTestCase {
+    private let password = "test-password"
+
+    private func make(into directory: URL, name: String? = nil, password: String? = "test-password") throws -> Shell.Outcome {
+        var args = name.map { ["--name", $0] } ?? []
+        args.append(directory.path)
+        return try Shell.runScript("make-self-signed-identity.sh", args: args, env: password.map { ["P12_PASSWORD": $0] } ?? [:])
+    }
+
+    private func certificateText(in directory: URL) throws -> String {
+        try Shell.run("/usr/bin/openssl", ["x509", "-inform", "DER", "-in", directory.appendingPathComponent("MeetingAssistantSelfSigned.cer").path, "-noout", "-text"]).output
+    }
+
+    func testItWritesAPasswordProtectedP12AndAPublicCertificateAndNothingElse() throws {
+        let directory = try Shell.makeTempDirectory(for: self).appendingPathComponent("out")
+
+        let result = try make(into: directory)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
+        XCTAssertEqual(files, ["MeetingAssistantSelfSigned.cer", "MeetingAssistantSelfSigned.p12"], "scratch files must be cleaned up")
+        let p12 = directory.appendingPathComponent("MeetingAssistantSelfSigned.p12").path
+        XCTAssertEqual(try Shell.run("/usr/bin/openssl", ["pkcs12", "-in", p12, "-noout", "-passin", "pass:\(password)"]).status, 0, "the password opens it")
+        XCTAssertNotEqual(try Shell.run("/usr/bin/openssl", ["pkcs12", "-in", p12, "-noout", "-passin", "pass:wrong"]).status, 0, "a wrong password does not")
+        let permissions = try FileManager.default.attributesOfItem(atPath: p12)[.posixPermissions] as? Int
+        XCTAssertEqual(permissions, 0o600, "the private key is readable only by its owner")
+    }
+
+    func testTheCertificateIsACodeSigningCertificateValidForTenYears() throws {
+        let directory = try Shell.makeTempDirectory(for: self).appendingPathComponent("out")
+        XCTAssertEqual(try make(into: directory).status, 0)
+
+        let text = try certificateText(in: directory)
+
+        XCTAssertTrue(text.contains("Code Signing"), text)
+        XCTAssertTrue(text.contains("Digital Signature"), text)
+        XCTAssertTrue(text.contains("CN=Meeting Assistant Self-Signed") || text.contains("CN = Meeting Assistant Self-Signed"), text)
+        XCTAssertTrue(text.contains("CA:FALSE"), "it must not be able to issue other certificates")
+        let fingerprintCheck = try Shell.run("/usr/bin/openssl", ["x509", "-inform", "DER", "-in", directory.appendingPathComponent("MeetingAssistantSelfSigned.cer").path,
+                                                                 "-noout", "-checkend", String(3650 * 86_400 - 2 * 86_400)])
+        XCTAssertEqual(fingerprintCheck.status, 0, "still valid in just under ten years")
+        let beyond = try Shell.run("/usr/bin/openssl", ["x509", "-inform", "DER", "-in", directory.appendingPathComponent("MeetingAssistantSelfSigned.cer").path,
+                                                        "-noout", "-checkend", String(3660 * 86_400)])
+        XCTAssertNotEqual(beyond.status, 0, "not valid forever")
+    }
+
+    func testItPrintsTheSHA1AndTheExactIdentityStringToUse() throws {
+        let directory = try Shell.makeTempDirectory(for: self).appendingPathComponent("out")
+
+        let result = try make(into: directory, name: "Acme Self-Signed")
+
+        let sha1 = try XCTUnwrap(captures(#"^SHA-1:\s+([0-9A-F]{40})$"#, in: result.output).first?.first, result.output)
+        XCTAssertTrue(result.output.contains("MACOS_SIGNING_IDENTITY:    Acme Self-Signed"), result.output)
+        let fingerprint = try Shell.run("/usr/bin/openssl", ["x509", "-inform", "DER", "-in", directory.appendingPathComponent("MeetingAssistantSelfSigned.cer").path,
+                                                            "-noout", "-fingerprint", "-sha1"]).output
+        XCTAssertEqual(fingerprint.split(separator: "=").last.map { $0.replacingOccurrences(of: ":", with: "").trimmingCharacters(in: .whitespacesAndNewlines) }, sha1)
+    }
+
+    func testItGeneratesAndShowsAPasswordOnlyWhenNoneWasGiven() throws {
+        let given = try make(into: try Shell.makeTempDirectory(for: self).appendingPathComponent("a"))
+        XCTAssertFalse(given.output.contains("MACOS_CERTIFICATE_PASSWORD"), "a password the user chose is not echoed back")
+
+        let directory = try Shell.makeTempDirectory(for: self).appendingPathComponent("b")
+        let generated = try make(into: directory, password: nil)
+        let shown = try XCTUnwrap(captures(#"^MACOS_CERTIFICATE_PASSWORD: (\S+)"#, in: generated.output).first?.first, generated.output)
+        XCTAssertGreaterThanOrEqual(shown.count, 16)
+        XCTAssertEqual(try Shell.run("/usr/bin/openssl", ["pkcs12", "-in", directory.appendingPathComponent("MeetingAssistantSelfSigned.p12").path,
+                                                          "-noout", "-passin", "pass:\(shown)"]).status, 0)
+    }
+
+    func testItNeverOverwritesAnExistingIdentity() throws {
+        let directory = try Shell.makeTempDirectory(for: self).appendingPathComponent("out")
+        XCTAssertEqual(try make(into: directory).status, 0)
+        let p12 = directory.appendingPathComponent("MeetingAssistantSelfSigned.p12")
+        let before = try Data(contentsOf: p12)
+
+        let second = try make(into: directory)
+
+        XCTAssertNotEqual(second.status, 0)
+        XCTAssertTrue(second.output.contains("Refusing to overwrite"), second.output)
+        XCTAssertEqual(try Data(contentsOf: p12), before)
+    }
+
+    func testItWritesNothingOutsideTheOutputDirectory() throws {
+        let parent = try Shell.makeTempDirectory(for: self)
+        let directory = parent.appendingPathComponent("out")
+
+        XCTAssertEqual(try make(into: directory).status, 0)
+
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: parent.path), ["out"])
+    }
+
+    func testItRejectsANameThatCouldBreakTheCertificateConfiguration() throws {
+        let directory = try Shell.makeTempDirectory(for: self).appendingPathComponent("out")
+
+        let result = try make(into: directory, name: "Evil\n[codesign]")
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path), "nothing is created for a rejected name")
+    }
+}
+
+/// The property the self-signed identity exists for. The script does the work and prints the requirements;
+/// it runs in a throwaway directory with a throwaway keychain that is never on the search list.
+final class StableIdentityTests: XCTestCase {
+    private func verify(_ args: [String]) throws -> Shell.Outcome {
+        try Shell.runScript("verify-stable-signing-identity.sh", args: args, env: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"])
+    }
+
+    private func requirements(prefix: String, in output: String) -> [String] {
+        captures("^\(prefix) build [AB]: +(.+)$", in: output).compactMap(\.first)
+    }
+
+    func testAdHocBuildsOfDifferentCodeGetDifferentRequirements() throws {
+        let result = try verify(["--adhoc-only"])
+        try XCTSkipIf(result.status == 77, "codesign is not available: \(result.output)")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        let adHoc = requirements(prefix: "ad-hoc", in: result.output)
+        XCTAssertEqual(adHoc.count, 2, result.output)
+        XCTAssertTrue(adHoc.allSatisfy { $0.contains("cdhash") }, "an ad-hoc requirement is the code hash: \(adHoc)")
+        XCTAssertEqual(Set(adHoc).count, 2, "so every build needs fresh permissions: \(adHoc)")
+    }
+
+    /// Needs codesign to accept a self-signed certificate, which macOS only does once the certificate is trusted.
+    /// That takes an interactive approval, so this runs on the maintainer's Mac with MA_VERIFY_TRUST=1 and is
+    /// skipped everywhere else; `scripts/verify-stable-signing-identity.sh --trust` is the same check by hand.
+    func testTwoBuildsSignedWithTheSameSelfSignedIdentityShareOneRequirement() throws {
+        let trust = ProcessInfo.processInfo.environment["MA_VERIFY_TRUST"] == "1"
+        let result = try verify(trust ? ["--trust"] : [])
+        try XCTSkipIf(result.status == 77, "the signed half cannot run here: \(result.output)")
+
+        XCTAssertEqual(result.status, 0, result.output)
+        let signed = requirements(prefix: "self-signed", in: result.output)
+        XCTAssertEqual(signed.count, 2, result.output)
+        XCTAssertEqual(Set(signed).count, 1, "one requirement means permissions survive an update: \(signed)")
+        XCTAssertTrue(signed.allSatisfy { $0.contains("certificate leaf = H") && !$0.contains("cdhash") }, "\(signed)")
+        let adHoc = requirements(prefix: "ad-hoc", in: result.output)
+        XCTAssertEqual(Set(adHoc).count, 2, "ad-hoc, the same two builds differ: \(adHoc)")
+    }
+
+    func testTheCheckLeavesNoKeychainBehind() throws {
+        let before = try Shell.run("/usr/bin/security", ["list-keychains", "-d", "user"]).output
+        let temp = FileManager.default.temporaryDirectory.path
+
+        _ = try verify([])
+
+        XCTAssertEqual(try Shell.run("/usr/bin/security", ["list-keychains", "-d", "user"]).output, before, "the search list is untouched")
+        XCTAssertFalse(before.contains(temp))
+    }
+}
+
 // MARK: - Repository hygiene
 
 final class RepositoryHygieneTests: XCTestCase {
@@ -962,6 +1211,63 @@ private struct FakeGitHub {
 
     var calls: [String] {
         ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+}
+
+final class ReleaseSigningModeTests: XCTestCase {
+    private static let signing = ["MACOS_CERTIFICATE_P12", "MACOS_CERTIFICATE_PASSWORD", "MACOS_SIGNING_IDENTITY"]
+    private static let notarization = ["APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"]
+
+    private func decide(setting names: [String]) throws -> Shell.Outcome {
+        var env: [String: String] = [:]
+        for name in Self.signing + Self.notarization { env["HAVE_" + name] = names.contains(name) ? "true" : "false" }
+        return try Shell.runScript("release-check-signing.sh", env: env)
+    }
+
+    func testNoSecretsMeansAnAdHocBuild() throws {
+        let result = try decide(setting: [])
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "ad-hoc")
+    }
+
+    func testTheThreeCertificateSecretsMeanASignedBuild() throws {
+        let result = try decide(setting: Self.signing)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "signed")
+    }
+
+    func testAllSixSecretsMeanANotarizedBuild() throws {
+        let result = try decide(setting: Self.signing + Self.notarization)
+
+        XCTAssertEqual(result.status, 0, result.output)
+        XCTAssertEqual(result.outputs["mode"], "notarized")
+    }
+
+    func testAnyPartialCertificateSetFailsNamingWhatIsMissing() throws {
+        for count in 1...2 {
+            let result = try decide(setting: Array(Self.signing.prefix(count)))
+
+            XCTAssertNotEqual(result.status, 0, "\(count) of 3 certificate secrets must not pass")
+            XCTAssertNil(result.outputs["mode"], "a failed check leaves no mode for later steps")
+            XCTAssertTrue(result.output.contains(Self.signing[2]), result.output)
+        }
+    }
+
+    func testNotarizationSecretsWithoutTheCertificateFail() throws {
+        let result = try decide(setting: Self.notarization)
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertNil(result.outputs["mode"])
+    }
+
+    func testACertificateWithOnlySomeNotarizationSecretsFails() throws {
+        let result = try decide(setting: Self.signing + ["APPLE_ID"])
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertNil(result.outputs["mode"])
+        XCTAssertTrue(result.output.contains("APPLE_TEAM_ID"), result.output)
     }
 }
 

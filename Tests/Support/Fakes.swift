@@ -159,12 +159,31 @@ final class FakeMicrophone: MicrophoneCapturing {
 final class FakeAnswerer: AnswerStreaming {
     private(set) var requests: [AnswerRequest] = []
     private(set) var streams: [AsyncThrowingStream<String, Error>.Continuation] = []
+    /// How the stream at an index stops when it finishes without an error (default: complete).
+    var stops: [Int: AnswerStop] = [:]
 
     func stream(_ request: AnswerRequest) -> AsyncThrowingStream<String, Error> {
         requests.append(request)
         let (stream, continuation) = AsyncThrowingStream<String, Error>.makeStream()
         streams.append(continuation)
         return stream
+    }
+
+    func streamEvents(_ request: AnswerRequest) -> AsyncThrowingStream<AnswerEvent, Error> {
+        let index = streams.count
+        let source = stream(request)
+        return AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                do {
+                    for try await chunk in source { continuation.yield(.text(chunk)) }
+                    continuation.yield(.stopped(stops[index] ?? .complete))
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 }
 
@@ -218,6 +237,15 @@ func silentBuffer() -> AVAudioPCMBuffer {
     return buffer
 }
 
+/// A model catalog whose requests never leave the process: they reach the stub, which
+/// refuses the connection unless a test installed a response.
+@MainActor
+func offlineModelCatalog(defaults: UserDefaults) -> ModelCatalog {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [StubURLProtocol.self]
+    return ModelCatalog(defaults: defaults, session: URLSession(configuration: configuration))
+}
+
 /// Settings over throwaway defaults and an in-memory Keychain.
 @MainActor
 func makeTestSettings(for testCase: XCTestCase,
@@ -228,7 +256,8 @@ func makeTestSettings(for testCase: XCTestCase,
     let defaults = UserDefaults(suiteName: suite)!
     testCase.addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
     let settings = AppSettings(defaults: defaults, secrets: secrets, environment: environment,
-                               anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"))
+                               anthropicKeyFile: URL(fileURLWithPath: "/nonexistent/anthropic_key"),
+                               modelCatalog: offlineModelCatalog(defaults: defaults))
     if acceptTerms { settings.acceptTerms() }
     return settings
 }
